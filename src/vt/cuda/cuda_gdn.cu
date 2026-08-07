@@ -5166,6 +5166,10 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
                           const Tensor& qsl, int64_t n_seq, int64_t nt_tot, bool dev_meta,
                           const GdnArgs& args) {
   const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
+  // hk_n is kept for the shape mapping it documents (q_in is [T, hk_n, dk]), but
+  // nothing below reads it, and nvcc's #177-D is an ERROR under -Werror -- so this
+  // declaration alone was failing every CUDA build.
+  (void)hk_n;
   const int64_t hv_n = v.shape[1], dv = v.shape[2];
   const int64_t t_tot = out.shape[0];
 
