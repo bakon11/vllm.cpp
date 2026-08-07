@@ -5124,6 +5124,11 @@ void KdaChunkPrefillKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const 
                                const Tensor& qsl, const GdnArgs& args) {
   const int64_t T = q_in.shape[0];
   const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
+  // hk_n's ONLY use is the geom_ok check below, which sits inside
+  // `#ifdef VLLM_CPP_TRITON`. In a NON-Triton build that use is compiled out and
+  // nvcc's #177-D -- an ERROR under -Werror -- fails the whole CUDA build. That
+  // configuration dependence is why this stayed green wherever Triton is on.
+  (void)hk_n;
   const int64_t hv_n = state.shape[1], dv = state.shape[2];
   if (T == 0 || hv_n == 0 || dv == 0) return;
   cudaStream_t s = AsStream(q);
