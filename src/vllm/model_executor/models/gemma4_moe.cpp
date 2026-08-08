@@ -20,6 +20,7 @@
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/rocm/rocm_gelu_mul_sep.h"
+#include "vt/rocm/rocm_gemma4_expert_geglu.h"
 #include "vt/rocm/rocm_matmul_batch.h"
 
 namespace vllm {
@@ -542,6 +543,10 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     const char* e = std::getenv("VT_GEMMA4_FP8_NATIVE");
     return e && e[0] == '1';
   }();
+  static const bool custom_expert = [] {
+    const char* e = std::getenv("VT_GEMMA4_CUSTOM_EXPERT");
+    return e && e[0] == '1';
+  }();
   std::vector<uint16_t> hsum;
   if (host_axpy) hsum.assign(static_cast<size_t>(H), vt::F32ToBF16(0.f));
 
@@ -658,6 +663,7 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     }
 
     // Fused-Gelu top-k: gate_up×G → one GeluAndMul → down×G (default BF16 device path).
+    // Optional custom RDNA4 expert kernels: VT_GEMMA4_CUSTOM_EXPERT=1
     if (!host_axpy && T == 1 && !fp8_native) {
       std::vector<const uint16_t*> gu_p, dn_p;
       gu_p.reserve(static_cast<size_t>(top_k));
@@ -684,14 +690,30 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
           ok = false;
         }
       }
-      if (ok && static_cast<int>(gu_p.size()) == top_k &&
-          ExpertGeGLUTopKFusedGelu(d, ysum, xin.t(), gu_p.data(), dn_p.data(), wts.data(), top_k,
-                                   I, H)) {
-        d.b.Copy(
-            d.q,
-            static_cast<char*>(acc.ptr()) + static_cast<size_t>(t) * static_cast<size_t>(H) * 2,
-            ysum.ptr(), static_cast<size_t>(H) * 2);
-        continue;
+      if (ok && static_cast<int>(gu_p.size()) == top_k) {
+        bool ran = false;
+        if (custom_expert) {
+          std::vector<const void*> gu_v(static_cast<size_t>(top_k));
+          std::vector<const void*> dn_v(static_cast<size_t>(top_k));
+          for (int g = 0; g < top_k; ++g) {
+            gu_v[static_cast<size_t>(g)] = gu_p[static_cast<size_t>(g)];
+            dn_v[static_cast<size_t>(g)] = dn_p[static_cast<size_t>(g)];
+          }
+          ran = vt::rocm::ExpertGeGLUBf16TopKM1Rocm(d.q, ysum.ptr(), xin.ptr(), gu_v.data(),
+                                                    dn_v.data(), wts.data(), top_k,
+                                                    static_cast<int>(I), static_cast<int>(H));
+        }
+        if (!ran) {
+          ran = ExpertGeGLUTopKFusedGelu(d, ysum, xin.t(), gu_p.data(), dn_p.data(), wts.data(),
+                                         top_k, I, H);
+        }
+        if (ran) {
+          d.b.Copy(
+              d.q,
+              static_cast<char*>(acc.ptr()) + static_cast<size_t>(t) * static_cast<size_t>(H) * 2,
+              ysum.ptr(), static_cast<size_t>(H) * 2);
+          continue;
+        }
       }
     }
 

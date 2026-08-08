@@ -46,6 +46,12 @@ Skip local re-quant until more host RAM; Firworks FP8_DYNAMIC file is fine. Spee
 
 Logs: `~/llms/logs/vllm-cpp-fp8-lt-matrix.log`, `vllm-cpp-fp8-vs-bf16-gemm.log`
 
+
+### Custom RDNA4 Expert GeGLU (`VT_GEMMA4_CUSTOM_EXPERT=1`)
+- HIP kernels: `rocm_gemma4_expert_geglu.hip` (act multi-block + down)
+- **Paris OK**; warm ~34.2 tok/s vs hipBLAS default ~35.2 (opt-in, default off)
+- SDK: ROCm 7.2.4, rocWMMA available for next WMMA pass
+
 ### Upstream (mudler/vllm.cpp, checked 2026-08-08)
 - **#154** (ours) OPEN, mergeable
 - **#140** merged (our base ROCm/Gemma4)
