@@ -8,6 +8,7 @@
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <thread>
 #include <vector>
 
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
@@ -269,6 +270,31 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     if (ex.is_fp8) {
       gu_tmp.resize(static_cast<size_t>(gu_stride));
       dn_tmp.resize(static_cast<size_t>(dn_stride));
+    }
+
+    // Prefetch BF16 caches for this token's top-k experts in parallel (cold only).
+    if (ex.is_fp8 && !same_dev && ex.gate_up_dev == nullptr) {
+      bool any_cold = false;
+      for (int i = 0; i < top_k; ++i) {
+        const auto& fex = ex.fp8[static_cast<size_t>(idx[static_cast<size_t>(i)])];
+        if (fex.cached_gu.empty() || fex.cached_dn.empty()) {
+          any_cold = true;
+          break;
+        }
+      }
+      if (any_cold) {
+        Fp8DequantBeginOuterParallel();
+        std::vector<std::thread> pref;
+        pref.reserve(static_cast<size_t>(top_k));
+        for (int i = 0; i < top_k; ++i) {
+          const int e = idx[static_cast<size_t>(i)];
+          pref.emplace_back([&, e] {
+            EnsureGemma4Fp8ExpertCached(ex.fp8[static_cast<size_t>(e)], I, H);
+          });
+        }
+        for (auto& th : pref) th.join();
+        Fp8DequantEndOuterParallel();
+      }
     }
 
     for (int i = 0; i < top_k; ++i) {
