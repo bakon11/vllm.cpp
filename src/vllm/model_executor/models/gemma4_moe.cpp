@@ -251,16 +251,28 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
         auto* dn =
             static_cast<const uint16_t*>(ex.down_dev) + static_cast<int64_t>(e) * dn_stride;
         ExpertGeGLUDevice(d, y, xin.t(), gu, dn, I, H);
-      } else if (ex.is_fp8) {
-        const auto& fex = ex.fp8[static_cast<size_t>(e)];
-        // If full-layer stack already lives on another GPU, do NOT alloc more
-        // device experts (OOM). Ephemeral host dequant + H2D for this expert.
-        if (ex.gate_up_dev != nullptr) {
+      } else if (ex.gate_up_dev != nullptr && ex.down_dev != nullptr) {
+        // Resident on another GPU: peer/stage one expert into compute scratch.
+        DBuf gu_sc(d, DType::kBF16, {2 * I, H});
+        DBuf dn_sc(d, DType::kBF16, {H, I});
+        if (PeerCopyGemma4ExpertSlice(ex.dev_id, ex.gate_up_dev, ex.down_dev, e, I, H,
+                                      compute_dev, gu_sc.ptr(), dn_sc.ptr())) {
+          ExpertGeGLUDevice(d, y, xin.t(), static_cast<const uint16_t*>(gu_sc.ptr()),
+                            static_cast<const uint16_t*>(dn_sc.ptr()), I, H);
+        } else if (ex.is_fp8) {
+          const auto& fex = ex.fp8[static_cast<size_t>(e)];
           std::vector<uint16_t> gu_tmp(static_cast<size_t>(gu_stride));
           std::vector<uint16_t> dn_tmp(static_cast<size_t>(dn_stride));
           DequantGemma4Fp8ExpertToBf16Ephemeral(fex, I, H, gu_tmp.data(), dn_tmp.data());
           ExpertGeGLUHost(d, y, xin.t(), gu_tmp.data(), dn_tmp.data(), I, H);
-        } else if (EnsureGemma4Fp8ExpertOnDevice(d, fex, I, H)) {
+        } else {
+          VT_CHECK(gu_host && dn_host, "gemma4 moe: peer fail no host");
+          ExpertGeGLUHost(d, y, xin.t(), gu_host + static_cast<int64_t>(e) * gu_stride,
+                          dn_host + static_cast<int64_t>(e) * dn_stride, I, H);
+        }
+      } else if (ex.is_fp8) {
+        const auto& fex = ex.fp8[static_cast<size_t>(e)];
+        if (EnsureGemma4Fp8ExpertOnDevice(d, fex, I, H)) {
           ExpertGeGLUDevice(d, y, xin.t(), static_cast<const uint16_t*>(fex.dev_gu),
                             static_cast<const uint16_t*>(fex.dev_dn), I, H);
         } else {
