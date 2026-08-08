@@ -321,6 +321,37 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
   DBuf acc(d, DType::kBF16, {T, H});
   acc.Zero(d);
 
+  // Layer-lifetime scratch (decode/prefill tokens share these).
+  ExpertScratch esc(d, /*T=*/1, I, H);
+  DBuf xin(d, DType::kBF16, {1, H});
+  DBuf ysum(d, DType::kBF16, {1, H});
+  DBuf y(d, DType::kBF16, {1, H});
+  DBuf ysc(d, DType::kBF16, {1, H});
+  const bool need_peer_sc =
+      ex.gate_up_dev != nullptr && ex.down_dev != nullptr && !same_dev;
+  std::optional<DBuf> gu_sc;
+  std::optional<DBuf> dn_sc;
+  if (need_peer_sc) {
+    gu_sc.emplace(d, DType::kBF16, std::vector<int64_t>{2 * I, H});
+    dn_sc.emplace(d, DType::kBF16, std::vector<int64_t>{H, I});
+  }
+  std::vector<uint16_t> gu_tmp;
+  std::vector<uint16_t> dn_tmp;
+  if (ex.is_fp8) {
+    gu_tmp.resize(static_cast<size_t>(gu_stride));
+    dn_tmp.resize(static_cast<size_t>(dn_stride));
+  }
+  static const bool host_axpy = [] {
+    const char* e = std::getenv("VT_GEMMA4_HOST_AXPY");
+    return e && e[0] == '1';
+  }();
+  static const bool batch_experts = [] {
+    const char* e = std::getenv("VT_GEMMA4_BATCH_EXPERTS");
+    return e && e[0] == '1';
+  }();
+  std::vector<uint16_t> hsum;
+  if (host_axpy) hsum.assign(static_cast<size_t>(H), vt::F32ToBF16(0.f));
+
   for (int64_t t = 0; t < T; ++t) {
     std::vector<int> idx(static_cast<size_t>(E));
     for (int e = 0; e < static_cast<int>(E); ++e) idx[static_cast<size_t>(e)] = e;
@@ -340,41 +371,13 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
           (wts[static_cast<size_t>(i)] / sum) *
           hscale[static_cast<size_t>(idx[static_cast<size_t>(i)])];
 
-    DBuf xin(d, DType::kBF16, {1, H});
     d.b.Copy(d.q, xin.ptr(),
              static_cast<const char*>(expert_in.data) +
                  static_cast<size_t>(t) * static_cast<size_t>(H) * 2,
              static_cast<size_t>(H) * 2);
 
-    DBuf ysum(d, DType::kBF16, {1, H});
     ysum.Zero(d);
-    // Prefer on-device weighted sum (no per-expert D2H). Host fallback if ops hang/fail.
-    const bool host_axpy = [] {
-      const char* e = std::getenv("VT_GEMMA4_HOST_AXPY");
-      return e && e[0] == '1';
-    }();
-    std::vector<uint16_t> hsum;
-    if (host_axpy) hsum.assign(static_cast<size_t>(H), vt::F32ToBF16(0.f));
-
-    // Reuse scratch across top-k (avoid alloc/free per expert).
-    DBuf y(d, DType::kBF16, {1, H});
-    DBuf ysc(d, DType::kBF16, {1, H});
-    ExpertScratch esc(d, /*T=*/1, I, H);
-    // Peer scratch only when experts live on another device (~12MiB).
-    const bool need_peer_sc =
-        ex.gate_up_dev != nullptr && ex.down_dev != nullptr && !same_dev;
-    std::optional<DBuf> gu_sc;
-    std::optional<DBuf> dn_sc;
-    if (need_peer_sc) {
-      gu_sc.emplace(d, DType::kBF16, std::vector<int64_t>{2 * I, H});
-      dn_sc.emplace(d, DType::kBF16, std::vector<int64_t>{H, I});
-    }
-    std::vector<uint16_t> gu_tmp;
-    std::vector<uint16_t> dn_tmp;
-    if (ex.is_fp8) {
-      gu_tmp.resize(static_cast<size_t>(gu_stride));
-      dn_tmp.resize(static_cast<size_t>(dn_stride));
-    }
+    if (host_axpy) std::fill(hsum.begin(), hsum.end(), vt::F32ToBF16(0.f));
 
     // Prefetch BF16 caches for this token's top-k experts in parallel (cold only).
     if (ex.is_fp8 && !same_dev && ex.gate_up_dev == nullptr) {
@@ -401,12 +404,7 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
       }
     }
 
-    // Batched path: VT_GEMMA4_BATCH_EXPERTS=1 (default off — still slower than serial
-    // ExpertGeGLU on R9700; fused Gelu helps but pointer-table overhead remains).
-    static const bool batch_experts = [] {
-      const char* e = std::getenv("VT_GEMMA4_BATCH_EXPERTS");
-      return e && e[0] == '1';
-    }();
+    // Batched path: VT_GEMMA4_BATCH_EXPERTS=1 (default off).
     if (batch_experts && ex.is_fp8 && !host_axpy) {
       std::vector<const uint16_t*> gu_ptrs;
       std::vector<const uint16_t*> dn_ptrs;
