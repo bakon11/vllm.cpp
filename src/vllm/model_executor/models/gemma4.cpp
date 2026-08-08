@@ -50,6 +50,7 @@
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/rocm/rocm_gelu_mul_sep.h"
+#include "vt/rocm/rocm_rmsnorm_plus_add.h"
 
 namespace vllm {
 namespace {
@@ -525,7 +526,6 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     lt.ple = ple;
   }
   DBuf& dhn = *lt.dhn;
-  DBuf& attn_n = *lt.attn_n;
   DBuf& h1 = *lt.h1;
   DBuf& dh2 = *lt.dh2;
   DBuf& h2 = *lt.h2;
@@ -533,10 +533,8 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   DBuf& n1 = *lt.n1;
   DBuf& n2 = *lt.n2;
   DBuf& sum = *lt.sum;
-  DBuf& n3 = *lt.n3;
-  DBuf& mlp_n = *lt.mlp_n;
-  DBuf& contrib = *lt.contrib;
   const size_t th_bytes = static_cast<size_t>(T) * static_cast<size_t>(H) * sizeof(uint16_t);
+  DBuf& contrib = *lt.contrib;
 
   for (int64_t l = 0; l < L; ++l) {
     const Gemma4LayerWeights& w = weights.layers[static_cast<size_t>(l)];
@@ -558,8 +556,8 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                                 g.rope_theta_sliding);
 
     Tensor w_pa = ResidentWeight(d, w.post_attention_layernorm, {H});
-    vt::RmsNorm(d.q, attn_n.t(), attn.t(), w_pa, plain);
-    vt::Add(d.q, h1.t(), attn_n.t(), hidden.t());
+    // h1 = rmsnorm(attn) + hidden  (one kernel)
+    vt::rocm::RmsNormPlusAddRocm(d.q, h1.t(), attn.t(), w_pa, hidden.t(), plain);
 
     Tensor w_pf = ResidentWeight(d, w.pre_feedforward_layernorm, {H});
     vt::RmsNorm(d.q, dh2.t(), h1.t(), w_pf, plain);
@@ -576,12 +574,11 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
       vt::RmsNorm(d.q, n2.t(), moe_out.tensor, w_p2, plain);
       vt::Add(d.q, sum.t(), n1.t(), n2.t());
       Tensor w_pff = ResidentWeight(d, w.post_feedforward_layernorm, {H});
-      vt::RmsNorm(d.q, n3.t(), sum.t(), w_pff, plain);
-      vt::Add(d.q, h2.t(), n3.t(), h1.t());
+      // h2 = rmsnorm(sum) + h1
+      vt::rocm::RmsNormPlusAddRocm(d.q, h2.t(), sum.t(), w_pff, h1.t(), plain);
     } else {
       Tensor w_pff = ResidentWeight(d, w.post_feedforward_layernorm, {H});
-      vt::RmsNorm(d.q, mlp_n.t(), mlp.t(), w_pff, plain);
-      vt::Add(d.q, h2.t(), mlp_n.t(), h1.t());
+      vt::rocm::RmsNormPlusAddRocm(d.q, h2.t(), mlp.t(), w_pff, h1.t(), plain);
     }
 
     if (ple > 0) {
