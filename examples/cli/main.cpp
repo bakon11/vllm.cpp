@@ -263,6 +263,7 @@ int main(int argc, char** argv) {
                    r + 1, args.repeat,
                    out.finish_reason != nullptr ? out.finish_reason : "(none)",
                    out.prompt_tokens, ct, secs, tps);
+      std::fflush(stderr);
       vllm_completion_free(&out);
     }
   }

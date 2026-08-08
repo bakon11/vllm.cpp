@@ -316,11 +316,25 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
 // GeGLU MLP (gemma4.py::Gemma4MLP).
 DBuf Gemma4MlpBlock(Dev d, const Gemma4MlpWeights& w, int64_t H, int64_t I,
                     const Tensor& dh2, int64_t T) {
-  // gate_up MatmulBT -> GeluAndMul(tanh) via the SHARED bf16 GeGLU gate-up MLP seam
-  // (layers::UnquantizedMlpGateUpGeluMethod). Byte-for-byte the inline sequence —
-  // folds Gemma-4 onto the shared MlpGateUpMethodBase descriptor. (Tier-C1,
-  // arch-fusion-fold-plan-2026-07-30.)
-  DBuf act = layers::UnquantizedMlpGateUpGeluMethod(&w.gate_up_proj, I).Apply(d, dh2);
+  // Dense GeGLU: TLS reuse of large gate_up [T,2I] + act [T,I] across layers.
+  Tensor wgu = ResidentWeight(d, w.gate_up_proj);
+  struct MlpTls {
+    int dev = -1;
+    int64_t T = 0, I = 0;
+    std::optional<DBuf> gu, act;
+  };
+  static thread_local MlpTls tls;
+  if (tls.dev != d.q.device.index || tls.T != T || tls.I != I) {
+    tls.gu.emplace(d, DType::kBF16, std::vector<int64_t>{T, 2 * I});
+    tls.act.emplace(d, DType::kBF16, std::vector<int64_t>{T, I});
+    tls.dev = d.q.device.index;
+    tls.T = T;
+    tls.I = I;
+  }
+  DBuf& gu = *tls.gu;
+  DBuf& act = *tls.act;
+  vt::MatmulBT(d.q, gu.t(), dh2, wgu);
+  vt::GeluAndMul(d.q, act.t(), gu.t());
   Tensor wd = ResidentWeight(d, w.down_proj);
   DBuf down(d, DType::kBF16, {T, H});
   vt::MatmulBT(d.q, down.t(), act.t(), wd);
