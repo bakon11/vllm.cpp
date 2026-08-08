@@ -913,6 +913,7 @@ add_library(vllm STATIC
   src/vt/op_provider.cpp
   src/vt/communicator.cpp
   src/vt/ops.cpp
+  src/vt/fused_ops.cpp
   src/vt/merged_gemm.cpp
   src/vt/cuda/nvfp4_persistent_cache.cpp
   src/vt/cpu/cpu_backend.cpp

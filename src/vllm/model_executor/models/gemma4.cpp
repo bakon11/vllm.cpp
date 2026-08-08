@@ -52,8 +52,7 @@
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
-#include "vt/rocm/rocm_gelu_mul_sep.h"
-#include "vt/rocm/rocm_rmsnorm_plus_add.h"
+#include "vt/fused_ops.h"
 
 namespace vllm {
 namespace {
@@ -586,7 +585,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
 
     Tensor w_pa = ResidentWeight(d, w.post_attention_layernorm, {H});
     // h1 = rmsnorm(attn) + hidden  (one kernel)
-    vt::rocm::RmsNormPlusAddRocm(d.q, h1.t(), attn.t(), w_pa, hidden.t(), plain);
+    vt::RmsNormPlusAdd(d.q, h1.t(), attn.t(), w_pa, hidden.t(), plain);
 
     if (layer_prof) d.b.Synchronize(d.q);
     const auto t1 = layer_prof ? clock::now() : clock::time_point{};
@@ -607,11 +606,11 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
       Tensor w_p2 = ResidentWeight(d, w.moe.post_feedforward_layernorm_2, {H});
       Tensor w_pff = ResidentWeight(d, w.post_feedforward_layernorm, {H});
       // h2 = rmsnorm(rmsnorm(mlp)+rmsnorm(moe), w_pff) + h1  — one fused kernel
-      vt::rocm::DualRmsNormPlusResRocm(d.q, h2.t(), mlp.t(), w_p1, moe_out.tensor, w_p2, w_pff,
+      vt::DualRmsNormPlusRes(d.q, h2.t(), mlp.t(), w_p1, moe_out.tensor, w_p2, w_pff,
                                        h1.t(), plain);
     } else {
       Tensor w_pff = ResidentWeight(d, w.post_feedforward_layernorm, {H});
-      vt::rocm::RmsNormPlusAddRocm(d.q, h2.t(), mlp.t(), w_pff, h1.t(), plain);
+      vt::RmsNormPlusAdd(d.q, h2.t(), mlp.t(), w_pff, h1.t(), plain);
     }
 
     if (layer_prof) {
@@ -650,7 +649,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
       const char* src = static_cast<const char*>(ple_by_layer.ptr()) +
                         static_cast<size_t>(l) * layer_bytes;
       d.b.Copy(d.q, ple_l.ptr(), src, layer_bytes);
-      vt::rocm::GeluMulSeparateRocm(d.q, gated.ptr(), gate_lin.ptr(), ple_l.ptr(), T * ple,
+      vt::GeluMulSeparate(d.q, gated.ptr(), gate_lin.ptr(), ple_l.ptr(), T * ple,
                                     DType::kBF16);
 
       Tensor wp = ResidentWeight(d, w.per_layer_projection, {H, ple});

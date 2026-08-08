@@ -19,9 +19,7 @@
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
-#include "vt/rocm/rocm_gelu_mul_sep.h"
-#include "vt/rocm/rocm_gemma4_expert_geglu.h"
-#include "vt/rocm/rocm_matmul_batch.h"
+#include "vt/fused_ops.h"
 
 namespace vllm {
 namespace {
@@ -67,7 +65,7 @@ void ExpertGeGLUDeviceAccum(Dev d, DBuf& out, const Tensor& x, const uint16_t* g
       Tensor::Contiguous(const_cast<uint16_t*>(gate_up_e), DType::kBF16, dev, {2 * I, H});
   vt::MatmulBT(d.q, s.gu.t(), x, gu_w);
   vt::GeluAndMul(d.q, s.act.t(), s.gu.t());
-  vt::rocm::MatmulBTAlphaBetaRocm(d.q, out.ptr(), s.act.ptr(), down_e, static_cast<int>(T),
+  vt::MatmulBTAlphaBeta(d.q, out.ptr(), s.act.ptr(), down_e, static_cast<int>(T),
                                   static_cast<int>(H), static_cast<int>(I), alpha, beta,
                                   DType::kBF16);
 }
@@ -76,15 +74,15 @@ void ExpertGeGLUFp8Native(Dev d, DBuf& out, const Tensor& x, const void* fp8_gu,
                           const void* s_gu, const void* fp8_dn, const void* s_dn, int64_t I,
                           int64_t H, ExpertScratch& s, float alpha, float beta) {
   VT_CHECK(x.shape[0] == 1, "fp8 native: T==1 only");
-  vt::rocm::MatmulBTFp8ChannelRocm(d.q, s.gu.ptr(), x.data, fp8_gu, s_gu, /*M=*/1,
+  vt::MatmulBTFp8Channel(d.q, s.gu.ptr(), x.data, fp8_gu, s_gu, /*M=*/1,
                                    static_cast<int>(2 * I), static_cast<int>(H), 1.f, 0.f);
   vt::GeluAndMul(d.q, s.act.t(), s.gu.t());
   if (beta == 0.f) {
-    vt::rocm::MatmulBTFp8ChannelRocm(d.q, out.ptr(), s.act.ptr(), fp8_dn, s_dn, /*M=*/1,
+    vt::MatmulBTFp8Channel(d.q, out.ptr(), s.act.ptr(), fp8_dn, s_dn, /*M=*/1,
                                      static_cast<int>(H), static_cast<int>(I), alpha, 0.f);
   } else {
     DBuf ytmp(d, DType::kBF16, {1, H});
-    vt::rocm::MatmulBTFp8ChannelRocm(d.q, ytmp.ptr(), s.act.ptr(), fp8_dn, s_dn, /*M=*/1,
+    vt::MatmulBTFp8Channel(d.q, ytmp.ptr(), s.act.ptr(), fp8_dn, s_dn, /*M=*/1,
                                      static_cast<int>(H), static_cast<int>(I), 1.f, 0.f);
     vt::MulScalar(d.q, out.t(), out.t(), static_cast<double>(beta));
     DBuf ysc(d, DType::kBF16, {1, H});
@@ -127,7 +125,7 @@ bool ExpertGeGLUTopKFusedGelu(Dev d, DBuf& ysum, const Tensor& x, const uint16_t
   // Phase 1: gate_up GEMMs into packed [G, 2I]
   for (int g = 0; g < G; ++g) {
     void* gu_out = static_cast<char*>(tls.gu->ptr()) + static_cast<size_t>(g) * gu_row;
-    vt::rocm::MatmulBTAlphaBetaRocm(d.q, gu_out, x.data, gu_ptrs[g], /*M=*/1, Ngu, Kh, 1.f, 0.f,
+    vt::MatmulBTAlphaBeta(d.q, gu_out, x.data, gu_ptrs[g], /*M=*/1, Ngu, Kh, 1.f, 0.f,
                                     DType::kBF16);
   }
 
@@ -143,7 +141,7 @@ bool ExpertGeGLUTopKFusedGelu(Dev d, DBuf& ysum, const Tensor& x, const uint16_t
     const float alpha = wts[g];
     const float beta = (g == 0) ? 0.f : 1.f;
     void* act_g = static_cast<char*>(tls.act->ptr()) + static_cast<size_t>(g) * act_row;
-    vt::rocm::MatmulBTAlphaBetaRocm(d.q, ysum.ptr(), act_g, dn_ptrs[g], /*M=*/1, Nh, Ki, alpha,
+    vt::MatmulBTAlphaBeta(d.q, ysum.ptr(), act_g, dn_ptrs[g], /*M=*/1, Nh, Ki, alpha,
                                     beta, DType::kBF16);
   }
   return true;
@@ -699,7 +697,7 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
             gu_v[static_cast<size_t>(g)] = gu_p[static_cast<size_t>(g)];
             dn_v[static_cast<size_t>(g)] = dn_p[static_cast<size_t>(g)];
           }
-          ran = vt::rocm::ExpertGeGLUBf16TopKM1Rocm(d.q, ysum.ptr(), xin.ptr(), gu_v.data(),
+          ran = vt::ExpertGeGLUBf16TopKM1(d.q, ysum.ptr(), xin.ptr(), gu_v.data(),
                                                     dn_v.data(), wts.data(), top_k,
                                                     static_cast<int>(I), static_cast<int>(H));
         }
@@ -858,6 +856,11 @@ bool RunGemma4FusedTopkExpertGeGLU(vt::Queue&, void*, const void*, const uint16_
                                    const uint16_t* const*, const float*, int, int64_t, int64_t) {
   return false;
 }
+bool PeerCopyGemma4ExpertSlice(int, const void*, const void*, int, int64_t, int64_t, int, void*,
+                               void*) {
+  return false;
+}
+void PinGemma4Fp8ExpertHostCache(const Gemma4Fp8ExpertMats&) {}
 #endif  // VLLM_CPP_HIP
 
 }  // namespace vllm
