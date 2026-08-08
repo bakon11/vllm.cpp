@@ -444,6 +444,24 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     vt::MulScalar(d.q, ple_input.t(), ple_input.t(), g.input_scale);
   }
 
+  // Layout [L,T,ple] so each layer's slice is one contiguous D2D (not T row gathers).
+  DBuf ple_by_layer(d, DType::kBF16,
+                    ple > 0 ? std::vector<int64_t>{L, T, ple} : std::vector<int64_t>{1, 1, 1});
+  if (ple > 0) {
+    const size_t row = static_cast<size_t>(ple) * sizeof(uint16_t);
+    const auto* src = static_cast<const char*>(ple_input.ptr());
+    auto* dst = static_cast<char*>(ple_by_layer.ptr());
+    for (int64_t t = 0; t < T; ++t) {
+      for (int64_t li = 0; li < L; ++li) {
+        const size_t s_off =
+            (static_cast<size_t>(t) * static_cast<size_t>(L) + static_cast<size_t>(li)) * row;
+        const size_t d_off =
+            (static_cast<size_t>(li) * static_cast<size_t>(T) + static_cast<size_t>(t)) * row;
+        CopyRow(d, dst + d_off, src + s_off, row);
+      }
+    }
+  }
+
   StepInputs si = BuildStepInputs(d, positions, attn_meta, config);
 
   // hidden state stream (each layer fully materializes h; no separate residual).
@@ -558,14 +576,11 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
       DBuf& ple_l = *lt.ple_l;
       DBuf& gated = *lt.gated;
       vt::MatmulBT(d.q, gate_lin.t(), h2.t(), wg);
-      const auto* pin = static_cast<const char*>(ple_input.ptr());
-      auto* pl = static_cast<char*>(ple_l.ptr());
-      for (int64_t t = 0; t < T; ++t) {
-        const size_t src_off =
-            (static_cast<size_t>(t) * static_cast<size_t>(L) + static_cast<size_t>(l)) *
-            ple_row_bytes;
-        CopyRow(d, pl + static_cast<size_t>(t) * ple_row_bytes, pin + src_off, ple_row_bytes);
-      }
+      // Contiguous [T,ple] slice for this layer from [L,T,ple] layout.
+      const size_t layer_bytes = static_cast<size_t>(T) * ple_row_bytes;
+      const char* src = static_cast<const char*>(ple_by_layer.ptr()) +
+                        static_cast<size_t>(l) * layer_bytes;
+      d.b.Copy(d.q, ple_l.ptr(), src, layer_bytes);
       vt::rocm::GeluMulSeparateRocm(d.q, gated.ptr(), gate_lin.ptr(), ple_l.ptr(), T * ple,
                                     DType::kBF16);
 
