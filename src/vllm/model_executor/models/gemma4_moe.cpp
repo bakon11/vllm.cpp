@@ -96,6 +96,30 @@ void EnsureGemma4Fp8ExpertCached(const Gemma4Fp8ExpertMats& ex, int64_t I, int64
                           ex.cached_dn.data());
 }
 
+// Dequant into caller buffers without retaining a permanent host BF16 cache.
+// Used by dual-GPU resident upload (must not pin ~1.5GiB/layer on host).
+void DequantGemma4Fp8ExpertToBf16Ephemeral(const Gemma4Fp8ExpertMats& ex, int64_t I,
+                                           int64_t H, uint16_t* gate_up_out,
+                                           uint16_t* down_out) {
+  VT_CHECK(gate_up_out && down_out, "fp8 expert ephemeral dequant null out");
+  if (!ex.cached_gu.empty() && !ex.cached_dn.empty() &&
+      static_cast<int64_t>(ex.cached_gu.size()) == 2 * I * H &&
+      static_cast<int64_t>(ex.cached_dn.size()) == H * I) {
+    std::memcpy(gate_up_out, ex.cached_gu.data(), ex.cached_gu.size() * sizeof(uint16_t));
+    std::memcpy(down_out, ex.cached_dn.data(), ex.cached_dn.size() * sizeof(uint16_t));
+    return;
+  }
+  DequantFp8ChannelToBf16(ex.gate_w.bytes.data(),
+                          reinterpret_cast<const uint16_t*>(ex.gate_s.bytes.data()), I, H,
+                          gate_up_out);
+  DequantFp8ChannelToBf16(ex.up_w.bytes.data(),
+                          reinterpret_cast<const uint16_t*>(ex.up_s.bytes.data()), I, H,
+                          gate_up_out + I * H);
+  DequantFp8ChannelToBf16(ex.down_w.bytes.data(),
+                          reinterpret_cast<const uint16_t*>(ex.down_s.bytes.data()), H, I,
+                          down_out);
+}
+
 // Host BF16 cache + device upload once (subsequent tokens use device GEMM path).
 bool EnsureGemma4Fp8ExpertOnDevice(Dev d, const Gemma4Fp8ExpertMats& ex, int64_t I,
                                    int64_t H) {
