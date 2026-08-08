@@ -75,7 +75,12 @@ size_t UploadGemma4ExpertsResident(std::vector<Gemma4MoeLayerWeights>& layers,
 size_t UploadGemma4ExpertsResidentForWeights(Gemma4Weights& weights, int num_gpus);
 
 // Dequant one FP8 expert into host BF16 gate_up[2I,H] and down[H,I] (caller-owned).
+// Fills permanent host cache (decode path). Prefer Ephemeral for bulk upload.
 void DequantGemma4Fp8ExpertToBf16(const Gemma4Fp8ExpertMats& ex, int64_t I, int64_t H,
                                   uint16_t* gate_up_out, uint16_t* down_out);
+// Same dequant without retaining permanent host BF16 cache (resident upload).
+void DequantGemma4Fp8ExpertToBf16Ephemeral(const Gemma4Fp8ExpertMats& ex, int64_t I,
+                                           int64_t H, uint16_t* gate_up_out,
+                                           uint16_t* down_out);
 
 }  // namespace vllm
