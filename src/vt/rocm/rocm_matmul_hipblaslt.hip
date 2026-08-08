@@ -234,7 +234,8 @@ void* LtWorkspace(size_t need) {
   return ws;
 }
 
-// C[M,N] = alpha * A[M,K] @ B[N,K]^T + beta * C   (all row-major BF16)
+// C[M,N] row-major = alpha * A[M,K] @ B[N,K]^T + beta * C
+// Same col-major view as hipblasGemmEx(OP_T, OP_N, m=N, n=M, k=K, B, K, A, K, C, N).
 bool MatmulBTLt(hipStream_t stream, void* C, const void* A, const void* B, int M, int N, int K,
                 float alpha, float beta) {
   if (!LtEnabled() || M <= 0 || N <= 0 || K <= 0) return false;
@@ -257,34 +258,31 @@ bool MatmulBTLt(hipStream_t stream, void* C, const void* A, const void* B, int M
     if (pref) (void)hipblasLtMatmulPreferenceDestroy(pref);
   };
 
-  // Row-major: rows, cols, ld=cols for contiguous
-  if (hipblasLtMatrixLayoutCreate(&layoutA, HIP_R_16BF, M, K, K) != HIPBLAS_STATUS_SUCCESS) {
+  // Col-major views of row-major buffers (default ORDER_COL):
+  //   weight B_rm[N,K] -> A_cm is K x N, ld=K
+  //   act    A_rm[M,K] -> B_cm is K x M, ld=K
+  //   out    C_rm[M,N] -> C_cm is N x M, ld=N
+  if (hipblasLtMatrixLayoutCreate(&layoutA, HIP_R_16BF, K, N, K) != HIPBLAS_STATUS_SUCCESS) {
     cleanup();
     return false;
   }
-  if (hipblasLtMatrixLayoutCreate(&layoutB, HIP_R_16BF, N, K, K) != HIPBLAS_STATUS_SUCCESS) {
+  if (hipblasLtMatrixLayoutCreate(&layoutB, HIP_R_16BF, K, M, K) != HIPBLAS_STATUS_SUCCESS) {
     cleanup();
     return false;
   }
-  if (hipblasLtMatrixLayoutCreate(&layoutC, HIP_R_16BF, M, N, N) != HIPBLAS_STATUS_SUCCESS) {
+  if (hipblasLtMatrixLayoutCreate(&layoutC, HIP_R_16BF, N, M, N) != HIPBLAS_STATUS_SUCCESS) {
     cleanup();
     return false;
   }
-  const hipblasLtOrder_t row = HIPBLASLT_ORDER_ROW;
-  (void)hipblasLtMatrixLayoutSetAttribute(layoutA, HIPBLASLT_MATRIX_LAYOUT_ORDER, &row,
-                                          sizeof(row));
-  (void)hipblasLtMatrixLayoutSetAttribute(layoutB, HIPBLASLT_MATRIX_LAYOUT_ORDER, &row,
-                                          sizeof(row));
-  (void)hipblasLtMatrixLayoutSetAttribute(layoutC, HIPBLASLT_MATRIX_LAYOUT_ORDER, &row,
-                                          sizeof(row));
 
   if (hipblasLtMatmulDescCreate(&matmulDesc, HIPBLAS_COMPUTE_32F, HIP_R_32F) !=
       HIPBLAS_STATUS_SUCCESS) {
     cleanup();
     return false;
   }
-  const hipblasOperation_t opA = HIPBLAS_OP_N;
-  const hipblasOperation_t opB = HIPBLAS_OP_T;  // B^T
+  // C_cm = A_cm^T * B_cm  => (N x K)*(K x M) = N x M  == row C[M,N]
+  const hipblasOperation_t opA = HIPBLAS_OP_T;
+  const hipblasOperation_t opB = HIPBLAS_OP_N;
   (void)hipblasLtMatmulDescSetAttribute(matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSA, &opA,
                                         sizeof(opA));
   (void)hipblasLtMatmulDescSetAttribute(matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSB, &opB,
@@ -295,30 +293,27 @@ bool MatmulBTLt(hipStream_t stream, void* C, const void* A, const void* B, int M
       cleanup();
       return false;
     }
-    const uint64_t max_ws = 64ull << 20;  // 64 MiB
+    const uint64_t max_ws = 64ull << 20;
     (void)hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                                 &max_ws, sizeof(max_ws));
     hipblasLtMatmulHeuristicResult_t heur{};
     int returned = 0;
     const hipblasStatus_t hs = hipblasLtMatmulAlgoGetHeuristic(
         lt.h, matmulDesc, layoutA, layoutB, layoutC, layoutC, pref, 1, &heur, &returned);
-    if (hs != HIPBLAS_STATUS_SUCCESS || returned <= 0 ||
-        heur.state != HIPBLAS_STATUS_SUCCESS) {
+    if (hs != HIPBLAS_STATUS_SUCCESS || returned <= 0 || heur.state != HIPBLAS_STATUS_SUCCESS) {
       cleanup();
-      cache.ok = false;
-      // poison: mark failed so we don't retry forever — use empty ok
       static thread_local int fail_log = 0;
       if (fail_log++ < 3) {
-        std::fprintf(stderr, "hipBLASLt heuristic fail M=%d N=%d K=%d st=%d ret=%d\n", M, N, K,
-                     static_cast<int>(hs), returned);
+        std::fprintf(stderr, "hipBLASLt COL heuristic fail M=%d N=%d K=%d st=%d ret=%d\n", M, N,
+                     K, static_cast<int>(hs), returned);
       }
-      // store negative cache
       LtCache()[key] = LtAlgoCache{};
       return false;
     }
     cache.algo = heur.algo;
     cache.workspace = heur.workspaceSize;
     cache.ok = true;
+    std::fprintf(stderr, "hipBLASLt COL ok M=%d N=%d K=%d ws=%zu\n", M, N, K, cache.workspace);
   }
 
   void* ws = LtWorkspace(cache.workspace);
@@ -327,12 +322,15 @@ bool MatmulBTLt(hipStream_t stream, void* C, const void* A, const void* B, int M
     return false;
   }
 
-  const hipblasStatus_t st = hipblasLtMatmul(
-      lt.h, matmulDesc, &alpha, A, layoutA, B, layoutB, &beta, C, layoutC, C, layoutC,
-      &cache.algo, ws, cache.workspace, stream);
+  // Pass weight as A, act as B (matches GemmEx argument order for OP_T,OP_N)
+  const hipblasStatus_t st =
+      hipblasLtMatmul(lt.h, matmulDesc, &alpha, B, layoutA, A, layoutB, &beta, C, layoutC, C,
+                      layoutC, &cache.algo, ws, cache.workspace, stream);
   cleanup();
   if (st != HIPBLAS_STATUS_SUCCESS) {
     cache.ok = false;
+    std::fprintf(stderr, "hipBLASLt COL matmul fail st=%d M=%d N=%d K=%d\n", static_cast<int>(st),
+                 M, N, K);
     return false;
   }
   return true;
