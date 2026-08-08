@@ -27,6 +27,8 @@ These change how the engine runs and have no CLI flag (or complement one).
 | `VT_VULKAN_DEVICE` | first suitable device | Forces the Vulkan physical device index. Required on a multi-GPU host to pin the intended device |
 | `VT_KV_CACHE_F32` | off (native KV dtype) | Forces the KV cache to fp32. A precision/diagnostic lever, at the cost of double the KV memory |
 | `VT_ENABLE_JUMP_FORWARD` | off | Opt-in to jump-forward constrained decoding (SGLang parity SW3): when a grammar/structured-output request reaches a state with exactly one valid next token, that token is emitted without a model step. Currently drives only the standalone driver (`DrainForcedTokens`); output-identical by construction (it fires only where the constrained sampler already has a single valid token), so it changes speed, never tokens. Off by default until the production scheduler splice (jumped-token KV recompute) lands. Set `1`/`true`/`on` to enable |
+| `VT_CHAT_ENABLE_THINKING` | off | Chat-template kwarg `enable_thinking` for HF/Gemma4 Jinja (vLLM default-chat-template-kwargs parity). `1` enables the thinking channel; default off emits an empty thought block where the template requires it |
+| `VT_SERVER_VERBOSE` | off | `1` enables verbose OpenAI server chat stage logs (request roles, prompt preview, step heartbeats). Debug only; does not change tokens |
 
 ## GGUF loading
 

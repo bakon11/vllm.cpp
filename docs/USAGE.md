@@ -444,3 +444,13 @@ Useful for measurement: `--denoise-only` times the DiT loop without loading the 
 Served over HTTP too: pass `--video-dit` (plus the VAEs and configs) to `examples/server` and
 `POST /v1/videos`, `POST /v1/videos/sync` and `GET /v1/videos/{id}` register. Without it the
 routes stay unregistered.
+
+### Chat template thinking flag
+
+```
+export VT_CHAT_ENABLE_THINKING=0   # default off
+export VT_CHAT_ENABLE_THINKING=1   # enable Gemma4/HF thinking channel
+```
+
+Jinja `enable_thinking` kwarg (vLLM default-chat-template-kwargs parity). Sibling
+`chat_template.jinja` is loaded when `tokenizer_config.json` has no inline template.

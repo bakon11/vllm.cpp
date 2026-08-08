@@ -3,6 +3,8 @@
 #include "vllm/entrypoints/openai/serving_chat.h"
 
 #include <ctime>
+#include <cstdlib>
+#include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -578,6 +580,55 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   const std::string prompt =
       prompt_fn_(request.messages, /*add_generation_prompt=*/true, tools);
 
+  // Verbose request logging (VT_SERVER_VERBOSE=1 or --verbose).
+  static const bool verbose = [] {
+    const char* e = std::getenv("VT_SERVER_VERBOSE");
+    return e && e[0] == '1';
+  }();
+  if (verbose) {
+    std::cerr << "chat: id=" << request_id << " model=" << model_name
+              << " msgs=" << request.messages.size()
+              << " stream=" << (request.stream ? "1" : "0")
+              << " max_tokens="
+              << (request.max_completion_tokens.has_value()
+                      ? *request.max_completion_tokens
+                      : request.max_tokens.value_or(-1))
+              << " temp="
+              << (request.temperature.has_value() ? *request.temperature : -1.0)
+              << " tools=" << tools.size() << " prompt_chars=" << prompt.size()
+              << "\n";
+    // Role summary
+    std::cerr << "chat: roles=";
+    for (size_t i = 0; i < request.messages.size(); ++i) {
+      if (i) std::cerr << ",";
+      std::cerr << request.messages[i].role;
+      size_t clen = 0;
+      if (request.messages[i].content.has_value())
+        clen = request.messages[i].content->size();
+      std::cerr << "(" << clen << ")";
+    }
+    std::cerr << "\n";
+    // Prompt preview (escape newlines)
+    const size_t prev_n = std::min<size_t>(prompt.size(), 600);
+    std::cerr << "chat: prompt_preview=\"";
+    for (size_t i = 0; i < prev_n; ++i) {
+      const char c = prompt[i];
+      if (c == '\n')
+        std::cerr << "\\n";
+      else if (c == '\r')
+        std::cerr << "\\r";
+      else if (c == '"')
+        std::cerr << "\\\"";
+      else if (static_cast<unsigned char>(c) < 32)
+        std::cerr << '?';
+      else
+        std::cerr << c;
+    }
+    if (prompt.size() > prev_n) std::cerr << "...";
+    std::cerr << "\"\n";
+    std::cerr.flush();
+  }
+
   // ── Multimodal (MM-SERVE-ENGINE) ─────────────────────────────────────────
   // When the mm seam is set AND a message carries a mm content part, decode +
   // route the media through the mm processor and carry the placeholder-EXPANDED
@@ -899,6 +950,23 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   response.usage.prompt_tokens = num_prompt_tokens;
   response.usage.completion_tokens = num_generated_tokens;
   response.usage.total_tokens = num_prompt_tokens + num_generated_tokens;
+
+  if (verbose) {
+    std::string finish = response.choices.empty()
+                             ? "?"
+                             : response.choices[0].finish_reason.value_or("?");
+    std::string out_preview;
+    if (!response.choices.empty() && response.choices[0].message.content.has_value()) {
+      out_preview = *response.choices[0].message.content;
+      if (out_preview.size() > 300) out_preview.resize(300);
+      for (char& c : out_preview)
+        if (c == '\n') c = ' ';
+    }
+    std::cerr << "chat: done id=" << request_id << " prompt_tok=" << num_prompt_tokens
+              << " completion_tok=" << num_generated_tokens << " finish=" << finish
+              << " out_preview=\"" << out_preview << "\"\n";
+    std::cerr.flush();
+  }
 
   ChatCompletionResult result;
   result.streaming = false;

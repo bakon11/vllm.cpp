@@ -373,3 +373,4 @@ built on it rather than keeping the flattering one.
 
 Build flags, environment variables, and the full gate list are in
 [BUILD.md](BUILD.md) and [ENVIRONMENT.md](ENVIRONMENT.md).
+Server concurrent generate (2026-08-08): blocking chat waits on own request_id only.

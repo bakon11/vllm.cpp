@@ -2206,7 +2206,4 @@ boundary; runtime behavior and Laguna's lifecycle state are unchanged.
 The next run also guarded Voxtral's GCC-only `-Wstringop-overflow` suppression
 out of Clang, where it was fatal. Its Go `go-m1cpu` diagnostics were nonfatal
 and outside this repo.
-
-**Agent onboarding:** [session](../.agents/specs/session-onboarding.md) +
-[entry](../.agents/specs/developer-agent-protocol-entrypoint.md) implemented;
-documentation-only.
+OpenAI server (2026-08-08): generate waits on own request_id; chat thinking via VT_CHAT_ENABLE_THINKING; chat_template.jinja sidecar.
