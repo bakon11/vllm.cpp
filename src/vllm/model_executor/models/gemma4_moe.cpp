@@ -207,22 +207,106 @@ void DequantGemma4Fp8ExpertToBf16Ephemeral(const Gemma4Fp8ExpertMats& ex, int64_
 }
 
 // Host BF16 cache + device upload once (subsequent tokens use device GEMM path).
+// H2D is async on d.q — later GEMMs on the same stream see the data without a
+// device-wide Synchronize (was serializing every expert upload).
+// VRAM budget: VT_GEMMA4_EXPERT_VRAM_MB (default 12288). LRU evicts oldest.
+namespace {
+struct DevExpertLru {
+  struct Slot {
+    const Gemma4Fp8ExpertMats* ex = nullptr;
+    void* gu = nullptr;
+    void* dn = nullptr;
+    size_t bytes = 0;
+    uint64_t tick = 0;
+  };
+  std::vector<Slot> slots;
+  size_t used = 0;
+  size_t budget = 0;
+  uint64_t tick = 1;
+  int dev = -1;
+
+  size_t BudgetBytes() {
+    if (budget) return budget;
+    // 0 = unlimited (legacy keep-all). Set VT_GEMMA4_EXPERT_VRAM_MB to cap.
+    size_t mb = 0;
+    if (const char* e = std::getenv("VT_GEMMA4_EXPERT_VRAM_MB")) {
+      const long v = std::strtol(e, nullptr, 10);
+      if (v >= 0) mb = static_cast<size_t>(v);
+    }
+    budget = mb == 0 ? static_cast<size_t>(-1) : mb * 1024ull * 1024ull;
+    return budget;
+  }
+
+  void EvictOne(Dev d) {
+    if (slots.empty()) return;
+    size_t victim = 0;
+    for (size_t i = 1; i < slots.size(); ++i)
+      if (slots[i].tick < slots[victim].tick) victim = i;
+    Slot s = slots[victim];
+    if (s.gu) d.b.Free(s.gu);
+    if (s.dn) d.b.Free(s.dn);
+    if (s.ex) {
+      s.ex->dev_gu = nullptr;
+      s.ex->dev_dn = nullptr;
+    }
+    used = used >= s.bytes ? used - s.bytes : 0;
+    slots.erase(slots.begin() + static_cast<std::ptrdiff_t>(victim));
+  }
+
+  void Note(const Gemma4Fp8ExpertMats* ex, void* gu, void* dn, size_t bytes, Dev d) {
+    if (dev != d.q.device.index) {
+      // New device context — drop tracking (pointers are device-local).
+      slots.clear();
+      used = 0;
+      dev = d.q.device.index;
+    }
+    const size_t bud = BudgetBytes();
+    while (used + bytes > bud && !slots.empty()) EvictOne(d);
+    if (used + bytes > bud) return;  // cannot fit even alone
+    slots.push_back(Slot{ex, gu, dn, bytes, tick++});
+    used += bytes;
+  }
+
+  void Touch(const Gemma4Fp8ExpertMats* ex) {
+    for (auto& s : slots) {
+      if (s.ex == ex) {
+        s.tick = tick++;
+        return;
+      }
+    }
+  }
+};
+
+DevExpertLru& ExpertLru() {
+  static DevExpertLru lru;
+  return lru;
+}
+}  // namespace
+
 bool EnsureGemma4Fp8ExpertOnDevice(Dev d, const Gemma4Fp8ExpertMats& ex, int64_t I,
                                    int64_t H) {
   EnsureGemma4Fp8ExpertCached(ex, I, H);
-  if (ex.dev_gu != nullptr && ex.dev_dn != nullptr) return true;
+  if (ex.dev_gu != nullptr && ex.dev_dn != nullptr) {
+    ExpertLru().Touch(&ex);
+    return true;
+  }
   const size_t gu_b = static_cast<size_t>(2 * I * H) * sizeof(uint16_t);
   const size_t dn_b = static_cast<size_t>(H * I) * sizeof(uint16_t);
+  const size_t total = gu_b + dn_b;
   void* gu = nullptr;
   void* dn = nullptr;
   try {
+    // Make room under budget before alloc.
+    auto& lru = ExpertLru();
+    while (lru.used + total > lru.BudgetBytes() && !lru.slots.empty()) lru.EvictOne(d);
     gu = d.b.Alloc(gu_b);
     dn = d.b.Alloc(dn_b);
     d.b.Copy(d.q, gu, ex.cached_gu.data(), gu_b);
     d.b.Copy(d.q, dn, ex.cached_dn.data(), dn_b);
-    d.b.Synchronize(d.q);
+    // No Synchronize — same-stream GEMM orders after these copies.
     ex.dev_gu = gu;
     ex.dev_dn = dn;
+    lru.Note(&ex, gu, dn, total, d);
     return true;
   } catch (...) {
     if (gu) d.b.Free(gu);
