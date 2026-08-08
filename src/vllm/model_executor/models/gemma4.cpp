@@ -212,18 +212,37 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
            "gemma4: KV cache head dims mismatch this layer (heterogeneous KV — "
            "runner must allocate per-layer head_dim; see gemma4.h G1 note)");
 
-  // Merged QKVParallelLinear: D1 folds the shared-input q/k/v GEMMs to ONE
-  // MatmulBT over the merged [qdim+2kdim,H] owner + a contiguous QkvSplit
-  // (MergedQkvEnabled(), VT_QWEN3_QKV_MERGE default ON; =0 = byte-identical
-  // 3-shard). The QKV GEMM is uniform across all Gemma-4 layers — the
-  // heterogeneous sliding/shared-KV/norm handling downstream is unaffected.
-  DBuf q(d, adt, {T, qdim});
-  DBuf k(d, adt, {T, kdim});
-  DBuf v(d, adt, {T, kdim});
+  // TLS temps across layers (decode T=1 thrash).
+  struct AttnTls {
+    int dev = -1;
+    int64_t T = 0, qdim = 0, kdim = 0, Hq = 0, Dh = 0;
+    std::optional<DBuf> q, k, v, qkv, attn;
+  };
+  static thread_local AttnTls tls;
+  if (tls.dev != d.q.device.index || tls.T != T || tls.qdim != qdim || tls.kdim != kdim ||
+      tls.Hq != Hq || tls.Dh != Dh) {
+    tls.q.emplace(d, adt, std::vector<int64_t>{T, qdim});
+    tls.k.emplace(d, adt, std::vector<int64_t>{T, kdim});
+    tls.v.emplace(d, adt, std::vector<int64_t>{T, kdim});
+    tls.qkv.emplace(d, adt, std::vector<int64_t>{T, qdim + 2 * kdim});
+    tls.attn.emplace(d, adt, std::vector<int64_t>{T, Hq, Dh});
+    tls.dev = d.q.device.index;
+    tls.T = T;
+    tls.qdim = qdim;
+    tls.kdim = kdim;
+    tls.Hq = Hq;
+    tls.Dh = Dh;
+  }
+  DBuf& q = *tls.q;
+  DBuf& k = *tls.k;
+  DBuf& v = *tls.v;
+  DBuf& qkv = *tls.qkv;
+  DBuf& attn = *tls.attn;
+
+  // Merged QKVParallelLinear: one MatmulBT + QkvSplit (default).
   {
     Tensor wqkv = ResidentWeight(d, w.attn.qkv_proj);
     if (MergedQkvEnabled()) {
-      DBuf qkv(d, adt, {T, qdim + 2 * kdim});
       vt::MatmulBT(d.q, qkv.t(), dhn, wqkv);
       vt::QkvSplit(d.q, q.t(), k.t(), v.t(), qkv.t());
     } else {
@@ -275,9 +294,10 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
     Tensor v3 = Reshape(v.t(), {T, Hkv, Dh});
     Tensor kw = k3;
     Tensor vw = v3;
-    DBuf kcast(d, kv.dtype, {T, Hkv, Dh});
-    DBuf vcast(d, kv.dtype, {T, Hkv, Dh});
+    // Cast buffers only when dtype differs (rare for bf16 KV).
     if (kv.dtype != adt) {
+      DBuf kcast(d, kv.dtype, {T, Hkv, Dh});
+      DBuf vcast(d, kv.dtype, {T, Hkv, Dh});
       if (kv.dtype == DType::kBF16) {
         vt::CastBf16(d.q, kcast.t(), k3);
         vt::CastBf16(d.q, vcast.t(), v3);
@@ -287,17 +307,19 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
       }
       kw = kcast.t();
       vw = vcast.t();
+      Tensor k_cache = KvSlice(kv, d.q.device, 0);
+      Tensor v_cache = KvSlice(kv, d.q.device, 1);
+      vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, si.slot_mapping.t());
+    } else {
+      Tensor k_cache = KvSlice(kv, d.q.device, 0);
+      Tensor v_cache = KvSlice(kv, d.q.device, 1);
+      vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, si.slot_mapping.t());
     }
-    Tensor k_cache = KvSlice(kv, d.q.device, 0);
-    Tensor v_cache = KvSlice(kv, d.q.device, 1);
-    vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, si.slot_mapping.t());
   }
 
-  // Paged GQA attention: scale = 1.0 (Q/K norms carry the scale). Reads the
-  // target layer's populated cache for shared layers.
+  // Paged GQA attention: scale = 1.0 (Q/K norms carry the scale).
   Tensor k_cache = KvSlice(kv, d.q.device, 0);
   Tensor v_cache = KvSlice(kv, d.q.device, 1);
-  DBuf attn(d, adt, {T, Hq, Dh});
   vt::PagedAttentionArgs pa{1.0f, meta.causal};
   if (g.attn_logit_softcap > 0.0f) pa.logits_soft_cap = g.attn_logit_softcap;
   pa.query_start_loc_host = meta.query_start_loc.data();
@@ -309,7 +331,7 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
 
   Tensor o_in = Reshape(attn.t(), {T, Hq * Dh});
   Tensor wo = ResidentWeight(d, w.attn.o_proj);
-  DBuf o(d, DType::kBF16, {T, H});
+  DBuf o(d, DType::kBF16, {T, H});  // returned — not TLS
   vt::MatmulBT(d.q, o.t(), o_in, wo);
   return o;
 }
