@@ -82,69 +82,55 @@ bool ExpertGeGLUDeviceBatched(Dev d, DBuf& ysum, const Tensor& x,
   const int64_t T = x.shape[0];
   if (T != 1) return false;
 
-  // Contiguous [G,I] activations / outputs (T=1).
-  DBuf gate_b(d, DType::kBF16, {G, I});
-  DBuf up_b(d, DType::kBF16, {G, I});
+  // Contiguous [G, 2I] gate|up + [G,I] act + [G,H] y
   DBuf gu_all(d, DType::kBF16, {G, 2 * I});
   DBuf act_all(d, DType::kBF16, {G, I});
   DBuf y_b(d, DType::kBF16, {G, H});
 
-  std::vector<void*> gate_out(static_cast<size_t>(G));
-  std::vector<void*> up_out(static_cast<size_t>(G));
+  std::vector<void*> gu_out(static_cast<size_t>(G));
   std::vector<void*> y_out(static_cast<size_t>(G));
   std::vector<void*> act_ptrs(static_cast<size_t>(G));
-  std::vector<void*> gate_w(static_cast<size_t>(G));
-  std::vector<void*> up_w(static_cast<size_t>(G));
+  std::vector<void*> gu_w(static_cast<size_t>(G));
   std::vector<void*> dn_w(static_cast<size_t>(G));
   for (int g = 0; g < G; ++g) {
-    gate_out[static_cast<size_t>(g)] =
-        static_cast<char*>(gate_b.ptr()) + static_cast<size_t>(g) * static_cast<size_t>(I) * 2;
-    up_out[static_cast<size_t>(g)] =
-        static_cast<char*>(up_b.ptr()) + static_cast<size_t>(g) * static_cast<size_t>(I) * 2;
+    gu_out[static_cast<size_t>(g)] =
+        static_cast<char*>(gu_all.ptr()) + static_cast<size_t>(g) * static_cast<size_t>(2 * I) * 2;
     y_out[static_cast<size_t>(g)] =
         static_cast<char*>(y_b.ptr()) + static_cast<size_t>(g) * static_cast<size_t>(H) * 2;
     act_ptrs[static_cast<size_t>(g)] =
         static_cast<char*>(act_all.ptr()) + static_cast<size_t>(g) * static_cast<size_t>(I) * 2;
-    gate_w[static_cast<size_t>(g)] = const_cast<uint16_t*>(gu_ptrs[static_cast<size_t>(g)]);
-    up_w[static_cast<size_t>(g)] =
-        const_cast<uint16_t*>(gu_ptrs[static_cast<size_t>(g)] + I * H);
+    gu_w[static_cast<size_t>(g)] = const_cast<uint16_t*>(gu_ptrs[static_cast<size_t>(g)]);
     dn_w[static_cast<size_t>(g)] = const_cast<uint16_t*>(dn_ptrs[static_cast<size_t>(g)]);
   }
 
-  // gate/up batched BT
-  vt::rocm::MatmulBTPointerBatchKernelRocm(d.q, gate_out.data(), x.data, gate_w.data(), G,
-                                           /*M=*/1, static_cast<int>(I), static_cast<int>(H),
-                                           DType::kBF16);
-  vt::rocm::MatmulBTPointerBatchKernelRocm(d.q, up_out.data(), x.data, up_w.data(), G,
-                                           /*M=*/1, static_cast<int>(I), static_cast<int>(H),
+  // One pointer-batch GEMM: x @ W_gu[g]^T -> [1, 2I] per expert
+  vt::rocm::MatmulBTPointerBatchKernelRocm(d.q, gu_out.data(), x.data, gu_w.data(), G,
+                                           /*M=*/1, static_cast<int>(2 * I), static_cast<int>(H),
                                            DType::kBF16);
 
-  // Pack [G,I]|[G,I] -> [G, 2I] then ONE GeluAndMul over G rows.
-  const size_t row = static_cast<size_t>(I) * sizeof(uint16_t);
-  for (int g = 0; g < G; ++g) {
-    char* dst = static_cast<char*>(gu_all.ptr()) + static_cast<size_t>(g) * 2 * row;
-    d.b.Copy(d.q, dst, gate_out[static_cast<size_t>(g)], row);
-    d.b.Copy(d.q, dst + row, up_out[static_cast<size_t>(g)], row);
-  }
   Tensor gu_t = Tensor::Contiguous(static_cast<uint16_t*>(gu_all.ptr()), DType::kBF16,
                                    d.q.device, {G, 2 * I});
   Tensor act_t = Tensor::Contiguous(static_cast<uint16_t*>(act_all.ptr()), DType::kBF16,
                                     d.q.device, {G, I});
   vt::GeluAndMul(d.q, act_t, gu_t);
 
-  // down: y[g] = act[g] @ Wd[g]^T  (pointer batch, both A and B vary)
+  // down: y[g] = act[g] @ Wd[g]^T
   vt::rocm::MatmulBTPointerBatchABKernelRocm(
       d.q, y_out.data(), act_ptrs.data(), dn_w.data(), G,
       /*M=*/1, static_cast<int>(H), static_cast<int>(I), DType::kBF16);
 
-  // weighted sum
-  ysum.Zero(d);
+  // weighted sum into ysum (first expert writes, rest accumulate)
   for (int g = 0; g < G; ++g) {
     Tensor y_g = Tensor::Contiguous(static_cast<uint16_t*>(y_out[static_cast<size_t>(g)]),
                                     DType::kBF16, d.q.device, {1, H});
-    DBuf ysc(d, DType::kBF16, {1, H});
-    vt::MulScalar(d.q, ysc.t(), y_g, static_cast<double>(wts[static_cast<size_t>(g)]));
-    vt::Add(d.q, ysum.t(), ysum.t(), ysc.t());
+    const float a = wts[static_cast<size_t>(g)];
+    if (g == 0) {
+      vt::MulScalar(d.q, ysum.t(), y_g, static_cast<double>(a));
+    } else {
+      DBuf ysc(d, DType::kBF16, {1, H});
+      vt::MulScalar(d.q, ysc.t(), y_g, static_cast<double>(a));
+      vt::Add(d.q, ysum.t(), ysum.t(), ysc.t());
+    }
   }
   return true;
 }
@@ -496,6 +482,15 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
         }
         for (auto& th : pref) th.join();
         Fp8DequantEndOuterParallel();
+      }
+    }
+
+    // Prefetch: queue device expert H2D for all top-k before any GEMM (same stream).
+    if (ex.is_fp8 && !same_dev) {
+      for (int i = 0; i < top_k; ++i) {
+        const int e = idx[static_cast<size_t>(i)];
+        if (e >= 0 && e < static_cast<int>(E))
+          (void)EnsureGemma4Fp8ExpertOnDevice(d, ex.fp8[static_cast<size_t>(e)], I, H);
       }
     }
 
