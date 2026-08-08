@@ -2,78 +2,50 @@
 
 Follow-up to merged #140 (ROCm gfx1201 + Gemma-4-26B MoE BF16/FP8).
 
-This PR hardens **dual-GPU FP8 expert residency** and decode mix so the path fits **~30 GB host RAM** and keeps weights on GPU — plus a stack of decode speed work for stream FP8.
+Hardens dual-GPU FP8 expert residency for ~30 GB hosts, plus a full decode speed stack for **stream FP8**.
 
-### Residency (#140 follow-up)
-1. **Pack GPU0 first**, spill to GPU1 (same-device fast path maximized)
-2. **Stream per-expert FP8→BF16→H2D** — no permanent host BF16 cache during bulk upload
-3. **10 GiB compute headroom** on GPU0 so dense/KV still allocate
-4. **Peer-copy** off-device resident expert slices into compute scratch
-5. Optional full resident via `VT_GEMMA4_RESIDENT_*` (avoid on 30 G host for routine benches)
+### Residency
+- Pack GPU0 first, spill GPU1; stream FP8→BF16 H2D (no permanent host BF16 during bulk upload)
+- Peer-copy off-device slices; optional `VT_GEMMA4_RESIDENT_*`
 
-### Decode speed (this branch tip)
-- ExpertGeGLU: **GeluMulSeparate** (no gate|up pack), fused **alpha/beta** mix into down GEMM
-- **Async expert H2D** (drop per-expert Synchronize); optional `VT_GEMMA4_EXPERT_VRAM_MB` LRU (default unlimited)
-- TLS scratch: MoE layer temps, dense GeGLU gate_up, ForwardBody buffers
-- **RmsNormPlusAdd** residual joins (post-attn / post-ff)
-- PLE contiguous `[L,T,ple]` + GeluMulSeparate
-- CLI `--repeat N` + stderr fflush for multi-run benches
-- Device MoE router top-k (D2H only `[T,K]`)
+### Decode speed (branch tip)
+- Fused expert gate+up MatmulBT (3→2 GEMMs/expert)
+- Async expert H2D + device expert cache (+ optional VRAM LRU)
+- DualRmsNormPlusRes / RmsNormPlusAdd residual fuses
+- TLS MoE/MLP/Attn scratch; TLS hipBLAS handle; TLS router ones-weight
+- Device MoE router top-k
+- CLI `--repeat N` multi-run benches
+- `VT_GEMMA4_PROFILE=1` MoE router vs expert timing
+- Opt-in `VT_ROCM_GEMV=1` LDS-cached M=1 BF16 GEMV (**slower than hipblas on gfx1201**)
 
-## Lab evidence (2× R9700 gfx1201, ROCm 7.2.x)
+## Lab (2× R9700, ROCm 7.2.x, kernel **7.0.0-29**)
 
-### Kernel
-Lab host should run **Ubuntu 7.0.0-29+** (not **7.0.0-28** — known AMDGPU/ROCm compute regression up to ~42×).
-
-### Stream FP8, exclusive GPU0, `--repeat` (Firworks gemma-4-26B-A4B-it-fp8)
-
-| Kernel | Run1 cold | Run2+ warm | Gate |
-|--------|-----------|------------|------|
-| 7.0.0-29 | ~0.46 tok/s | **~28 tok/s** stable | Paris OK |
-
-Multi-prompt matrix historically 3/3 after device router.
-
-| Env | Notes |
-|-----|--------|
-| Default | serial ExpertGeGLU, device expert cache after first use |
-| `VT_GEMMA4_BATCH_EXPERTS=1` | opt-in; lab found slower than serial |
-| `VT_GEMMA4_EXPERT_VRAM_MB` | 0/unset = unlimited device expert cache; set to cap LRU |
-
-### Full resident (optional stress)
-| Check | Result |
-|-------|--------|
-| Full resident upload | 30/30 layers, **~42.5 GiB** experts |
-| Peak VRAM | ~**28.6 GB** historically |
-| Avoid | routine full dual-resident on 30 G host |
-
-## Usage
+| Metric | Value |
+|--------|--------|
+| Correctness | Paris/Hello/arith **3/3** stream FP8 |
+| Warm Paris | **~33–34 tok/s** (hipblas default) |
+| MoE profile (warm) | router **~2%**, experts **~98%** |
 
 ```bash
-# Warm decode benchmark (recommended)
-HIP_VISIBLE_DEVICES=0 \
-./build-hip/examples/vllm-cli \
-  --model /path/to/Firworks/gemma-4-26B-A4B-it-fp8 \
-  --prompt '<bos>The capital of France is' --max-tokens 12 --temperature 0 \
-  --repeat 4
-
-# Optional full resident (heavy)
-HIP_VISIBLE_DEVICES=0,1 \
-VT_GEMMA4_RESIDENT_EXPERTS=1 VT_GEMMA4_RESIDENT_GPUS=2 \
-./build-hip/examples/vllm-cli ...
+HIP_VISIBLE_DEVICES=0 ./build-hip/examples/vllm-cli \
+  --model .../gemma-4-26B-A4B-it-fp8 \
+  --prompt '<bos>The capital of France is' --max-tokens 12 --temperature 0 --repeat 4
 ```
 
-Canonical lab script: `~/llms/scripts/vllm/run_fp8_lab_bench.py`
+Harness: `FARM_RESTORE=0 LAB_REPEATS=4 python3 ~/llms/scripts/vllm/run_fp8_lab_bench.py`
 
-## Test plan
+## Dead ends (do not re-open without new evidence)
+| Attempt | Result |
+|---------|--------|
+| `VT_GEMMA4_BATCH_EXPERTS=1` pointer-batch | ~0.8 tok/s |
+| `HIPBLAS_COMPUTE_32F_FAST_16BF` / `16F` | NOT_SUPPORTED on BT shapes |
+| Multi-stream ExpertGeGLU (even per-stream handles) | **wrong tokens** + slower |
+| Naive / LDS M=1 GEMV | correct but **~27–30** vs hipblas **~34** |
 
-- [x] HIP build gfx1201
-- [x] Stream FP8 Paris multi-run warm ~28 tok/s (k29)
-- [x] RmsNormPlusAdd path Paris OK
-- [ ] CI (no AMD GPU expected)
-- [ ] Load-once server multi-req tok/s (follow-up)
+## Next real lever
+**Fused/grouped MoE expert kernel** that wins on RDNA4 MFMA (not host batch glue).  
+Experts are the wall; host hygiene is exhausted.
 
 ## Notes
-
-- Does **not** claim pip-vLLM oracle token-exact or Vulkan-Q6 farm parity yet.
-- Warm decode still GEMM-bound (~720 expert GEMMs/token naive); next real leap is fused/grouped expert kernel that beats serial hipBLAS.
-- Daily farm remains dual-Vulkan Q6 P=3 `:8010` — exclusive HIP smokes must stop farm first.
+- Daily farm: dual-Vulkan Q6 P=3 `:8010` — exclusive HIP needs farm down
+- Avoid Ubuntu **7.0.0-28** (AMDGPU ROCm regression); use **29+**
