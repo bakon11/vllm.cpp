@@ -18,6 +18,7 @@
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
+#include "vt/rocm/rocm_gelu_mul_sep.h"
 #include "vt/rocm/rocm_matmul_batch.h"
 
 namespace vllm {
@@ -33,7 +34,6 @@ using vt::Tensor;
 struct ExpertScratch {
   DBuf gate;
   DBuf up;
-  DBuf gu;
   DBuf act;
   DBuf gate_w;  // host-path weight upload targets
   DBuf up_w;
@@ -41,27 +41,11 @@ struct ExpertScratch {
   ExpertScratch(Dev d, int64_t T, int64_t I, int64_t H)
       : gate(d, DType::kBF16, {T, I}),
         up(d, DType::kBF16, {T, I}),
-        gu(d, DType::kBF16, {T, 2 * I}),
         act(d, DType::kBF16, {T, I}),
         gate_w(d, DType::kBF16, {I, H}),
         up_w(d, DType::kBF16, {I, H}),
         down_w(d, DType::kBF16, {H, I}) {}
 };
-
-void PackGateUp(Dev d, DBuf& gu, DBuf& gate, DBuf& up, int64_t T, int64_t I) {
-  const size_t row = static_cast<size_t>(I) * sizeof(uint16_t);
-  if (T == 1) {
-    d.b.Copy(d.q, gu.ptr(), gate.ptr(), row);
-    d.b.Copy(d.q, static_cast<char*>(gu.ptr()) + row, up.ptr(), row);
-    return;
-  }
-  for (int64_t t = 0; t < T; ++t) {
-    d.b.Copy(d.q, static_cast<char*>(gu.ptr()) + static_cast<size_t>(t) * 2 * row,
-             static_cast<const char*>(gate.ptr()) + static_cast<size_t>(t) * row, row);
-    d.b.Copy(d.q, static_cast<char*>(gu.ptr()) + static_cast<size_t>(t) * 2 * row + row,
-             static_cast<const char*>(up.ptr()) + static_cast<size_t>(t) * row, row);
-  }
-}
 
 void ExpertGeGLUHost(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_up_e,
                      const uint16_t* down_e, int64_t I, int64_t H, ExpertScratch& s) {
@@ -73,8 +57,8 @@ void ExpertGeGLUHost(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_up_
   d.b.Copy(d.q, s.down_w.ptr(), down_e, dn_b);
   vt::MatmulBT(d.q, s.gate.t(), x, s.gate_w.t());
   vt::MatmulBT(d.q, s.up.t(), x, s.up_w.t());
-  PackGateUp(d, s.gu, s.gate, s.up, T, I);
-  vt::GeluAndMul(d.q, s.act.t(), s.gu.t());
+  vt::rocm::GeluMulSeparateRocm(d.q, s.act.ptr(), s.gate.ptr(), s.up.ptr(), T * I,
+                                DType::kBF16);
   vt::MatmulBT(d.q, out.t(), s.act.t(), s.down_w.t());
 }
 
@@ -90,8 +74,8 @@ void ExpertGeGLUDevice(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_u
       Tensor::Contiguous(const_cast<uint16_t*>(down_e), DType::kBF16, dev, {H, I});
   vt::MatmulBT(d.q, s.gate.t(), x, gate_w);
   vt::MatmulBT(d.q, s.up.t(), x, up_w);
-  PackGateUp(d, s.gu, s.gate, s.up, T, I);
-  vt::GeluAndMul(d.q, s.act.t(), s.gu.t());
+  vt::rocm::GeluMulSeparateRocm(d.q, s.act.ptr(), s.gate.ptr(), s.up.ptr(), T * I,
+                                DType::kBF16);
   vt::MatmulBT(d.q, out.t(), s.act.t(), down_w);
 }
 
@@ -339,26 +323,52 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
   DBuf acc(d, DType::kBF16, {T, H});
   acc.Zero(d);
 
-  // Layer-lifetime scratch (decode/prefill tokens share these).
-  ExpertScratch esc(d, /*T=*/1, I, H);
-  DBuf xin(d, DType::kBF16, {1, H});
-  DBuf ysum(d, DType::kBF16, {1, H});
-  DBuf y(d, DType::kBF16, {1, H});
-  DBuf ysc(d, DType::kBF16, {1, H});
+  // Reuse MoE decode scratch across layers (30 layers × every token was thrashing the pool).
+  struct MoeTlsScratch {
+    int dev = -1;
+    int64_t I = 0, H = 0;
+    std::unique_ptr<ExpertScratch> esc;
+    std::optional<DBuf> xin, ysum, y, ysc;
+    std::optional<DBuf> gu_sc, dn_sc;
+    bool have_peer = false;
+    std::vector<uint16_t> gu_tmp, dn_tmp;
+  };
+  static thread_local MoeTlsScratch tls;
+  if (tls.dev != compute_dev || tls.I != I || tls.H != H) {
+    tls.esc = std::make_unique<ExpertScratch>(d, /*T=*/1, I, H);
+    tls.xin.emplace(d, DType::kBF16, std::vector<int64_t>{1, H});
+    tls.ysum.emplace(d, DType::kBF16, std::vector<int64_t>{1, H});
+    tls.y.emplace(d, DType::kBF16, std::vector<int64_t>{1, H});
+    tls.ysc.emplace(d, DType::kBF16, std::vector<int64_t>{1, H});
+    tls.gu_sc.reset();
+    tls.dn_sc.reset();
+    tls.have_peer = false;
+    tls.gu_tmp.clear();
+    tls.dn_tmp.clear();
+    tls.dev = compute_dev;
+    tls.I = I;
+    tls.H = H;
+  }
+  ExpertScratch& esc = *tls.esc;
+  DBuf& xin = *tls.xin;
+  DBuf& ysum = *tls.ysum;
+  DBuf& y = *tls.y;
+  DBuf& ysc = *tls.ysc;
   const bool need_peer_sc =
       ex.gate_up_dev != nullptr && ex.down_dev != nullptr && !same_dev;
-  std::optional<DBuf> gu_sc;
-  std::optional<DBuf> dn_sc;
-  if (need_peer_sc) {
-    gu_sc.emplace(d, DType::kBF16, std::vector<int64_t>{2 * I, H});
-    dn_sc.emplace(d, DType::kBF16, std::vector<int64_t>{H, I});
+  if (need_peer_sc && !tls.have_peer) {
+    tls.gu_sc.emplace(d, DType::kBF16, std::vector<int64_t>{2 * I, H});
+    tls.dn_sc.emplace(d, DType::kBF16, std::vector<int64_t>{H, I});
+    tls.have_peer = true;
   }
-  std::vector<uint16_t> gu_tmp;
-  std::vector<uint16_t> dn_tmp;
-  if (ex.is_fp8) {
-    gu_tmp.resize(static_cast<size_t>(gu_stride));
-    dn_tmp.resize(static_cast<size_t>(dn_stride));
+  std::optional<DBuf>& gu_sc = tls.gu_sc;
+  std::optional<DBuf>& dn_sc = tls.dn_sc;
+  if (ex.is_fp8 && tls.gu_tmp.size() != static_cast<size_t>(gu_stride)) {
+    tls.gu_tmp.resize(static_cast<size_t>(gu_stride));
+    tls.dn_tmp.resize(static_cast<size_t>(dn_stride));
   }
+  std::vector<uint16_t>& gu_tmp = tls.gu_tmp;
+  std::vector<uint16_t>& dn_tmp = tls.dn_tmp;
   static const bool host_axpy = [] {
     const char* e = std::getenv("VT_GEMMA4_HOST_AXPY");
     return e && e[0] == '1';
