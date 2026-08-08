@@ -2,6 +2,7 @@
 #include "vllm/model_executor/models/gemma4_moe.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -242,6 +243,14 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
 
     DBuf ysum(d, DType::kBF16, {1, H});
     ysum.Zero(d);
+    // Prefer on-device weighted sum (no per-expert D2H). Host fallback if ops hang/fail.
+    const bool host_axpy = [] {
+      const char* e = std::getenv("VT_GEMMA4_HOST_AXPY");
+      return e && e[0] == '1';
+    }();
+    std::vector<uint16_t> hsum;
+    if (host_axpy) hsum.assign(static_cast<size_t>(H), vt::F32ToBF16(0.f));
+
     for (int i = 0; i < top_k; ++i) {
       const int e = idx[static_cast<size_t>(i)];
       DBuf y(d, DType::kBF16, {1, H});
@@ -285,17 +294,26 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
       } else {
         VT_CHECK(false, "gemma4 moe: no expert weights");
       }
-      d.b.Synchronize(d.q);
-      std::vector<uint16_t> hy(static_cast<size_t>(H)), hs(static_cast<size_t>(H));
-      d.b.Copy(d.q, hy.data(), y.ptr(), hy.size() * 2);
-      d.b.Copy(d.q, hs.data(), ysum.ptr(), hs.size() * 2);
-      d.b.Synchronize(d.q);
-      const float ww = wts[static_cast<size_t>(i)];
-      for (int64_t j = 0; j < H; ++j)
-        hs[static_cast<size_t>(j)] = vt::F32ToBF16(
-            vt::BF16ToF32(hs[static_cast<size_t>(j)]) +
-            ww * vt::BF16ToF32(hy[static_cast<size_t>(j)]));
-      d.b.Copy(d.q, ysum.ptr(), hs.data(), hs.size() * 2);
+
+      const double ww = static_cast<double>(wts[static_cast<size_t>(i)]);
+      if (host_axpy) {
+        d.b.Synchronize(d.q);
+        std::vector<uint16_t> hy(static_cast<size_t>(H));
+        d.b.Copy(d.q, hy.data(), y.ptr(), hy.size() * 2);
+        d.b.Synchronize(d.q);
+        for (int64_t j = 0; j < H; ++j)
+          hsum[static_cast<size_t>(j)] = vt::F32ToBF16(
+              vt::BF16ToF32(hsum[static_cast<size_t>(j)]) +
+              static_cast<float>(ww) * vt::BF16ToF32(hy[static_cast<size_t>(j)]));
+      } else {
+        // Device: ysum += ww * y  (stay on GPU)
+        DBuf ysc(d, DType::kBF16, {1, H});
+        vt::MulScalar(d.q, ysc.t(), y.t(), ww);
+        vt::Add(d.q, ysum.t(), ysum.t(), ysc.t());
+      }
+    }
+    if (host_axpy) {
+      d.b.Copy(d.q, ysum.ptr(), hsum.data(), hsum.size() * 2);
     }
     d.b.Copy(d.q,
              static_cast<char*>(acc.ptr()) + static_cast<size_t>(t) * static_cast<size_t>(H) * 2,
