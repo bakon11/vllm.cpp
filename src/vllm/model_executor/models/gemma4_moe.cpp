@@ -295,15 +295,33 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
   Tensor wp = ResidentWeight(d, rproj);
   DBuf logits(d, DType::kF32, {T, E});
   vt::MatmulBT(d.q, logits.t(), rn.t(), wp);
-  d.b.Synchronize(d.q);
-  std::vector<float> hlog(static_cast<size_t>(T * E));
-  d.b.Copy(d.q, hlog.data(), logits.ptr(), hlog.size() * sizeof(float));
+
+  // Device router top-k (softmax + greedy). Only D2H [T,K] weights/indices.
+  DBuf rw(d, DType::kF32, {T, top_k});
+  DBuf ri(d, DType::kI32, {T, top_k});
+  vt::MoeRouterTopKArgs rargs;
+  rargs.top_k = top_k;
+  rargs.renormalize = true;
+  vt::MoeRouterTopK(d.q, rw.t(), ri.t(), logits.t(), rargs);
+
+  std::vector<float> hw(static_cast<size_t>(T * top_k));
+  std::vector<int32_t> hi(static_cast<size_t>(T * top_k));
+  d.b.Copy(d.q, hw.data(), rw.ptr(), hw.size() * sizeof(float));
+  d.b.Copy(d.q, hi.data(), ri.ptr(), hi.size() * sizeof(int32_t));
   d.b.Synchronize(d.q);
 
   std::vector<float> hscale(static_cast<size_t>(E), 1.f);
   if (moe.per_expert_scale.HasHostBytes()) {
     const auto* pe = reinterpret_cast<const uint16_t*>(moe.per_expert_scale.bytes.data());
     for (int64_t e = 0; e < E; ++e) hscale[static_cast<size_t>(e)] = vt::BF16ToF32(pe[e]);
+  }
+  // Apply per-expert scale to selected weights.
+  for (int64_t t = 0; t < T; ++t) {
+    for (int i = 0; i < top_k; ++i) {
+      const size_t o = static_cast<size_t>(t * top_k + i);
+      const int e = hi[o];
+      if (e >= 0 && e < static_cast<int>(E)) hw[o] *= hscale[static_cast<size_t>(e)];
+    }
   }
 
   const auto& ex = moe.experts;
@@ -353,23 +371,13 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
   if (host_axpy) hsum.assign(static_cast<size_t>(H), vt::F32ToBF16(0.f));
 
   for (int64_t t = 0; t < T; ++t) {
-    std::vector<int> idx(static_cast<size_t>(E));
-    for (int e = 0; e < static_cast<int>(E); ++e) idx[static_cast<size_t>(e)] = e;
-    std::partial_sort(idx.begin(), idx.begin() + top_k, idx.end(), [&](int a, int b) {
-      return hlog[static_cast<size_t>(t * E + a)] > hlog[static_cast<size_t>(t * E + b)];
-    });
-    float mx = hlog[static_cast<size_t>(t * E + idx[0])];
+    std::vector<int> idx(static_cast<size_t>(top_k));
     std::vector<float> wts(static_cast<size_t>(top_k));
-    float sum = 0.f;
     for (int i = 0; i < top_k; ++i) {
-      wts[static_cast<size_t>(i)] =
-          std::exp(hlog[static_cast<size_t>(t * E + idx[static_cast<size_t>(i)])] - mx);
-      sum += wts[static_cast<size_t>(i)];
+      const size_t o = static_cast<size_t>(t * top_k + i);
+      idx[static_cast<size_t>(i)] = static_cast<int>(hi[o]);
+      wts[static_cast<size_t>(i)] = hw[o];
     }
-    for (int i = 0; i < top_k; ++i)
-      wts[static_cast<size_t>(i)] =
-          (wts[static_cast<size_t>(i)] / sum) *
-          hscale[static_cast<size_t>(idx[static_cast<size_t>(i)])];
 
     d.b.Copy(d.q, xin.ptr(),
              static_cast<const char*>(expert_in.data) +
