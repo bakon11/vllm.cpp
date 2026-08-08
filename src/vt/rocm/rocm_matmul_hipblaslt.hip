@@ -8,6 +8,8 @@
 #include <hipblas/hipblas.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -84,6 +86,21 @@ hipDataType ToBlasType(DType dt) {
   }
 }
 
+// BF16 default: COMPUTE_32F (FAST_16BF returns NOT_SUPPORTED on gfx1201 for our BT shapes).
+// Override: VT_ROCM_GEMM_COMPUTE=32f | 16bf | 16f
+hipblasComputeType_t GemmCompute(DType dt) {
+  if (dt != DType::kBF16 && dt != DType::kF16) return HIPBLAS_COMPUTE_32F;
+  static const hipblasComputeType_t k = [] {
+    if (const char* e = std::getenv("VT_ROCM_GEMM_COMPUTE")) {
+      if (std::strcmp(e, "32f") == 0) return HIPBLAS_COMPUTE_32F;
+      if (std::strcmp(e, "16f") == 0) return HIPBLAS_COMPUTE_16F;
+      if (std::strcmp(e, "16bf") == 0) return HIPBLAS_COMPUTE_32F_FAST_16BF;
+    }
+    return HIPBLAS_COMPUTE_32F;
+  }();
+  return k;
+}
+
 }  // namespace
 
 // out[M,N] = a[M,K] @ b[K,N]  (row-major contiguous / a may have row stride)
@@ -134,7 +151,7 @@ void MatmulKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
                           /*k=*/static_cast<int>(K), &alpha, b.data, at,
                           /*ldb=*/static_cast<int>(N), a.data, at,
                           /*lda=*/static_cast<int>(a.stride[0]), &beta, out.data, ot,
-                          /*ldc=*/static_cast<int>(N), HIPBLAS_COMPUTE_32F,
+                          /*ldc=*/static_cast<int>(N), GemmCompute(a.dtype),
                           HIPBLAS_GEMM_DEFAULT),
             "hipblasGemmEx NN");
 }
@@ -179,7 +196,7 @@ void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
                           /*k=*/static_cast<int>(K), &alpha, b.data, at,
                           /*ldb=*/static_cast<int>(K), a.data, at,
                           /*lda=*/static_cast<int>(a.stride[0]), &beta, out.data, ot,
-                          /*ldc=*/static_cast<int>(N), HIPBLAS_COMPUTE_32F,
+                          /*ldc=*/static_cast<int>(N), GemmCompute(a.dtype),
                           HIPBLAS_GEMM_DEFAULT),
             "hipblasGemmEx BT");
 }
@@ -205,7 +222,7 @@ void MatmulBTAlphaBetaRocm(Queue& q, void* out, const void* a, const void* b, in
   const hipDataType at = ToBlasType(dtype);
   CheckBlas(hipblasGemmEx(ctx.handle, HIPBLAS_OP_T, HIPBLAS_OP_N,
                           /*m=*/N, /*n=*/M, /*k=*/K, &alpha, b, at, /*ldb=*/K, a, at,
-                          /*lda=*/K, &beta, out, at, /*ldc=*/N, HIPBLAS_COMPUTE_32F,
+                          /*lda=*/K, &beta, out, at, /*ldc=*/N, GemmCompute(dtype),
                           HIPBLAS_GEMM_DEFAULT),
             "hipblasGemmEx BT alpha/beta");
 }
@@ -237,7 +254,7 @@ void MatmulBTStridedBatchFullKernelRocm(Queue& q, void* out, const void* a, cons
                 ctx.handle, HIPBLAS_OP_T, HIPBLAS_OP_N,
                 /*m=*/N, /*n=*/M, /*k=*/K, &alpha, b, at, /*ldb=*/K, strideB, a, at,
                 /*lda=*/K, strideA, &beta, out, at, /*ldc=*/N, strideC, batch,
-                HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT),
+                GemmCompute(dtype), HIPBLAS_GEMM_DEFAULT),
             "hipblasGemmStridedBatchedEx BT");
 }
 
@@ -298,7 +315,7 @@ void MatmulBTPointerBatchKernelRocm(Queue& q, void** out_ptrs, const void* a,
                 /*m=*/N, /*n=*/M, /*k=*/K, &alpha,
                 reinterpret_cast<const void**>(tab->B), at, /*ldb=*/K,
                 reinterpret_cast<const void**>(tab->A), at, /*lda=*/K, &beta,
-                reinterpret_cast<void**>(tab->C), at, /*ldc=*/N, batch, HIPBLAS_COMPUTE_32F,
+                reinterpret_cast<void**>(tab->C), at, /*ldc=*/N, batch, GemmCompute(dtype),
                 HIPBLAS_GEMM_DEFAULT),
             "hipblasGemmBatchedEx BT");
 }
@@ -357,7 +374,7 @@ void MatmulBTPointerBatchABKernelRocm(Queue& q, void** out_ptrs, void** a_ptrs,
                 /*m=*/N, /*n=*/M, /*k=*/K, &alpha,
                 reinterpret_cast<const void**>(tab->B), at, /*ldb=*/K,
                 reinterpret_cast<const void**>(tab->A), at, /*lda=*/K, &beta,
-                reinterpret_cast<void**>(tab->C), at, /*ldc=*/N, batch, HIPBLAS_COMPUTE_32F,
+                reinterpret_cast<void**>(tab->C), at, /*ldc=*/N, batch, GemmCompute(dtype),
                 HIPBLAS_GEMM_DEFAULT),
             "hipblasGemmBatchedEx BT AB");
 }
