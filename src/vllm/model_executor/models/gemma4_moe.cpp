@@ -251,9 +251,20 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     std::vector<uint16_t> hsum;
     if (host_axpy) hsum.assign(static_cast<size_t>(H), vt::F32ToBF16(0.f));
 
+    // Reuse scratch across top-k (avoid alloc/free per expert).
+    DBuf y(d, DType::kBF16, {1, H});
+    DBuf ysc(d, DType::kBF16, {1, H});
+    DBuf gu_sc(d, DType::kBF16, {2 * I, H});
+    DBuf dn_sc(d, DType::kBF16, {H, I});
+    std::vector<uint16_t> gu_tmp;
+    std::vector<uint16_t> dn_tmp;
+    if (ex.is_fp8) {
+      gu_tmp.resize(static_cast<size_t>(gu_stride));
+      dn_tmp.resize(static_cast<size_t>(dn_stride));
+    }
+
     for (int i = 0; i < top_k; ++i) {
       const int e = idx[static_cast<size_t>(i)];
-      DBuf y(d, DType::kBF16, {1, H});
       if (same_dev) {
         auto* gu = static_cast<const uint16_t*>(ex.gate_up_dev) +
                    static_cast<int64_t>(e) * gu_stride;
@@ -262,16 +273,12 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
         ExpertGeGLUDevice(d, y, xin.t(), gu, dn, I, H);
       } else if (ex.gate_up_dev != nullptr && ex.down_dev != nullptr) {
         // Resident on another GPU: peer/stage one expert into compute scratch.
-        DBuf gu_sc(d, DType::kBF16, {2 * I, H});
-        DBuf dn_sc(d, DType::kBF16, {H, I});
         if (PeerCopyGemma4ExpertSlice(ex.dev_id, ex.gate_up_dev, ex.down_dev, e, I, H,
                                       compute_dev, gu_sc.ptr(), dn_sc.ptr())) {
           ExpertGeGLUDevice(d, y, xin.t(), static_cast<const uint16_t*>(gu_sc.ptr()),
                             static_cast<const uint16_t*>(dn_sc.ptr()), I, H);
         } else if (ex.is_fp8) {
           const auto& fex = ex.fp8[static_cast<size_t>(e)];
-          std::vector<uint16_t> gu_tmp(static_cast<size_t>(gu_stride));
-          std::vector<uint16_t> dn_tmp(static_cast<size_t>(dn_stride));
           DequantGemma4Fp8ExpertToBf16Ephemeral(fex, I, H, gu_tmp.data(), dn_tmp.data());
           ExpertGeGLUHost(d, y, xin.t(), gu_tmp.data(), dn_tmp.data(), I, H);
         } else {
@@ -307,7 +314,6 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
               static_cast<float>(ww) * vt::BF16ToF32(hy[static_cast<size_t>(j)]));
       } else {
         // Device: ysum += ww * y  (stay on GPU)
-        DBuf ysc(d, DType::kBF16, {1, H});
         vt::MulScalar(d.q, ysc.t(), y.t(), ww);
         vt::Add(d.q, ysum.t(), ysum.t(), ysc.t());
       }
