@@ -18,4 +18,9 @@ void MatmulBTPointerBatchKernelRocm(Queue& q, void** out_ptrs, const void* a,
                                     void** b_ptrs, int batch, int M, int N, int K,
                                     DType dtype);
 
+// Both A and B per-batch: out_ptrs[g] = a_ptrs[g] @ b_ptrs[g]^T
+void MatmulBTPointerBatchABKernelRocm(Queue& q, void** out_ptrs, void** a_ptrs,
+                                      void** b_ptrs, int batch, int M, int N, int K,
+                                      DType dtype);
+
 }  // namespace vt::rocm

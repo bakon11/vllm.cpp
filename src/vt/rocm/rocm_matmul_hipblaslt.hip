@@ -277,4 +277,63 @@ void MatmulBTPointerBatchKernelRocm(Queue& q, void** out_ptrs, const void* a,
             "hipblasGemmBatchedEx BT");
 }
 
+// Pointer-array BT with per-batch A and B: out[g] = a[g] @ b[g]^T
+void MatmulBTPointerBatchABKernelRocm(Queue& q, void** out_ptrs, void** a_ptrs,
+                                      void** b_ptrs, int batch, int M, int N, int K,
+                                      DType dtype) {
+  if (batch <= 0 || M == 0 || N == 0) return;
+  if (dtype != DType::kBF16 && dtype != DType::kF32) {
+    throw std::runtime_error("vt rocm: matmul_bt_ptr_ab: dtype");
+  }
+  hipStream_t s = static_cast<hipStream_t>(q.handle);
+  if (K == 0) {
+    for (int g = 0; g < batch; ++g)
+      CheckHip(hipMemsetAsync(out_ptrs[g], 0,
+                              static_cast<size_t>(M) * static_cast<size_t>(N) * SizeOf(dtype),
+                              s),
+               "bt_ptr_ab k0");
+    return;
+  }
+  auto ctx = GetBlas(q.device.index, s);
+  const float alpha = 1.f, beta = 0.f;
+  const hipDataType at = ToBlasType(dtype);
+
+  struct PtrTables {
+    void* A = nullptr;
+    void* B = nullptr;
+    void* C = nullptr;
+    int cap = 0;
+  };
+  static std::mutex mu;
+  static std::unordered_map<int, PtrTables> tabs;
+  PtrTables* tab = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    tab = &tabs[q.device.index];
+    if (tab->cap < batch) {
+      if (tab->A) CheckHip(hipFree(tab->A), "freeA");
+      if (tab->B) CheckHip(hipFree(tab->B), "freeB");
+      if (tab->C) CheckHip(hipFree(tab->C), "freeC");
+      const size_t psz = static_cast<size_t>(batch) * sizeof(void*);
+      CheckHip(hipMalloc(&tab->A, psz), "ptrA");
+      CheckHip(hipMalloc(&tab->B, psz), "ptrB");
+      CheckHip(hipMalloc(&tab->C, psz), "ptrC");
+      tab->cap = batch;
+    }
+  }
+  const size_t psz = static_cast<size_t>(batch) * sizeof(void*);
+  CheckHip(hipMemcpyAsync(tab->A, a_ptrs, psz, hipMemcpyHostToDevice, s), "H2D A");
+  CheckHip(hipMemcpyAsync(tab->B, b_ptrs, psz, hipMemcpyHostToDevice, s), "H2D B");
+  CheckHip(hipMemcpyAsync(tab->C, out_ptrs, psz, hipMemcpyHostToDevice, s), "H2D C");
+
+  CheckBlas(hipblasGemmBatchedEx(
+                ctx.handle, HIPBLAS_OP_T, HIPBLAS_OP_N,
+                /*m=*/N, /*n=*/M, /*k=*/K, &alpha,
+                reinterpret_cast<const void**>(tab->B), at, /*ldb=*/K,
+                reinterpret_cast<const void**>(tab->A), at, /*lda=*/K, &beta,
+                reinterpret_cast<void**>(tab->C), at, /*ldc=*/N, batch, HIPBLAS_COMPUTE_32F,
+                HIPBLAS_GEMM_DEFAULT),
+            "hipblasGemmBatchedEx BT AB");
+}
+
 }  // namespace vt::rocm

@@ -95,7 +95,7 @@ void ExpertGeGLUDevice(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_u
   vt::MatmulBT(d.q, out.t(), s.act.t(), down_w);
 }
 
-// Batched top-k experts already on device via pointer-array GEMM (no weight gather).
+// Batched top-k experts on device: pointer-batch GEMM + single fused GeluAndMul.
 bool ExpertGeGLUDeviceBatched(Dev d, DBuf& ysum, const Tensor& x,
                               const std::vector<const uint16_t*>& gu_ptrs,
                               const std::vector<const uint16_t*>& dn_ptrs,
@@ -107,69 +107,67 @@ bool ExpertGeGLUDeviceBatched(Dev d, DBuf& ysum, const Tensor& x,
   const int64_t T = x.shape[0];
   if (T != 1) return false;
 
-  DBuf gate_b(d, DType::kBF16, {G, T, I});
-  DBuf up_b(d, DType::kBF16, {G, T, I});
-  DBuf act_b(d, DType::kBF16, {G, T, I});
-  DBuf y_b(d, DType::kBF16, {G, T, H});
+  // Contiguous [G,I] activations / outputs (T=1).
+  DBuf gate_b(d, DType::kBF16, {G, I});
+  DBuf up_b(d, DType::kBF16, {G, I});
+  DBuf gu_all(d, DType::kBF16, {G, 2 * I});
+  DBuf act_all(d, DType::kBF16, {G, I});
+  DBuf y_b(d, DType::kBF16, {G, H});
 
   std::vector<void*> gate_out(static_cast<size_t>(G));
   std::vector<void*> up_out(static_cast<size_t>(G));
   std::vector<void*> y_out(static_cast<size_t>(G));
+  std::vector<void*> act_ptrs(static_cast<size_t>(G));
   std::vector<void*> gate_w(static_cast<size_t>(G));
   std::vector<void*> up_w(static_cast<size_t>(G));
   std::vector<void*> dn_w(static_cast<size_t>(G));
-  std::vector<void*> act_in(static_cast<size_t>(G));
   for (int g = 0; g < G; ++g) {
     gate_out[static_cast<size_t>(g)] =
-        static_cast<char*>(gate_b.ptr()) + static_cast<size_t>(g) * static_cast<size_t>(T * I) * 2;
+        static_cast<char*>(gate_b.ptr()) + static_cast<size_t>(g) * static_cast<size_t>(I) * 2;
     up_out[static_cast<size_t>(g)] =
-        static_cast<char*>(up_b.ptr()) + static_cast<size_t>(g) * static_cast<size_t>(T * I) * 2;
+        static_cast<char*>(up_b.ptr()) + static_cast<size_t>(g) * static_cast<size_t>(I) * 2;
     y_out[static_cast<size_t>(g)] =
-        static_cast<char*>(y_b.ptr()) + static_cast<size_t>(g) * static_cast<size_t>(T * H) * 2;
-    act_in[static_cast<size_t>(g)] =
-        static_cast<char*>(act_b.ptr()) + static_cast<size_t>(g) * static_cast<size_t>(T * I) * 2;
+        static_cast<char*>(y_b.ptr()) + static_cast<size_t>(g) * static_cast<size_t>(H) * 2;
+    act_ptrs[static_cast<size_t>(g)] =
+        static_cast<char*>(act_all.ptr()) + static_cast<size_t>(g) * static_cast<size_t>(I) * 2;
     gate_w[static_cast<size_t>(g)] = const_cast<uint16_t*>(gu_ptrs[static_cast<size_t>(g)]);
     up_w[static_cast<size_t>(g)] =
         const_cast<uint16_t*>(gu_ptrs[static_cast<size_t>(g)] + I * H);
     dn_w[static_cast<size_t>(g)] = const_cast<uint16_t*>(dn_ptrs[static_cast<size_t>(g)]);
   }
 
-  // gate/up: [T,I] = x[T,H] @ W[I,H]^T
+  // gate/up batched BT
   vt::rocm::MatmulBTPointerBatchKernelRocm(d.q, gate_out.data(), x.data, gate_w.data(), G,
-                                           static_cast<int>(T), static_cast<int>(I),
-                                           static_cast<int>(H), DType::kBF16);
+                                           /*M=*/1, static_cast<int>(I), static_cast<int>(H),
+                                           DType::kBF16);
   vt::rocm::MatmulBTPointerBatchKernelRocm(d.q, up_out.data(), x.data, up_w.data(), G,
-                                           static_cast<int>(T), static_cast<int>(I),
-                                           static_cast<int>(H), DType::kBF16);
+                                           /*M=*/1, static_cast<int>(I), static_cast<int>(H),
+                                           DType::kBF16);
 
-  DBuf gu(d, DType::kBF16, {T, 2 * I});
-  DBuf act1(d, DType::kBF16, {T, I});
+  // Pack [G,I]|[G,I] -> [G, 2I] then ONE GeluAndMul over G rows.
   const size_t row = static_cast<size_t>(I) * sizeof(uint16_t);
   for (int g = 0; g < G; ++g) {
-    d.b.Copy(d.q, gu.ptr(), gate_out[static_cast<size_t>(g)], row);
-    d.b.Copy(d.q, static_cast<char*>(gu.ptr()) + row, up_out[static_cast<size_t>(g)], row);
-    vt::GeluAndMul(d.q, act1.t(), gu.t());
-    d.b.Copy(d.q, act_in[static_cast<size_t>(g)], act1.ptr(), row);
+    char* dst = static_cast<char*>(gu_all.ptr()) + static_cast<size_t>(g) * 2 * row;
+    d.b.Copy(d.q, dst, gate_out[static_cast<size_t>(g)], row);
+    d.b.Copy(d.q, dst + row, up_out[static_cast<size_t>(g)], row);
   }
+  Tensor gu_t = Tensor::Contiguous(static_cast<uint16_t*>(gu_all.ptr()), DType::kBF16,
+                                   d.q.device, {G, 2 * I});
+  Tensor act_t = Tensor::Contiguous(static_cast<uint16_t*>(act_all.ptr()), DType::kBF16,
+                                    d.q.device, {G, I});
+  vt::GeluAndMul(d.q, act_t, gu_t);
 
-  // down: [T,H] = act[T,I] @ Wd[H,I]^T  — different A per expert
-  // Use pointer batch with A=act, B=down weights. Not shared A — need per-A batch.
-  // Fall back to loop MatmulBT for down (G small).
-  for (int g = 0; g < G; ++g) {
-    Tensor act_g = Tensor::Contiguous(static_cast<uint16_t*>(act_in[static_cast<size_t>(g)]),
-                                      DType::kBF16, d.q.device, {T, I});
-    Tensor wd_g = Tensor::Contiguous(static_cast<uint16_t*>(dn_w[static_cast<size_t>(g)]),
-                                     DType::kBF16, d.q.device, {H, I});
-    Tensor y_g = Tensor::Contiguous(static_cast<uint16_t*>(y_out[static_cast<size_t>(g)]),
-                                    DType::kBF16, d.q.device, {T, H});
-    vt::MatmulBT(d.q, y_g, act_g, wd_g);
-  }
+  // down: y[g] = act[g] @ Wd[g]^T  (pointer batch, both A and B vary)
+  vt::rocm::MatmulBTPointerBatchABKernelRocm(
+      d.q, y_out.data(), act_ptrs.data(), dn_w.data(), G,
+      /*M=*/1, static_cast<int>(H), static_cast<int>(I), DType::kBF16);
 
+  // weighted sum
   ysum.Zero(d);
   for (int g = 0; g < G; ++g) {
     Tensor y_g = Tensor::Contiguous(static_cast<uint16_t*>(y_out[static_cast<size_t>(g)]),
-                                    DType::kBF16, d.q.device, {T, H});
-    DBuf ysc(d, DType::kBF16, {T, H});
+                                    DType::kBF16, d.q.device, {1, H});
+    DBuf ysc(d, DType::kBF16, {1, H});
     vt::MulScalar(d.q, ysc.t(), y_g, static_cast<double>(wts[static_cast<size_t>(g)]));
     vt::Add(d.q, ysum.t(), ysum.t(), ysc.t());
   }
@@ -403,8 +401,8 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
       }
     }
 
-    // Optional batched device path (VT_GEMMA4_BATCH_EXPERTS=1). Default off:
-    // pointer-batch + Gelu pack currently slower than serial ExpertGeGLU on R9700.
+    // Batched path: VT_GEMMA4_BATCH_EXPERTS=1 (default off — still slower than serial
+    // ExpertGeGLU on R9700; fused Gelu helps but pointer-table overhead remains).
     static const bool batch_experts = [] {
       const char* e = std::getenv("VT_GEMMA4_BATCH_EXPERTS");
       return e && e[0] == '1';
