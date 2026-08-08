@@ -184,6 +184,32 @@ void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
             "hipblasGemmEx BT");
 }
 
+// out = alpha * (a @ b^T) + beta * out
+void MatmulBTAlphaBetaRocm(Queue& q, void* out, const void* a, const void* b, int M, int N,
+                           int K, float alpha, float beta, DType dtype) {
+  if (M == 0 || N == 0) return;
+  if (dtype != DType::kBF16 && dtype != DType::kF32) {
+    throw std::runtime_error("vt rocm: matmul_bt_ab: dtype");
+  }
+  hipStream_t s = static_cast<hipStream_t>(q.handle);
+  if (K == 0) {
+    if (beta == 0.f) {
+      CheckHip(hipMemsetAsync(out, 0,
+                              static_cast<size_t>(M) * static_cast<size_t>(N) * SizeOf(dtype),
+                              s),
+               "bt_ab k0");
+    }
+    return;
+  }
+  auto ctx = GetBlas(q.device.index, s);
+  const hipDataType at = ToBlasType(dtype);
+  CheckBlas(hipblasGemmEx(ctx.handle, HIPBLAS_OP_T, HIPBLAS_OP_N,
+                          /*m=*/N, /*n=*/M, /*k=*/K, &alpha, b, at, /*ldb=*/K, a, at,
+                          /*lda=*/K, &beta, out, at, /*ldc=*/N, HIPBLAS_COMPUTE_32F,
+                          HIPBLAS_GEMM_DEFAULT),
+            "hipblasGemmEx BT alpha/beta");
+}
+
 // General strided-batch BT: a may also be batched (strideA elements between batches).
 // out[g,M,N] = a_g[M,K] @ b_g[N,K]^T
 void MatmulBTStridedBatchFullKernelRocm(Queue& q, void* out, const void* a, const void* b,

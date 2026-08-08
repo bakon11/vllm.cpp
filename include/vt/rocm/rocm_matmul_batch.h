@@ -23,4 +23,9 @@ void MatmulBTPointerBatchABKernelRocm(Queue& q, void** out_ptrs, void** a_ptrs,
                                       void** b_ptrs, int batch, int M, int N, int K,
                                       DType dtype);
 
+// out = alpha * (a @ b^T) + beta * out   — MoE expert mix fuse
+// a [M,K], b [N,K], out [M,N], contiguous rows
+void MatmulBTAlphaBetaRocm(Queue& q, void* out, const void* a, const void* b, int M, int N,
+                           int K, float alpha, float beta, DType dtype);
+
 }  // namespace vt::rocm

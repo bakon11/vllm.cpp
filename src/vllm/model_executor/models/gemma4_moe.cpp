@@ -62,21 +62,22 @@ void ExpertGeGLUHost(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_up_
   vt::MatmulBT(d.q, out.t(), s.act.t(), s.down_w.t());
 }
 
-void ExpertGeGLUDevice(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_up_e,
-                       const uint16_t* down_e, int64_t I, int64_t H, ExpertScratch& s) {
+void ExpertGeGLUDeviceAccum(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_up_e,
+                            const uint16_t* down_e, int64_t I, int64_t H, ExpertScratch& s,
+                            float alpha, float beta) {
   const int64_t T = x.shape[0];
   const vt::Device dev = d.q.device;
   Tensor gate_w =
       Tensor::Contiguous(const_cast<uint16_t*>(gate_up_e), DType::kBF16, dev, {I, H});
   Tensor up_w = Tensor::Contiguous(const_cast<uint16_t*>(gate_up_e + I * H), DType::kBF16,
                                    dev, {I, H});
-  Tensor down_w =
-      Tensor::Contiguous(const_cast<uint16_t*>(down_e), DType::kBF16, dev, {H, I});
   vt::MatmulBT(d.q, s.gate.t(), x, gate_w);
   vt::MatmulBT(d.q, s.up.t(), x, up_w);
   vt::rocm::GeluMulSeparateRocm(d.q, s.act.ptr(), s.gate.ptr(), s.up.ptr(), T * I,
                                 DType::kBF16);
-  vt::MatmulBT(d.q, out.t(), s.act.t(), down_w);
+  vt::rocm::MatmulBTAlphaBetaRocm(d.q, out.ptr(), s.act.ptr(), down_e, static_cast<int>(T),
+                                  static_cast<int>(H), static_cast<int>(I), alpha, beta,
+                                  DType::kBF16);
 }
 
 // Batched top-k experts on device: pointer-batch GEMM + single fused GeluAndMul.
@@ -452,18 +453,24 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
 
     for (int i = 0; i < top_k; ++i) {
       const int e = idx[static_cast<size_t>(i)];
+      const float ww = wts[static_cast<size_t>(i)];
+      const float beta = (i == 0) ? 0.f : 1.f;
+      bool fused_mix = false;
+
       if (same_dev) {
         auto* gu = static_cast<const uint16_t*>(ex.gate_up_dev) +
                    static_cast<int64_t>(e) * gu_stride;
         auto* dn =
             static_cast<const uint16_t*>(ex.down_dev) + static_cast<int64_t>(e) * dn_stride;
-        ExpertGeGLUDevice(d, y, xin.t(), gu, dn, I, H, esc);
+        ExpertGeGLUDeviceAccum(d, ysum, xin.t(), gu, dn, I, H, esc, ww, beta);
+        fused_mix = true;
       } else if (need_peer_sc && gu_sc && dn_sc) {
-        // Resident on another GPU: peer/stage one expert into compute scratch.
         if (PeerCopyGemma4ExpertSlice(ex.dev_id, ex.gate_up_dev, ex.down_dev, e, I, H,
                                       compute_dev, gu_sc->ptr(), dn_sc->ptr())) {
-          ExpertGeGLUDevice(d, y, xin.t(), static_cast<const uint16_t*>(gu_sc->ptr()),
-                            static_cast<const uint16_t*>(dn_sc->ptr()), I, H, esc);
+          ExpertGeGLUDeviceAccum(d, ysum, xin.t(), static_cast<const uint16_t*>(gu_sc->ptr()),
+                                 static_cast<const uint16_t*>(dn_sc->ptr()), I, H, esc, ww,
+                                 beta);
+          fused_mix = true;
         } else if (ex.is_fp8) {
           const auto& fex = ex.fp8[static_cast<size_t>(e)];
           DequantGemma4Fp8ExpertToBf16Ephemeral(fex, I, H, gu_tmp.data(), dn_tmp.data());
@@ -476,8 +483,10 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
       } else if (ex.is_fp8) {
         const auto& fex = ex.fp8[static_cast<size_t>(e)];
         if (EnsureGemma4Fp8ExpertOnDevice(d, fex, I, H)) {
-          ExpertGeGLUDevice(d, y, xin.t(), static_cast<const uint16_t*>(fex.dev_gu),
-                            static_cast<const uint16_t*>(fex.dev_dn), I, H, esc);
+          ExpertGeGLUDeviceAccum(d, ysum, xin.t(), static_cast<const uint16_t*>(fex.dev_gu),
+                                 static_cast<const uint16_t*>(fex.dev_dn), I, H, esc, ww,
+                                 beta);
+          fused_mix = true;
         } else {
           EnsureGemma4Fp8ExpertCached(fex, I, H);
           ExpertGeGLUHost(d, y, xin.t(), fex.cached_gu.data(), fex.cached_dn.data(), I, H,
@@ -490,7 +499,8 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
         VT_CHECK(false, "gemma4 moe: no expert weights");
       }
 
-      const double ww = static_cast<double>(wts[static_cast<size_t>(i)]);
+      if (fused_mix) continue;  // already accumulated into ysum
+
       if (host_axpy) {
         d.b.Synchronize(d.q);
         std::vector<uint16_t> hy(static_cast<size_t>(H));
@@ -499,13 +509,11 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
         for (int64_t j = 0; j < H; ++j)
           hsum[static_cast<size_t>(j)] = vt::F32ToBF16(
               vt::BF16ToF32(hsum[static_cast<size_t>(j)]) +
-              static_cast<float>(ww) * vt::BF16ToF32(hy[static_cast<size_t>(j)]));
+              ww * vt::BF16ToF32(hy[static_cast<size_t>(j)]));
       } else if (i == 0) {
-        // First expert: ysum = ww * y (skip Zero+Add).
-        vt::MulScalar(d.q, ysum.t(), y.t(), ww);
+        vt::MulScalar(d.q, ysum.t(), y.t(), static_cast<double>(ww));
       } else {
-        // Device: ysum += ww * y
-        vt::MulScalar(d.q, ysc.t(), y.t(), ww);
+        vt::MulScalar(d.q, ysc.t(), y.t(), static_cast<double>(ww));
         vt::Add(d.q, ysum.t(), ysum.t(), ysc.t());
       }
     }
