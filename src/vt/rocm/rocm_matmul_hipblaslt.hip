@@ -10,10 +10,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "vt/ops.h"
@@ -57,19 +55,30 @@ struct BlasCtx {
   hipblasHandle_t handle = nullptr;
 };
 
+// Per-thread handle: hipBLAS is not free-threaded; decode is single-threaded per
+// engine worker. Avoid global mutex + SetStream on every GEMM (100s×/token).
 BlasCtx GetBlas(int device, hipStream_t stream) {
-  static std::mutex mu;
-  static std::unordered_map<int, BlasCtx> ctxs;
-  std::lock_guard<std::mutex> lock(mu);
-  auto it = ctxs.find(device);
-  if (it == ctxs.end()) {
-    BlasCtx c;
-    CheckBlas(hipblasCreate(&c.handle), "hipblasCreate");
-    ctxs.emplace(device, c);
-    it = ctxs.find(device);
+  struct Tls {
+    int dev = -1;
+    hipStream_t stream = nullptr;
+    hipblasHandle_t handle = nullptr;
+  };
+  static thread_local Tls tls;
+  if (tls.handle == nullptr || tls.dev != device) {
+    if (tls.handle) {
+      // device switch rare — destroy old handle
+      (void)hipblasDestroy(tls.handle);
+      tls.handle = nullptr;
+    }
+    CheckBlas(hipblasCreate(&tls.handle), "hipblasCreate");
+    tls.dev = device;
+    tls.stream = nullptr;
   }
-  CheckBlas(hipblasSetStream(it->second.handle, stream), "hipblasSetStream");
-  return it->second;
+  if (tls.stream != stream) {
+    CheckBlas(hipblasSetStream(tls.handle, stream), "hipblasSetStream");
+    tls.stream = stream;
+  }
+  return BlasCtx{tls.handle};
 }
 
 std::string ComboName(const Tensor& a, const Tensor& b, const Tensor& out) {
