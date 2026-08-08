@@ -71,69 +71,14 @@ void ExpertGeGLUDeviceAccum(Dev d, DBuf& out, const Tensor& x, const uint16_t* g
                                   DType::kBF16);
 }
 
-// Batched top-k experts on device: pointer-batch GEMM + single fused GeluAndMul.
-bool ExpertGeGLUDeviceBatched(Dev d, DBuf& ysum, const Tensor& x,
-                              const std::vector<const uint16_t*>& gu_ptrs,
-                              const std::vector<const uint16_t*>& dn_ptrs,
-                              const std::vector<float>& wts, int64_t I, int64_t H) {
-  const int G = static_cast<int>(gu_ptrs.size());
-  if (G <= 0 || static_cast<int>(dn_ptrs.size()) != G ||
-      static_cast<int>(wts.size()) != G)
-    return false;
-  const int64_t T = x.shape[0];
-  if (T != 1) return false;
-
-  // Contiguous [G, 2I] gate|up + [G,I] act + [G,H] y
-  DBuf gu_all(d, DType::kBF16, {G, 2 * I});
-  DBuf act_all(d, DType::kBF16, {G, I});
-  DBuf y_b(d, DType::kBF16, {G, H});
-
-  std::vector<void*> gu_out(static_cast<size_t>(G));
-  std::vector<void*> y_out(static_cast<size_t>(G));
-  std::vector<void*> act_ptrs(static_cast<size_t>(G));
-  std::vector<void*> gu_w(static_cast<size_t>(G));
-  std::vector<void*> dn_w(static_cast<size_t>(G));
-  for (int g = 0; g < G; ++g) {
-    gu_out[static_cast<size_t>(g)] =
-        static_cast<char*>(gu_all.ptr()) + static_cast<size_t>(g) * static_cast<size_t>(2 * I) * 2;
-    y_out[static_cast<size_t>(g)] =
-        static_cast<char*>(y_b.ptr()) + static_cast<size_t>(g) * static_cast<size_t>(H) * 2;
-    act_ptrs[static_cast<size_t>(g)] =
-        static_cast<char*>(act_all.ptr()) + static_cast<size_t>(g) * static_cast<size_t>(I) * 2;
-    gu_w[static_cast<size_t>(g)] = const_cast<uint16_t*>(gu_ptrs[static_cast<size_t>(g)]);
-    dn_w[static_cast<size_t>(g)] = const_cast<uint16_t*>(dn_ptrs[static_cast<size_t>(g)]);
-  }
-
-  // One pointer-batch GEMM: x @ W_gu[g]^T -> [1, 2I] per expert
-  vt::rocm::MatmulBTPointerBatchKernelRocm(d.q, gu_out.data(), x.data, gu_w.data(), G,
-                                           /*M=*/1, static_cast<int>(2 * I), static_cast<int>(H),
-                                           DType::kBF16);
-
-  Tensor gu_t = Tensor::Contiguous(static_cast<uint16_t*>(gu_all.ptr()), DType::kBF16,
-                                   d.q.device, {G, 2 * I});
-  Tensor act_t = Tensor::Contiguous(static_cast<uint16_t*>(act_all.ptr()), DType::kBF16,
-                                    d.q.device, {G, I});
-  vt::GeluAndMul(d.q, act_t, gu_t);
-
-  // down: y[g] = act[g] @ Wd[g]^T
-  vt::rocm::MatmulBTPointerBatchABKernelRocm(
-      d.q, y_out.data(), act_ptrs.data(), dn_w.data(), G,
-      /*M=*/1, static_cast<int>(H), static_cast<int>(I), DType::kBF16);
-
-  // weighted sum into ysum (first expert writes, rest accumulate)
-  for (int g = 0; g < G; ++g) {
-    Tensor y_g = Tensor::Contiguous(static_cast<uint16_t*>(y_out[static_cast<size_t>(g)]),
-                                    DType::kBF16, d.q.device, {1, H});
-    const float a = wts[static_cast<size_t>(g)];
-    if (g == 0) {
-      vt::MulScalar(d.q, ysum.t(), y_g, static_cast<double>(a));
-    } else {
-      DBuf ysc(d, DType::kBF16, {1, H});
-      vt::MulScalar(d.q, ysc.t(), y_g, static_cast<double>(a));
-      vt::Add(d.q, ysum.t(), ysum.t(), ysc.t());
-    }
-  }
-  return true;
+// Batched top-k path (gather+strided or pointer-batch): currently disabled.
+// Lab: gather+strided produced wrong tokens (~23 t/s); pointer-batch ~0.8 t/s.
+// Serial ExpertGeGLUDeviceAccum remains the correct/fast path (~34 t/s).
+bool ExpertGeGLUDeviceBatched(Dev /*d*/, DBuf& /*ysum*/, const Tensor& /*x*/,
+                              const std::vector<const uint16_t*>& /*gu_ptrs*/,
+                              const std::vector<const uint16_t*>& /*dn_ptrs*/,
+                              const std::vector<float>& /*wts*/, int64_t /*I*/, int64_t /*H*/) {
+  return false;
 }
 
 }  // namespace
