@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
@@ -254,8 +255,15 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     // Reuse scratch across top-k (avoid alloc/free per expert).
     DBuf y(d, DType::kBF16, {1, H});
     DBuf ysc(d, DType::kBF16, {1, H});
-    DBuf gu_sc(d, DType::kBF16, {2 * I, H});
-    DBuf dn_sc(d, DType::kBF16, {H, I});
+    // Peer scratch only when experts live on another device (~12MiB).
+    const bool need_peer_sc =
+        ex.gate_up_dev != nullptr && ex.down_dev != nullptr && !same_dev;
+    std::optional<DBuf> gu_sc;
+    std::optional<DBuf> dn_sc;
+    if (need_peer_sc) {
+      gu_sc.emplace(d, DType::kBF16, std::vector<int64_t>{2 * I, H});
+      dn_sc.emplace(d, DType::kBF16, std::vector<int64_t>{H, I});
+    }
     std::vector<uint16_t> gu_tmp;
     std::vector<uint16_t> dn_tmp;
     if (ex.is_fp8) {
@@ -271,12 +279,12 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
         auto* dn =
             static_cast<const uint16_t*>(ex.down_dev) + static_cast<int64_t>(e) * dn_stride;
         ExpertGeGLUDevice(d, y, xin.t(), gu, dn, I, H);
-      } else if (ex.gate_up_dev != nullptr && ex.down_dev != nullptr) {
+      } else if (need_peer_sc && gu_sc && dn_sc) {
         // Resident on another GPU: peer/stage one expert into compute scratch.
         if (PeerCopyGemma4ExpertSlice(ex.dev_id, ex.gate_up_dev, ex.down_dev, e, I, H,
-                                      compute_dev, gu_sc.ptr(), dn_sc.ptr())) {
-          ExpertGeGLUDevice(d, y, xin.t(), static_cast<const uint16_t*>(gu_sc.ptr()),
-                            static_cast<const uint16_t*>(dn_sc.ptr()), I, H);
+                                      compute_dev, gu_sc->ptr(), dn_sc->ptr())) {
+          ExpertGeGLUDevice(d, y, xin.t(), static_cast<const uint16_t*>(gu_sc->ptr()),
+                            static_cast<const uint16_t*>(dn_sc->ptr()), I, H);
         } else if (ex.is_fp8) {
           const auto& fex = ex.fp8[static_cast<size_t>(e)];
           DequantGemma4Fp8ExpertToBf16Ephemeral(fex, I, H, gu_tmp.data(), dn_tmp.data());
