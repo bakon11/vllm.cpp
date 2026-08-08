@@ -627,7 +627,8 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   static const size_t kMaxPromptChars = [] {
     const char* e = std::getenv("VT_SERVER_MAX_PROMPT_CHARS");
     if (e && e[0]) return static_cast<size_t>(std::strtoull(e, nullptr, 10));
-    return static_cast<size_t>(48000);  // ~safe for interactive; 0 disables
+    // Default raised for Hermes full SOUL+tools (~140k). Set lower for safety.
+    return static_cast<size_t>(200000);
   }();
   static const int kMaxNewTokensCap = [] {
     const char* e = std::getenv("VT_SERVER_MAX_NEW_TOKENS");
@@ -642,6 +643,11 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
            "prompt / tools payload. Set VT_SERVER_MAX_PROMPT_CHARS=0 to disable.";
     LogRequestError(request_id, "/v1/chat/completions", err.str());
     throw std::runtime_error(err.str());
+  }
+  if (prompt.size() > 32000) {
+    ChatDbg(request_id,
+            "note=large_prompt prefix_caching=ON — first request pays full prefill; "
+            "identical system+tools prefix on later turns should hit APC");
   }
 
   // ── Multimodal (MM-SERVE-ENGINE) ─────────────────────────────────────────
