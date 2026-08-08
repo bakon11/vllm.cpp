@@ -181,6 +181,8 @@ struct Args {
   // default → /abort_requests 404s. Enables the /abort_requests production wiring.
   bool enable_server_dev_mode = false;
   bool verbose = false;
+  // Gemma4 HF/vLLM: --default-chat-template-kwargs enable_thinking (default OFF).
+  bool enable_thinking = false;
   // Request logging (Python vLLM --enable-log-requests parity). Default ON.
   bool enable_log_requests = true;
   bool enable_log_outputs = false;
@@ -235,6 +237,7 @@ struct Args {
          "               [--enable-tokenizer-info-endpoint]\n"
          "               [--enable-server-dev-mode]\n"
          "               [--verbose]\n"
+         "               [--enable-thinking|--no-enable-thinking]\n"
          "               [--enable-log-requests|--disable-log-requests]\n"
          "               [--enable-log-outputs] [--max-log-len N]\n"
          "               [--enable-metrics|--disable-metrics]\n"
@@ -334,6 +337,10 @@ Args ParseArgs(int argc, char** argv) {
       a.enable_server_dev_mode = true;
     } else if (flag == "--verbose" || flag == "-v") {
       a.verbose = true;
+    } else if (flag == "--enable-thinking") {
+      a.enable_thinking = true;
+    } else if (flag == "--no-enable-thinking") {
+      a.enable_thinking = false;
     } else if (flag == "--enable-log-requests") {
       a.enable_log_requests = true;
     } else if (flag == "--disable-log-requests") {
@@ -713,10 +720,13 @@ int main(int argc, char** argv) {
       const std::string eos =
           tokenizer.EosId() >= 0 ? tokenizer.Decode({tokenizer.EosId()}) : "";
       chat_prompt_fn =
-          vllm::entrypoints::MakeChatTemplatePromptFn(chat_template, bos, eos);
+          vllm::entrypoints::MakeChatTemplatePromptFn(
+              chat_template, bos, eos, args.enable_thinking);
       std::cerr << "server: using chat template (" << chat_template.size()
                 << " chars) from " << tokenizer_config_path
-                << " or sibling chat_template.jinja\n";
+                << " or sibling chat_template.jinja"
+                << " enable_thinking="
+                << (args.enable_thinking ? "true" : "false") << "\n";
     } catch (const std::exception& e) {
       std::cerr << "server: no chat template (" << e.what()
                 << "); falling back to the simple role-join prompt\n";
