@@ -515,6 +515,33 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
       }
     }
 
+    // Fused top-k ExpertGeGLU (VT_GEMMA4_FUSED_EXPERTS=1).
+    if (!host_axpy && ex.is_fp8 && T == 1) {
+      std::vector<const uint16_t*> gu_ptrs, dn_ptrs;
+      gu_ptrs.reserve(static_cast<size_t>(top_k));
+      dn_ptrs.reserve(static_cast<size_t>(top_k));
+      bool all_dev = true;
+      for (int i = 0; i < top_k; ++i) {
+        const int e = idx[static_cast<size_t>(i)];
+        const auto& fex = ex.fp8[static_cast<size_t>(e)];
+        if (!fex.dev_gu || !fex.dev_dn) {
+          all_dev = false;
+          break;
+        }
+        gu_ptrs.push_back(static_cast<const uint16_t*>(fex.dev_gu));
+        dn_ptrs.push_back(static_cast<const uint16_t*>(fex.dev_dn));
+      }
+      if (all_dev &&
+          RunGemma4FusedTopkExpertGeGLU(d.q, ysum.ptr(), xin.ptr(), gu_ptrs.data(),
+                                        dn_ptrs.data(), wts.data(), top_k, I, H)) {
+        d.b.Copy(
+            d.q,
+            static_cast<char*>(acc.ptr()) + static_cast<size_t>(t) * static_cast<size_t>(H) * 2,
+            ysum.ptr(), static_cast<size_t>(H) * 2);
+        continue;
+      }
+    }
+
     // Batched path: VT_GEMMA4_BATCH_EXPERTS=1 (default off).
     if (batch_experts && ex.is_fp8 && !host_axpy) {
       std::vector<const uint16_t*> gu_ptrs;
@@ -670,6 +697,10 @@ size_t UploadGemma4ExpertsResidentForWeights(Gemma4Weights& weights,
                "[gemma4] VT_GEMMA4_RESIDENT_EXPERTS requested but this binary "
                "was built without -DVLLM_CPP_HIP; resident preload is a no-op.\n");
   return 0;
+}
+bool RunGemma4FusedTopkExpertGeGLU(vt::Queue&, void*, const void*, const uint16_t* const*,
+                                   const uint16_t* const*, const float*, int, int64_t, int64_t) {
+  return false;
 }
 #endif  // VLLM_CPP_HIP
 

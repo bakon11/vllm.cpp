@@ -94,4 +94,11 @@ void DequantGemma4Fp8ExpertToBf16Ephemeral(const Gemma4Fp8ExpertMats& ex, int64_
                                            int64_t H, uint16_t* gate_up_out,
                                            uint16_t* down_out);
 
+// Fused top-k ExpertGeGLU (T=1). Opt-in VT_GEMMA4_FUSED_EXPERTS=1.
+// Returns false if disabled/unsupported — caller uses serial hipBLAS path.
+bool RunGemma4FusedTopkExpertGeGLU(vt::Queue& q, void* ysum, const void* x,
+                                   const uint16_t* const* gu_ptrs,
+                                   const uint16_t* const* dn_ptrs, const float* wts, int G,
+                                   int64_t I, int64_t H);
+
 }  // namespace vllm
