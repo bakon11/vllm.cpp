@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -620,6 +621,29 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
                            " stream=" + std::string(request.stream ? "1" : "0"));
   const auto req_t0 = std::chrono::steady_clock::now();
 
+  // Lab guardrails: Hermes accidentally sending full SOUL (~140k chars) + max_tokens=65536
+  // wedges single-batch async prefill for many minutes with no client tokens.
+  // Override with VT_SERVER_MAX_PROMPT_CHARS / VT_SERVER_MAX_NEW_TOKENS (0 = disable).
+  static const size_t kMaxPromptChars = [] {
+    const char* e = std::getenv("VT_SERVER_MAX_PROMPT_CHARS");
+    if (e && e[0]) return static_cast<size_t>(std::strtoull(e, nullptr, 10));
+    return static_cast<size_t>(48000);  // ~safe for interactive; 0 disables
+  }();
+  static const int kMaxNewTokensCap = [] {
+    const char* e = std::getenv("VT_SERVER_MAX_NEW_TOKENS");
+    if (e && e[0]) return std::atoi(e);
+    return 4096;  // 0 disables
+  }();
+  if (kMaxPromptChars > 0 && prompt.size() > kMaxPromptChars) {
+    std::ostringstream err;
+    err << "prompt too large for this server (" << prompt.size()
+        << " chars > VT_SERVER_MAX_PROMPT_CHARS=" << kMaxPromptChars
+        << "). Hermes is likely injecting a full system SOUL; shrink the system "
+           "prompt / tools payload. Set VT_SERVER_MAX_PROMPT_CHARS=0 to disable.";
+    LogRequestError(request_id, "/v1/chat/completions", err.str());
+    throw std::runtime_error(err.str());
+  }
+
   // ── Multimodal (MM-SERVE-ENGINE) ─────────────────────────────────────────
   // When the mm seam is set AND a message carries a mm content part, decode +
   // route the media through the mm processor and carry the placeholder-EXPANDED
@@ -718,6 +742,14 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   const bool named_tool_choice = IsNamedToolChoice(request);
 
   SamplingParams sampling_params = request.to_sampling_params();
+  if (kMaxNewTokensCap > 0) {
+    const int before = sampling_params.max_tokens.value_or(kMaxNewTokensCap);
+    if (before > kMaxNewTokensCap) {
+      ChatDbg(request_id, "clamp max_tokens " + std::to_string(before) + " -> " +
+                              std::to_string(kMaxNewTokensCap));
+      sampling_params.max_tokens = kMaxNewTokensCap;
+    }
+  }
 
   // tool_choice -> a structural-tag constraint (structured_outputs.structural_tag)
   // before add_request, built for the ACTIVE tool parser family
