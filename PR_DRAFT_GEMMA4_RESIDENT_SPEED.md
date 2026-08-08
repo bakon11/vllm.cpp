@@ -36,12 +36,15 @@ Hardens dual-GPU FP8 expert residency for ~30 GB hosts, plus a full decode spe
 Per layer-call (avg after warmup): **attn ~4% · dense MLP ~1% · MoE ~95%**
 
 ### Expert GEMM microbench (gfx1201, M=1)
-| Shape | GemmEx BF16 | hipBLASLt FP8 |
-|-------|-------------|---------------|
-| gate_up N=1408 K=2816 | **~30 µs** | heuristic **FAIL** (unsupported) |
-| down N=2816 K=704 | **~17 µs** | heuristic **FAIL** |
+| Shape | GemmEx BF16 | hipBLASLt FP8×BF16 (W8A16) | hipBLASLt FP8×FP8 (W8A8)→BF16 C |
+|-------|-------------|----------------------------|----------------------------------|
+| gate_up N=1408 K=2816 | **~30 µs** | NOT_SUPPORTED | **~54 µs (~1.8× slower)** |
+| down N=2816 K=704 | **~17 µs** | NOT_SUPPORTED | **~18 µs (~1.2× slower)** |
 
-⇒ ~8×(30+17)×30 layers ≈ **11 ms** pure GEMM/token theoretical; wall ~30 ms → rest is launches/Gelu/router/etc. inside MoE.
+⇒ On RDNA4 decode shapes, **library FP8 is available only as W8A8**, and it **does not beat BF16 GemmEx**.  
+Skip local re-quant until more host RAM; Firworks FP8_DYNAMIC file is fine. Speed needs better kernels or different approach than stock hipBLASLt W8A8 @ M=1.
+
+Logs: `~/llms/logs/vllm-cpp-fp8-lt-matrix.log`, `vllm-cpp-fp8-vs-bf16-gemm.log`
 
 ### Upstream (mudler/vllm.cpp, checked 2026-08-08)
 - **#154** (ours) OPEN, mergeable
