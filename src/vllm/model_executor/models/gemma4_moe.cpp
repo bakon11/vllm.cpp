@@ -452,7 +452,9 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     }
 
     // Prefetch: queue device expert H2D for all top-k before any GEMM (same stream).
-    if (ex.is_fp8 && !same_dev) {
+    // Skip when fused resident packs exist (same_dev or peer) — those are the source of truth
+    // and VRAM is already tight after full resident upload.
+    if (ex.is_fp8 && !same_dev && ex.gate_up_dev == nullptr) {
       for (int i = 0; i < top_k; ++i) {
         const int e = idx[static_cast<size_t>(i)];
         if (e >= 0 && e < static_cast<int>(E))

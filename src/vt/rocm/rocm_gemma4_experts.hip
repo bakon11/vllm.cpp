@@ -26,7 +26,8 @@ bool DeviceHasRoom(int dev, size_t need_bytes) {
   size_t free_b = 0, tot_b = 0;
   if (hipMemGetInfo(&free_b, &tot_b) != hipSuccess) return true;
   // GPU0 is compute: dense weights + KV + activations need real headroom.
-  const size_t headroom = (dev == 0) ? (10ull << 30) : (512ull << 20);
+  // 12 GiB: prior 10 GiB still OOM'd gelu after 42 GiB dual-GPU resident pack.
+  const size_t headroom = (dev == 0) ? (12ull << 30) : (512ull << 20);
   return free_b >= need_bytes + headroom;
 }
 
