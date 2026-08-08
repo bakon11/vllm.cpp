@@ -49,6 +49,7 @@
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
+#include "vt/rocm/rocm_gelu_mul_sep.h"
 
 namespace vllm {
 namespace {
@@ -515,30 +516,24 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
       vt::Add(d.q, h2.t(), mlp_n.t(), h1.t());
     }
 
-    // --- PLE (gemma4.py:753-761): gate = gelu(gate_lin(h2)); gated = gate *
-    // ple_l; contrib = post_per_layer_input_norm(proj(gated)); h2 += contrib. ---
+    // --- PLE: gated = gelu(gate_lin(h2)) * ple_l; contrib = norm(proj(gated)); h2 += ---
     if (ple > 0) {
       Tensor wg = ResidentWeight(d, w.per_layer_input_gate, {ple, H});
       DBuf gate_lin(d, DType::kBF16, {T, ple});
       vt::MatmulBT(d.q, gate_lin.t(), h2.t(), wg);
-      DBuf gate_in(d, DType::kBF16, {T, 2 * ple});  // [gate_lin | ple_l]
-      // Assemble [T, 2*ple]: row t = [gate_lin[t] | ple_input[t, l, :]].
-      auto* gi = static_cast<char*>(gate_in.ptr());
-      const auto* gl = static_cast<const char*>(gate_lin.ptr());
+      // Gather this layer's ple rows into contiguous [T,ple] (no pack into 2*ple).
+      DBuf ple_l(d, DType::kBF16, {T, ple});
       const auto* pin = static_cast<const char*>(ple_input.ptr());
-      const size_t two = static_cast<size_t>(2 * ple) * sizeof(uint16_t);
+      auto* pl = static_cast<char*>(ple_l.ptr());
       for (int64_t t = 0; t < T; ++t) {
-        CopyRow(d, gi + static_cast<size_t>(t) * two,
-                gl + static_cast<size_t>(t) * ple_row_bytes, ple_row_bytes);
         const size_t src_off =
-            (static_cast<size_t>(t) * static_cast<size_t>(L) +
-             static_cast<size_t>(l)) *
+            (static_cast<size_t>(t) * static_cast<size_t>(L) + static_cast<size_t>(l)) *
             ple_row_bytes;
-        CopyRow(d, gi + static_cast<size_t>(t) * two + ple_row_bytes,
-                pin + src_off, ple_row_bytes);
+        CopyRow(d, pl + static_cast<size_t>(t) * ple_row_bytes, pin + src_off, ple_row_bytes);
       }
       DBuf gated(d, DType::kBF16, {T, ple});
-      vt::GeluAndMul(d.q, gated.t(), gate_in.t());  // gelu_tanh(gate_lin)*ple_l
+      vt::rocm::GeluMulSeparateRocm(d.q, gated.ptr(), gate_lin.ptr(), ple_l.ptr(), T * ple,
+                                    DType::kBF16);
 
       Tensor wp = ResidentWeight(d, w.per_layer_projection, {H, ple});
       DBuf contrib(d, DType::kBF16, {T, H});
