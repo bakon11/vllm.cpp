@@ -74,6 +74,13 @@ size_t UploadGemma4ExpertsResident(std::vector<Gemma4MoeLayerWeights>& layers,
                                    int num_gpus);
 size_t UploadGemma4ExpertsResidentForWeights(Gemma4Weights& weights, int num_gpus);
 
+// Peer-copy one resident expert (fused stacks on src_dev) into dst buffers on
+// compute_dev. Returns false if peer path unavailable.
+bool PeerCopyGemma4ExpertSlice(int src_dev, const void* gate_up_base,
+                               const void* down_base, int expert_id, int64_t I,
+                               int64_t H, int compute_dev, void* gate_up_dst,
+                               void* down_dst);
+
 // Dequant one FP8 expert into host BF16 gate_up[2I,H] and down[H,I] (caller-owned).
 // Fills permanent host cache (decode path). Prefer Ephemeral for bulk upload.
 void DequantGemma4Fp8ExpertToBf16(const Gemma4Fp8ExpertMats& ex, int64_t I, int64_t H,

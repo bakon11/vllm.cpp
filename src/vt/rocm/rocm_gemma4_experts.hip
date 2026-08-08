@@ -110,6 +110,22 @@ size_t UploadGemma4ExpertsResident(std::vector<Gemma4MoeLayerWeights>& layers,
   if (available < 1) return 0;
   if (num_gpus > available) num_gpus = available;
 
+  // Enable peer access so off-device resident experts can D2D into compute GPU.
+  for (int a = 0; a < num_gpus; ++a) {
+    for (int b = 0; b < num_gpus; ++b) {
+      if (a == b) continue;
+      int can = 0;
+      if (hipDeviceCanAccessPeer(&can, a, b) == hipSuccess && can) {
+        Check(hipSetDevice(a), "peer set");
+        hipError_t pe = hipDeviceEnablePeerAccess(b, 0);
+        if (pe != hipSuccess && pe != hipErrorPeerAccessAlreadyEnabled) {
+          std::fprintf(stderr, "gemma4 moe: peer access %d->%d failed: %s\n", a, b,
+                       hipGetErrorString(pe));
+        }
+      }
+    }
+  }
+
   size_t total = 0;
   int ok_layers = 0;
   int max_layers = 100000;
@@ -172,6 +188,41 @@ size_t UploadGemma4ExpertsResidentForWeights(Gemma4Weights& weights, int num_gpu
   size_t n = UploadGemma4ExpertsResident(flat, num_gpus);
   for (size_t i = 0; i < ptrs.size(); ++i) *ptrs[i] = std::move(flat[i]);
   return n;
+}
+
+bool PeerCopyGemma4ExpertSlice(int src_dev, const void* gate_up_base, const void* down_base,
+                               int expert_id, int64_t I, int64_t H, int compute_dev,
+                               void* gate_up_dst, void* down_dst) {
+  if (!gate_up_base || !down_base || !gate_up_dst || !down_dst) return false;
+  if (src_dev < 0 || compute_dev < 0) return false;
+  const size_t gu_one = static_cast<size_t>(2 * I * H) * sizeof(uint16_t);
+  const size_t dn_one = static_cast<size_t>(H * I) * sizeof(uint16_t);
+  const char* gu_src =
+      static_cast<const char*>(gate_up_base) + static_cast<size_t>(expert_id) * gu_one;
+  const char* dn_src =
+      static_cast<const char*>(down_base) + static_cast<size_t>(expert_id) * dn_one;
+  if (src_dev == compute_dev) {
+    Check(hipSetDevice(compute_dev), "peer same set");
+    Check(hipMemcpy(gate_up_dst, gu_src, gu_one, hipMemcpyDeviceToDevice), "D2D gu");
+    Check(hipMemcpy(down_dst, dn_src, dn_one, hipMemcpyDeviceToDevice), "D2D dn");
+    return true;
+  }
+  hipError_t e1 =
+      hipMemcpyPeer(gate_up_dst, compute_dev, const_cast<char*>(gu_src), src_dev, gu_one);
+  hipError_t e2 =
+      hipMemcpyPeer(down_dst, compute_dev, const_cast<char*>(dn_src), src_dev, dn_one);
+  if (e1 != hipSuccess || e2 != hipSuccess) {
+    // Fallback: staged through host (still avoids FP8 dequant)
+    std::vector<uint16_t> gu_tmp(gu_one / 2), dn_tmp(dn_one / 2);
+    Check(hipSetDevice(src_dev), "peer fb src");
+    Check(hipMemcpy(gu_tmp.data(), gu_src, gu_one, hipMemcpyDeviceToHost), "D2H gu");
+    Check(hipMemcpy(dn_tmp.data(), dn_src, dn_one, hipMemcpyDeviceToHost), "D2H dn");
+    Check(hipSetDevice(compute_dev), "peer fb dst");
+    Check(hipMemcpy(gate_up_dst, gu_tmp.data(), gu_one, hipMemcpyHostToDevice), "H2D gu");
+    Check(hipMemcpy(down_dst, dn_tmp.data(), dn_one, hipMemcpyHostToDevice), "H2D dn");
+  }
+  Check(hipSetDevice(compute_dev), "peer restore compute");
+  return true;
 }
 
 }  // namespace vllm
