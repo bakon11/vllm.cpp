@@ -25,6 +25,7 @@ struct Gemma4Fp8ExpertMats {
   // Lazy host BF16 cache after first dequant (decode reuse).
   mutable std::vector<uint16_t> cached_gu;  // [2I,H]
   mutable std::vector<uint16_t> cached_dn;  // [H,I]
+  mutable bool host_pinned = false;
   // Lazy device BF16 copy on compute GPU (avoids H2D every token).
   mutable void* dev_gu = nullptr;  // [2I,H] bf16
   mutable void* dev_dn = nullptr;  // [H,I] bf16
@@ -80,6 +81,9 @@ bool PeerCopyGemma4ExpertSlice(int src_dev, const void* gate_up_base,
                                const void* down_base, int expert_id, int64_t I,
                                int64_t H, int compute_dev, void* gate_up_dst,
                                void* down_dst);
+
+// hipHostRegister BF16 expert cache for faster H2D (no-op if already pinned).
+void PinGemma4Fp8ExpertHostCache(const Gemma4Fp8ExpertMats& ex);
 
 // Dequant one FP8 expert into host BF16 gate_up[2I,H] and down[H,I] (caller-owned).
 // Fills permanent host cache (decode path). Prefer Ephemeral for bulk upload.

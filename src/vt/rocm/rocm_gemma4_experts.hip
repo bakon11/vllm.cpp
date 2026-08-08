@@ -225,4 +225,19 @@ bool PeerCopyGemma4ExpertSlice(int src_dev, const void* gate_up_base, const void
   return true;
 }
 
+void PinGemma4Fp8ExpertHostCache(const Gemma4Fp8ExpertMats& ex) {
+  if (ex.host_pinned) return;
+  if (ex.cached_gu.empty() || ex.cached_dn.empty()) return;
+  const size_t gu_b = ex.cached_gu.size() * sizeof(uint16_t);
+  const size_t dn_b = ex.cached_dn.size() * sizeof(uint16_t);
+  hipError_t e1 =
+      hipHostRegister(const_cast<uint16_t*>(ex.cached_gu.data()), gu_b, hipHostRegisterDefault);
+  hipError_t e2 =
+      hipHostRegister(const_cast<uint16_t*>(ex.cached_dn.data()), dn_b, hipHostRegisterDefault);
+  if ((e1 == hipSuccess || e1 == hipErrorHostMemoryAlreadyRegistered) &&
+      (e2 == hipSuccess || e2 == hipErrorHostMemoryAlreadyRegistered)) {
+    ex.host_pinned = true;
+  }
+}
+
 }  // namespace vllm

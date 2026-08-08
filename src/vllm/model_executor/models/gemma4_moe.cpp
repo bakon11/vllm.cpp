@@ -1,6 +1,7 @@
 // Gemma-4 MoE: BF16 fused or FP8 per-expert + optional device resident.
 #include "vllm/model_executor/models/gemma4_moe.h"
 
+#include <atomic>
 #include <algorithm>
 #include <cstdlib>
 #include <cmath>
@@ -97,6 +98,7 @@ void EnsureGemma4Fp8ExpertCached(const Gemma4Fp8ExpertMats& ex, int64_t I, int64
   DequantFp8ChannelToBf16(ex.down_w.bytes.data(),
                           reinterpret_cast<const uint16_t*>(ex.down_s.bytes.data()), H, I,
                           ex.cached_dn.data());
+  PinGemma4Fp8ExpertHostCache(ex);
 }
 
 // Dequant into caller buffers without retaining a permanent host BF16 cache.
@@ -144,6 +146,11 @@ bool EnsureGemma4Fp8ExpertOnDevice(Dev d, const Gemma4Fp8ExpertMats& ex, int64_t
   } catch (...) {
     if (gu) d.b.Free(gu);
     if (dn) d.b.Free(dn);
+    static std::atomic<int> fails{0};
+    const int n = fails.fetch_add(1) + 1;
+    if (n == 1 || n % 64 == 0)
+      std::fprintf(stderr, "gemma4 moe: device expert upload fail #%d (falling back to H2D)\n",
+                   n);
     return false;  // fall back to host H2D path
   }
 }
