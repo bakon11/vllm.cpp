@@ -384,8 +384,10 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
                  static_cast<size_t>(t) * static_cast<size_t>(H) * 2,
              static_cast<size_t>(H) * 2);
 
-    ysum.Zero(d);
-    if (host_axpy) std::fill(hsum.begin(), hsum.end(), vt::F32ToBF16(0.f));
+    if (host_axpy) {
+      std::fill(hsum.begin(), hsum.end(), vt::F32ToBF16(0.f));
+    }
+    // device path: first expert MulScalar writes ysum (no Zero needed)
 
     // Prefetch BF16 caches for this token's top-k experts in parallel (cold only).
     if (ex.is_fp8 && !same_dev && ex.gate_up_dev == nullptr) {
@@ -488,8 +490,11 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
           hsum[static_cast<size_t>(j)] = vt::F32ToBF16(
               vt::BF16ToF32(hsum[static_cast<size_t>(j)]) +
               static_cast<float>(ww) * vt::BF16ToF32(hy[static_cast<size_t>(j)]));
+      } else if (i == 0) {
+        // First expert: ysum = ww * y (skip Zero+Add).
+        vt::MulScalar(d.q, ysum.t(), y.t(), ww);
       } else {
-        // Device: ysum += ww * y  (stay on GPU)
+        // Device: ysum += ww * y
         vt::MulScalar(d.q, ysc.t(), y.t(), ww);
         vt::Add(d.q, ysum.t(), ysum.t(), ysc.t());
       }
