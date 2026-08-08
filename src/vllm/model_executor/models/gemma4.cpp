@@ -530,9 +530,6 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   DBuf& dh2 = *lt.dh2;
   DBuf& h2 = *lt.h2;
   DBuf& moe_in = *lt.moe_in;
-  DBuf& n1 = *lt.n1;
-  DBuf& n2 = *lt.n2;
-  DBuf& sum = *lt.sum;
   const size_t th_bytes = static_cast<size_t>(T) * static_cast<size_t>(H) * sizeof(uint16_t);
   DBuf& contrib = *lt.contrib;
 
@@ -570,12 +567,10 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
           RunGemma4Moe(d.q, w.moe, /*router_in=*/h1.t(), /*expert_in=*/moe_in.t(), T, H, eps);
       Tensor w_p1 = ResidentWeight(d, w.moe.post_feedforward_layernorm_1, {H});
       Tensor w_p2 = ResidentWeight(d, w.moe.post_feedforward_layernorm_2, {H});
-      vt::RmsNorm(d.q, n1.t(), mlp.t(), w_p1, plain);
-      vt::RmsNorm(d.q, n2.t(), moe_out.tensor, w_p2, plain);
-      vt::Add(d.q, sum.t(), n1.t(), n2.t());
       Tensor w_pff = ResidentWeight(d, w.post_feedforward_layernorm, {H});
-      // h2 = rmsnorm(sum) + h1
-      vt::rocm::RmsNormPlusAddRocm(d.q, h2.t(), sum.t(), w_pff, h1.t(), plain);
+      // h2 = rmsnorm(rmsnorm(mlp)+rmsnorm(moe), w_pff) + h1  — one fused kernel
+      vt::rocm::DualRmsNormPlusResRocm(d.q, h2.t(), mlp.t(), w_p1, moe_out.tensor, w_p2, w_pff,
+                                       h1.t(), plain);
     } else {
       Tensor w_pff = ResidentWeight(d, w.post_feedforward_layernorm, {H});
       vt::rocm::RmsNormPlusAddRocm(d.q, h2.t(), mlp.t(), w_pff, h1.t(), plain);

@@ -201,4 +201,97 @@ void RmsNormPlusAddRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor& w,
   }
 }
 
+// out = rmsnorm(rmsnorm(x1,w1) + rmsnorm(x2,w2), w3) + residual
+// Gemma-4 MoE post-FF: dual expert streams + join residual.
+template <typename T>
+__global__ void DualRmsNormPlusResKernel(T* out, const T* x1, const T* w1, const T* x2,
+                                         const T* w2, const T* w3, const T* residual, int64_t h,
+                                         float eps1, float eps2, float eps3, bool gemma) {
+  const int64_t row = blockIdx.x;
+  const T* x1r = x1 + row * h;
+  const T* x2r = x2 + row * h;
+  const T* rr = residual + row * h;
+  T* orow = out + row * h;
+  __shared__ float p1[kBlock];
+  __shared__ float p2[kBlock];
+  __shared__ float p3[kBlock];
+
+  float a1 = 0.f, a2 = 0.f;
+  for (int64_t j = threadIdx.x; j < h; j += kBlock) {
+    const float v1 = Load(x1r, j);
+    const float v2 = Load(x2r, j);
+    a1 += v1 * v1;
+    a2 += v2 * v2;
+  }
+  p1[threadIdx.x] = a1;
+  p2[threadIdx.x] = a2;
+  __syncthreads();
+  for (int s = kBlock / 2; s > 0; s /= 2) {
+    if (static_cast<int>(threadIdx.x) < s) {
+      p1[threadIdx.x] += p1[threadIdx.x + s];
+      p2[threadIdx.x] += p2[threadIdx.x + s];
+    }
+    __syncthreads();
+  }
+  const float inv1 = 1.f / sqrtf(p1[0] / static_cast<float>(h) + eps1);
+  const float inv2 = 1.f / sqrtf(p2[0] / static_cast<float>(h) + eps2);
+
+  // Second pass: build mid = n1+n2 and accumulate variance of mid.
+  // Use shared? too large for H=2816. Recompute n1,n2 per thread.
+  float a3 = 0.f;
+  for (int64_t j = threadIdx.x; j < h; j += kBlock) {
+    float w1j = Load(w1, j);
+    float w2j = Load(w2, j);
+    if (gemma) {
+      w1j += 1.f;
+      w2j += 1.f;
+    }
+    const float mid = Load(x1r, j) * inv1 * w1j + Load(x2r, j) * inv2 * w2j;
+    a3 += mid * mid;
+  }
+  p3[threadIdx.x] = a3;
+  __syncthreads();
+  for (int s = kBlock / 2; s > 0; s /= 2) {
+    if (static_cast<int>(threadIdx.x) < s) p3[threadIdx.x] += p3[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float inv3 = 1.f / sqrtf(p3[0] / static_cast<float>(h) + eps3);
+  for (int64_t j = threadIdx.x; j < h; j += kBlock) {
+    float w1j = Load(w1, j);
+    float w2j = Load(w2, j);
+    float w3j = Load(w3, j);
+    if (gemma) {
+      w1j += 1.f;
+      w2j += 1.f;
+      w3j += 1.f;
+    }
+    const float mid = Load(x1r, j) * inv1 * w1j + Load(x2r, j) * inv2 * w2j;
+    Store(orow, j, mid * inv3 * w3j + Load(rr, j));
+  }
+}
+
+void DualRmsNormPlusResRocm(Queue& q, Tensor& out, const Tensor& x1, const Tensor& w1,
+                            const Tensor& x2, const Tensor& w2, const Tensor& w3,
+                            const Tensor& residual, const RmsNormArgs& args) {
+  VT_CHECK(out.dtype == x1.dtype && x1.dtype == x2.dtype && x1.dtype == residual.dtype,
+           "dual rms dtype");
+  const int64_t t = x1.shape[0], h = x1.shape[1];
+  if (t == 0 || h == 0) return;
+  hipStream_t s = static_cast<hipStream_t>(q.handle);
+  // plain RMS (no gemma +1) for Gemma-4 layer norms
+  const bool gemma = args.gemma;
+  if (x1.dtype == DType::kBF16) {
+    DualRmsNormPlusResKernel<__hip_bfloat16><<<static_cast<unsigned>(t), kBlock, 0, s>>>(
+        out.Ptr<__hip_bfloat16>(), x1.Ptr<__hip_bfloat16>(), w1.Ptr<__hip_bfloat16>(),
+        x2.Ptr<__hip_bfloat16>(), w2.Ptr<__hip_bfloat16>(), w3.Ptr<__hip_bfloat16>(),
+        residual.Ptr<__hip_bfloat16>(), h, args.eps, args.eps, args.eps, gemma);
+  } else if (x1.dtype == DType::kF32) {
+    DualRmsNormPlusResKernel<float><<<static_cast<unsigned>(t), kBlock, 0, s>>>(
+        out.Ptr<float>(), x1.Ptr<float>(), w1.Ptr<float>(), x2.Ptr<float>(), w2.Ptr<float>(),
+        w3.Ptr<float>(), residual.Ptr<float>(), h, args.eps, args.eps, args.eps, gemma);
+  } else {
+    VT_CHECK(false, "dual rms dtype");
+  }
+}
+
 }  // namespace vt::rocm
