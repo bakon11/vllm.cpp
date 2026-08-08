@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "vt/ops.h"
 
@@ -181,6 +182,99 @@ void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
                           /*ldc=*/static_cast<int>(N), HIPBLAS_COMPUTE_32F,
                           HIPBLAS_GEMM_DEFAULT),
             "hipblasGemmEx BT");
+}
+
+// General strided-batch BT: a may also be batched (strideA elements between batches).
+// out[g,M,N] = a_g[M,K] @ b_g[N,K]^T
+void MatmulBTStridedBatchFullKernelRocm(Queue& q, void* out, const void* a, const void* b,
+                                        int batch, int M, int N, int K, long long strideA,
+                                        DType dtype) {
+  if (batch <= 0 || M == 0 || N == 0) return;
+  if (dtype != DType::kBF16 && dtype != DType::kF32) {
+    throw std::runtime_error("vt rocm: matmul_bt_batch: dtype");
+  }
+  hipStream_t s = static_cast<hipStream_t>(q.handle);
+  if (K == 0) {
+    CheckHip(hipMemsetAsync(out, 0,
+                            static_cast<size_t>(batch) * static_cast<size_t>(M) *
+                                static_cast<size_t>(N) * SizeOf(dtype),
+                            s),
+             "bt_batch k0");
+    return;
+  }
+  auto ctx = GetBlas(q.device.index, s);
+  const float alpha = 1.f, beta = 0.f;
+  const hipDataType at = ToBlasType(dtype);
+  const long long strideB = static_cast<long long>(N) * K;
+  const long long strideC = static_cast<long long>(M) * N;
+  CheckBlas(hipblasGemmStridedBatchedEx(
+                ctx.handle, HIPBLAS_OP_T, HIPBLAS_OP_N,
+                /*m=*/N, /*n=*/M, /*k=*/K, &alpha, b, at, /*ldb=*/K, strideB, a, at,
+                /*lda=*/K, strideA, &beta, out, at, /*ldc=*/N, strideC, batch,
+                HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT),
+            "hipblasGemmStridedBatchedEx BT");
+}
+
+// Batched BT via pointer arrays (no weight gather): out[g] = a @ b[g]^T
+// a shared; b_ptrs[g] -> [N,K]; out_ptrs[g] -> [M,N]
+void MatmulBTPointerBatchKernelRocm(Queue& q, void** out_ptrs, const void* a,
+                                    void** b_ptrs, int batch, int M, int N, int K,
+                                    DType dtype) {
+  if (batch <= 0 || M == 0 || N == 0) return;
+  if (dtype != DType::kBF16 && dtype != DType::kF32) {
+    throw std::runtime_error("vt rocm: matmul_bt_ptr_batch: dtype");
+  }
+  hipStream_t s = static_cast<hipStream_t>(q.handle);
+  if (K == 0) {
+    for (int g = 0; g < batch; ++g)
+      CheckHip(hipMemsetAsync(out_ptrs[g], 0,
+                              static_cast<size_t>(M) * static_cast<size_t>(N) * SizeOf(dtype),
+                              s),
+               "bt_ptr k0");
+    return;
+  }
+  auto ctx = GetBlas(q.device.index, s);
+  const float alpha = 1.f, beta = 0.f;
+  const hipDataType at = ToBlasType(dtype);
+
+  // Reuse device pointer tables (per-device, grows to max batch seen).
+  struct PtrTables {
+    void* A = nullptr;
+    void* B = nullptr;
+    void* C = nullptr;
+    int cap = 0;
+  };
+  static std::mutex mu;
+  static std::unordered_map<int, PtrTables> tabs;
+  PtrTables* tab = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    tab = &tabs[q.device.index];
+    if (tab->cap < batch) {
+      if (tab->A) CheckHip(hipFree(tab->A), "freeA");
+      if (tab->B) CheckHip(hipFree(tab->B), "freeB");
+      if (tab->C) CheckHip(hipFree(tab->C), "freeC");
+      const size_t psz = static_cast<size_t>(batch) * sizeof(void*);
+      CheckHip(hipMalloc(&tab->A, psz), "ptrA");
+      CheckHip(hipMalloc(&tab->B, psz), "ptrB");
+      CheckHip(hipMalloc(&tab->C, psz), "ptrC");
+      tab->cap = batch;
+    }
+  }
+  std::vector<const void*> a_host(static_cast<size_t>(batch), a);
+  const size_t psz = static_cast<size_t>(batch) * sizeof(void*);
+  CheckHip(hipMemcpyAsync(tab->A, a_host.data(), psz, hipMemcpyHostToDevice, s), "H2D A");
+  CheckHip(hipMemcpyAsync(tab->B, b_ptrs, psz, hipMemcpyHostToDevice, s), "H2D B");
+  CheckHip(hipMemcpyAsync(tab->C, out_ptrs, psz, hipMemcpyHostToDevice, s), "H2D C");
+
+  CheckBlas(hipblasGemmBatchedEx(
+                ctx.handle, HIPBLAS_OP_T, HIPBLAS_OP_N,
+                /*m=*/N, /*n=*/M, /*k=*/K, &alpha,
+                reinterpret_cast<const void**>(tab->B), at, /*ldb=*/K,
+                reinterpret_cast<const void**>(tab->A), at, /*lda=*/K, &beta,
+                reinterpret_cast<void**>(tab->C), at, /*ldc=*/N, batch, HIPBLAS_COMPUTE_32F,
+                HIPBLAS_GEMM_DEFAULT),
+            "hipblasGemmBatchedEx BT");
 }
 
 }  // namespace vt::rocm
