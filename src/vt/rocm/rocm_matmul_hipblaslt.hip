@@ -4,6 +4,7 @@
 //
 // MatmulBT: out[M,N] = a[M,K] @ b[N,K]^T  (b = Linear weight row-major)
 // Matmul:   out[M,N] = a[M,K] @ b[K,N]
+#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
@@ -112,6 +113,52 @@ hipblasComputeType_t GemmCompute(DType dt) {
   return k;
 }
 
+// VT_ROCM_GEMV=1 enables naive M=1 BF16 GEMV (default OFF — hipblas faster on gfx1201).
+bool GemvEnabled() {
+  static const bool on = [] {
+    if (const char* e = std::getenv("VT_ROCM_GEMV")) return e[0] == '1';
+    return false;
+  }();
+  return on;
+}
+
+// y[n] = alpha * dot(x[0:K], W[n,0:K]) + beta * y[n]
+// W row-major [N,K]. One block per n.
+__global__ void Bf16GemvBTKernel(__hip_bfloat16* __restrict__ y,
+                                 const __hip_bfloat16* __restrict__ x,
+                                 const __hip_bfloat16* __restrict__ W, int N, int K,
+                                 float alpha, float beta) {
+  const int n = static_cast<int>(blockIdx.x);
+  if (n >= N) return;
+  const __hip_bfloat16* wrow = W + static_cast<int64_t>(n) * K;
+  float acc = 0.f;
+  for (int k = static_cast<int>(threadIdx.x); k < K; k += static_cast<int>(blockDim.x)) {
+    acc += __bfloat162float(x[k]) * __bfloat162float(wrow[k]);
+  }
+  // block reduce
+  __shared__ float sm[256];
+  const int tid = static_cast<int>(threadIdx.x);
+  sm[tid] = acc;
+  __syncthreads();
+  for (int s = 128; s > 0; s >>= 1) {
+    if (tid < s) sm[tid] += sm[tid + s];
+    __syncthreads();
+  }
+  if (tid == 0) {
+    float v = alpha * sm[0];
+    if (beta != 0.f) v += beta * __bfloat162float(y[n]);
+    y[n] = __float2bfloat16(v);
+  }
+}
+
+void Bf16GemvBT(hipStream_t s, void* out, const void* a, const void* b, int N, int K,
+                float alpha, float beta) {
+  constexpr int kBlock = 256;
+  Bf16GemvBTKernel<<<N, kBlock, 0, s>>>(
+      static_cast<__hip_bfloat16*>(out), static_cast<const __hip_bfloat16*>(a),
+      static_cast<const __hip_bfloat16*>(b), N, K, alpha, beta);
+}
+
 }  // namespace
 
 // out[M,N] = a[M,K] @ b[K,N]  (row-major contiguous / a may have row stride)
@@ -195,6 +242,12 @@ void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
     throw std::runtime_error("vt rocm: matmul_bt: bad a stride");
   }
 
+  // Decode: M=1 BF16 GEMV
+  if (M == 1 && bf16 && out.dtype == DType::kBF16 && a.stride[0] == K && GemvEnabled()) {
+    Bf16GemvBT(s, out.data, a.data, b.data, static_cast<int>(N), static_cast<int>(K), 1.f, 0.f);
+    return;
+  }
+
   auto ctx = GetBlas(q.device.index, s);
   const float alpha = 1.f, beta = 0.f;
   const hipDataType at = ToBlasType(a.dtype);
@@ -227,6 +280,11 @@ void MatmulBTAlphaBetaRocm(Queue& q, void* out, const void* a, const void* b, in
                               s),
                "bt_ab k0");
     }
+    return;
+  }
+  // Decode path: custom BF16 GEMV often beats hipblasGemmEx at M=1.
+  if (M == 1 && dtype == DType::kBF16 && GemvEnabled()) {
+    Bf16GemvBT(s, out, a, b, N, K, alpha, beta);
     return;
   }
   auto ctx = GetBlas(q.device.index, s);
