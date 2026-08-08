@@ -7,13 +7,16 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
+#include <hipblaslt/hipblaslt.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -163,26 +166,176 @@ __global__ void Bf16GemvBTKernel(__hip_bfloat16* __restrict__ y,
 void Bf16GemvBT(hipStream_t s, void* out, const void* a, const void* b, int N, int K,
                 float alpha, float beta) {
   constexpr int kBlock = 256;
-  // Cap shared mem: K*4 bytes. Expert shapes K<=2816 → ~11KB OK.
   if (K <= 0 || N <= 0) return;
-  if (static_cast<size_t>(K) * sizeof(float) > 48 * 1024) {
-    // Fall back: one-block-per-row reduce (no full x in LDS)
-    // Use simple path without LDS x — relaunch with K=0 marker handled below
-  }
   const int grid = (N + kBlock - 1) / kBlock;
   const size_t shmem = static_cast<size_t>(K) * sizeof(float);
-  if (shmem <= 48 * 1024) {
-    Bf16GemvBTKernel<<<grid, kBlock, shmem, s>>>(
-        static_cast<__hip_bfloat16*>(out), static_cast<const __hip_bfloat16*>(a),
-        static_cast<const __hip_bfloat16*>(b), N, K, alpha, beta);
-  } else {
-    // Large K: one block per output (old path)
-    // Reuse kernel with grid=N requires different launch — simple serial fallback
-    // just use hipblas by not being called (caller only when GEMV on)
-    Bf16GemvBTKernel<<<grid, kBlock, 48 * 1024, s>>>(
-        static_cast<__hip_bfloat16*>(out), static_cast<const __hip_bfloat16*>(a),
-        static_cast<const __hip_bfloat16*>(b), N, K, alpha, beta);
+  if (shmem > 48 * 1024) return;  // caller falls through if we no-op — keep K small
+  Bf16GemvBTKernel<<<grid, kBlock, shmem, s>>>(
+      static_cast<__hip_bfloat16*>(out), static_cast<const __hip_bfloat16*>(a),
+      static_cast<const __hip_bfloat16*>(b), N, K, alpha, beta);
+}
+
+// VT_ROCM_HIPBLASLT=1 enables. Default OFF — heuristic path aborted on gfx1201 in lab.
+bool LtEnabled() {
+  static const bool on = [] {
+    if (const char* e = std::getenv("VT_ROCM_HIPBLASLT")) return e[0] == '1';
+    return false;
+  }();
+  return on;
+}
+
+struct LtHandle {
+  hipblasLtHandle_t h = nullptr;
+  LtHandle() {
+    if (hipblasLtCreate(&h) != HIPBLAS_STATUS_SUCCESS) h = nullptr;
   }
+  ~LtHandle() {
+    if (h) (void)hipblasLtDestroy(h);
+  }
+};
+
+LtHandle& GetLt() {
+  static thread_local LtHandle lt;
+  return lt;
+}
+
+struct LtAlgoCache {
+  hipblasLtMatmulAlgo_t algo{};
+  size_t workspace = 0;
+  bool ok = false;
+};
+
+// key: M,N,K,alpha_beta_flag (0=ab1.0/0.0, 1=general)
+using LtKey = std::tuple<int, int, int, int>;
+struct LtKeyHash {
+  size_t operator()(const LtKey& k) const {
+    auto [a, b, c, d] = k;
+    return (static_cast<size_t>(a) * 1315423911u) ^ (static_cast<size_t>(b) * 2654435761u) ^
+           (static_cast<size_t>(c) * 97531u) ^ static_cast<size_t>(d);
+  }
+};
+
+std::unordered_map<LtKey, LtAlgoCache, LtKeyHash>& LtCache() {
+  static thread_local std::unordered_map<LtKey, LtAlgoCache, LtKeyHash> m;
+  return m;
+}
+
+void* LtWorkspace(size_t need) {
+  static thread_local void* ws = nullptr;
+  static thread_local size_t cap = 0;
+  if (need == 0) return nullptr;
+  if (need > cap) {
+    if (ws) (void)hipFree(ws);
+    ws = nullptr;
+    cap = 0;
+    if (hipMalloc(&ws, need) != hipSuccess) return nullptr;
+    cap = need;
+  }
+  return ws;
+}
+
+// C[M,N] = alpha * A[M,K] @ B[N,K]^T + beta * C   (all row-major BF16)
+bool MatmulBTLt(hipStream_t stream, void* C, const void* A, const void* B, int M, int N, int K,
+                float alpha, float beta) {
+  if (!LtEnabled() || M <= 0 || N <= 0 || K <= 0) return false;
+  auto& lt = GetLt();
+  if (!lt.h) return false;
+
+  const int ab_flag = (alpha == 1.f && beta == 0.f) ? 0 : 1;
+  LtKey key{M, N, K, ab_flag};
+  auto& cache = LtCache()[key];
+
+  hipblasLtMatrixLayout_t layoutA = nullptr, layoutB = nullptr, layoutC = nullptr;
+  hipblasLtMatmulDesc_t matmulDesc = nullptr;
+  hipblasLtMatmulPreference_t pref = nullptr;
+
+  auto cleanup = [&]() {
+    if (layoutA) (void)hipblasLtMatrixLayoutDestroy(layoutA);
+    if (layoutB) (void)hipblasLtMatrixLayoutDestroy(layoutB);
+    if (layoutC) (void)hipblasLtMatrixLayoutDestroy(layoutC);
+    if (matmulDesc) (void)hipblasLtMatmulDescDestroy(matmulDesc);
+    if (pref) (void)hipblasLtMatmulPreferenceDestroy(pref);
+  };
+
+  // Row-major: rows, cols, ld=cols for contiguous
+  if (hipblasLtMatrixLayoutCreate(&layoutA, HIP_R_16BF, M, K, K) != HIPBLAS_STATUS_SUCCESS) {
+    cleanup();
+    return false;
+  }
+  if (hipblasLtMatrixLayoutCreate(&layoutB, HIP_R_16BF, N, K, K) != HIPBLAS_STATUS_SUCCESS) {
+    cleanup();
+    return false;
+  }
+  if (hipblasLtMatrixLayoutCreate(&layoutC, HIP_R_16BF, M, N, N) != HIPBLAS_STATUS_SUCCESS) {
+    cleanup();
+    return false;
+  }
+  const hipblasLtOrder_t row = HIPBLASLT_ORDER_ROW;
+  (void)hipblasLtMatrixLayoutSetAttribute(layoutA, HIPBLASLT_MATRIX_LAYOUT_ORDER, &row,
+                                          sizeof(row));
+  (void)hipblasLtMatrixLayoutSetAttribute(layoutB, HIPBLASLT_MATRIX_LAYOUT_ORDER, &row,
+                                          sizeof(row));
+  (void)hipblasLtMatrixLayoutSetAttribute(layoutC, HIPBLASLT_MATRIX_LAYOUT_ORDER, &row,
+                                          sizeof(row));
+
+  if (hipblasLtMatmulDescCreate(&matmulDesc, HIPBLAS_COMPUTE_32F, HIP_R_32F) !=
+      HIPBLAS_STATUS_SUCCESS) {
+    cleanup();
+    return false;
+  }
+  const hipblasOperation_t opA = HIPBLAS_OP_N;
+  const hipblasOperation_t opB = HIPBLAS_OP_T;  // B^T
+  (void)hipblasLtMatmulDescSetAttribute(matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSA, &opA,
+                                        sizeof(opA));
+  (void)hipblasLtMatmulDescSetAttribute(matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSB, &opB,
+                                        sizeof(opB));
+
+  if (!cache.ok) {
+    if (hipblasLtMatmulPreferenceCreate(&pref) != HIPBLAS_STATUS_SUCCESS) {
+      cleanup();
+      return false;
+    }
+    const uint64_t max_ws = 64ull << 20;  // 64 MiB
+    (void)hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                                &max_ws, sizeof(max_ws));
+    hipblasLtMatmulHeuristicResult_t heur{};
+    int returned = 0;
+    const hipblasStatus_t hs = hipblasLtMatmulAlgoGetHeuristic(
+        lt.h, matmulDesc, layoutA, layoutB, layoutC, layoutC, pref, 1, &heur, &returned);
+    if (hs != HIPBLAS_STATUS_SUCCESS || returned <= 0 ||
+        heur.state != HIPBLAS_STATUS_SUCCESS) {
+      cleanup();
+      cache.ok = false;
+      // poison: mark failed so we don't retry forever — use empty ok
+      static thread_local int fail_log = 0;
+      if (fail_log++ < 3) {
+        std::fprintf(stderr, "hipBLASLt heuristic fail M=%d N=%d K=%d st=%d ret=%d\n", M, N, K,
+                     static_cast<int>(hs), returned);
+      }
+      // store negative cache
+      LtCache()[key] = LtAlgoCache{};
+      return false;
+    }
+    cache.algo = heur.algo;
+    cache.workspace = heur.workspaceSize;
+    cache.ok = true;
+  }
+
+  void* ws = LtWorkspace(cache.workspace);
+  if (cache.workspace > 0 && !ws) {
+    cleanup();
+    return false;
+  }
+
+  const hipblasStatus_t st = hipblasLtMatmul(
+      lt.h, matmulDesc, &alpha, A, layoutA, B, layoutB, &beta, C, layoutC, C, layoutC,
+      &cache.algo, ws, cache.workspace, stream);
+  cleanup();
+  if (st != HIPBLAS_STATUS_SUCCESS) {
+    cache.ok = false;
+    return false;
+  }
+  return true;
 }
 
 }  // namespace
@@ -274,6 +427,13 @@ void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
     return;
   }
 
+  // hipBLASLt (BF16 contiguous)
+  if (bf16 && out.dtype == DType::kBF16 && a.stride[0] == K &&
+      MatmulBTLt(s, out.data, a.data, b.data, static_cast<int>(M), static_cast<int>(N),
+                 static_cast<int>(K), 1.f, 0.f)) {
+    return;
+  }
+
   auto ctx = GetBlas(q.device.index, s);
   const float alpha = 1.f, beta = 0.f;
   const hipDataType at = ToBlasType(a.dtype);
@@ -311,6 +471,9 @@ void MatmulBTAlphaBetaRocm(Queue& q, void* out, const void* a, const void* b, in
   // Decode path: custom BF16 GEMV often beats hipblasGemmEx at M=1.
   if (M == 1 && dtype == DType::kBF16 && GemvEnabled()) {
     Bf16GemvBT(s, out, a, b, N, K, alpha, beta);
+    return;
+  }
+  if (dtype == DType::kBF16 && MatmulBTLt(s, out, a, b, M, N, K, alpha, beta)) {
     return;
   }
   auto ctx = GetBlas(q.device.index, s);
