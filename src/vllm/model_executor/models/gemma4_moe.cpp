@@ -94,6 +94,7 @@ void ExpertGeGLUFp8Native(Dev d, DBuf& out, const Tensor& x, const void* fp8_gu,
 
 // Top-k experts: all gate_up GEMMs → one GeluAndMul → all down GEMMs (alpha/beta mix).
 // Cuts (top_k-1) Gelu launches vs per-expert ExpertGeGLUDeviceAccum.
+// Uses MatmulBTAlphaBetaRocm directly (no vt::MatmulBT dispatch overhead).
 bool ExpertGeGLUTopKFusedGelu(Dev d, DBuf& ysum, const Tensor& x, const uint16_t* const* gu_ptrs,
                               const uint16_t* const* dn_ptrs, const float* wts, int G, int64_t I,
                               int64_t H) {
@@ -117,14 +118,16 @@ bool ExpertGeGLUTopKFusedGelu(Dev d, DBuf& ysum, const Tensor& x, const uint16_t
   const vt::Device dev = d.q.device;
   const size_t gu_row = static_cast<size_t>(2 * I) * 2;
   const size_t act_row = static_cast<size_t>(I) * 2;
+  const int Ngu = static_cast<int>(2 * I);
+  const int Nh = static_cast<int>(H);
+  const int Ki = static_cast<int>(I);
+  const int Kh = static_cast<int>(H);
 
   // Phase 1: gate_up GEMMs into packed [G, 2I]
   for (int g = 0; g < G; ++g) {
-    Tensor gu_w =
-        Tensor::Contiguous(const_cast<uint16_t*>(gu_ptrs[g]), DType::kBF16, dev, {2 * I, H});
-    Tensor gu_out = Tensor::Contiguous(static_cast<char*>(tls.gu->ptr()) + static_cast<size_t>(g) * gu_row,
-                                       DType::kBF16, dev, {1, 2 * I});
-    vt::MatmulBT(d.q, gu_out, x, gu_w);
+    void* gu_out = static_cast<char*>(tls.gu->ptr()) + static_cast<size_t>(g) * gu_row;
+    vt::rocm::MatmulBTAlphaBetaRocm(d.q, gu_out, x.data, gu_ptrs[g], /*M=*/1, Ngu, Kh, 1.f, 0.f,
+                                    DType::kBF16);
   }
 
   // Phase 2: single GeluAndMul over all experts
@@ -139,9 +142,8 @@ bool ExpertGeGLUTopKFusedGelu(Dev d, DBuf& ysum, const Tensor& x, const uint16_t
     const float alpha = wts[g];
     const float beta = (g == 0) ? 0.f : 1.f;
     void* act_g = static_cast<char*>(tls.act->ptr()) + static_cast<size_t>(g) * act_row;
-    vt::rocm::MatmulBTAlphaBetaRocm(d.q, ysum.ptr(), act_g, dn_ptrs[g], /*M=*/1,
-                                    static_cast<int>(H), static_cast<int>(I), alpha, beta,
-                                    DType::kBF16);
+    vt::rocm::MatmulBTAlphaBetaRocm(d.q, ysum.ptr(), act_g, dn_ptrs[g], /*M=*/1, Nh, Ki, alpha,
+                                    beta, DType::kBF16);
   }
   return true;
 }
