@@ -23,8 +23,14 @@ Hardens dual-GPU FP8 expert residency for ~30 GB hosts, plus a full decode spe
 | Metric | Value |
 |--------|--------|
 | Correctness | Paris/Hello/arith **3/3** stream FP8 |
-| Warm Paris | **~33–34 tok/s** (hipblas default) |
+| Warm Paris (vllm.cpp ROCm FP8 serial) | **~33–34 tok/s** |
+| **Target bar: llama.cpp Vulkan Q8** (llama-bench tg128, 1× R9700) | **~98 tok/s** |
+| Gap | **~3×** slower than Q8 Vulkan |
 | MoE profile (warm) | router **~2%**, experts **~98%** |
+
+### Fused ExpertGeGLU spike (`VT_GEMMA4_FUSED_EXPERTS=1`)
+- Multi-block act + down-mix HIP path
+- **Correct** (Paris) but **~3.3 tok/s** (no MFMA; scalar dots) — default **off**
 
 ```bash
 HIP_VISIBLE_DEVICES=0 ./build-hip/examples/vllm-cli \
