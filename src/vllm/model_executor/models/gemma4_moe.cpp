@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cmath>
 #include <cstdio>
@@ -326,11 +327,29 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
   const vt::RmsNormArgs plain{rms_eps, false};
   const int compute_dev = q.device.index;
 
+  static const bool profile = [] {
+    const char* e = std::getenv("VT_GEMMA4_PROFILE");
+    return e && e[0] == '1';
+  }();
+  using clock = std::chrono::steady_clock;
+  const auto t_all0 = profile ? clock::now() : clock::time_point{};
+
   DBuf rn(d, DType::kBF16, {T, H});
+  // Identity RMS weight (ones) — TLS, upload once (was H2D every layer/token).
   {
-    std::vector<uint16_t> ones(static_cast<size_t>(H), vt::F32ToBF16(1.f));
-    DBuf w1(d, DType::kBF16, {H}, ones.data());
-    vt::RmsNorm(d.q, rn.t(), router_in, w1.t(), plain);
+    struct OnesTls {
+      int dev = -1;
+      int64_t H = 0;
+      std::optional<DBuf> w;
+    };
+    static thread_local OnesTls ot;
+    if (ot.dev != compute_dev || ot.H != H || !ot.w) {
+      std::vector<uint16_t> ones(static_cast<size_t>(H), vt::F32ToBF16(1.f));
+      ot.w.emplace(d, DType::kBF16, std::vector<int64_t>{H}, ones.data());
+      ot.dev = compute_dev;
+      ot.H = H;
+    }
+    vt::RmsNorm(d.q, rn.t(), router_in, ot.w->t(), plain);
   }
 
   const OwnedTensor& rproj =
@@ -354,6 +373,8 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
   d.b.Copy(d.q, hw.data(), rw.ptr(), hw.size() * sizeof(float));
   d.b.Copy(d.q, hi.data(), ri.ptr(), hi.size() * sizeof(int32_t));
   d.b.Synchronize(d.q);
+
+  const auto t_router1 = profile ? clock::now() : clock::time_point{};
 
   std::vector<float> hscale(static_cast<size_t>(E), 1.f);
   if (moe.per_expert_scale.HasHostBytes()) {
@@ -599,6 +620,29 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
   const size_t alloc = acc.alloc_bytes();
   void* p = acc.Release();
   r.storage = std::shared_ptr<void>(p, [alloc](void* q) { Pool().Put(alloc, q); });
+
+  if (profile) {
+    d.b.Synchronize(d.q);
+    const auto t_all1 = clock::now();
+    static std::atomic<uint64_t> ncalls{0};
+    static std::atomic<uint64_t> us_router{0};
+    static std::atomic<uint64_t> us_total{0};
+    const auto ur = std::chrono::duration_cast<std::chrono::microseconds>(t_router1 - t_all0).count();
+    const auto ut = std::chrono::duration_cast<std::chrono::microseconds>(t_all1 - t_all0).count();
+    us_router.fetch_add(static_cast<uint64_t>(ur), std::memory_order_relaxed);
+    us_total.fetch_add(static_cast<uint64_t>(ut), std::memory_order_relaxed);
+    const uint64_t c = ncalls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (c == 1 || c % 64 == 0) {
+      const uint64_t tr = us_router.load(std::memory_order_relaxed);
+      const uint64_t tt = us_total.load(std::memory_order_relaxed);
+      std::fprintf(stderr,
+                   "gemma4 moe profile: calls=%llu router_us/call=%.1f expert+rest_us/call=%.1f "
+                   "total_us/call=%.1f (router%%=%.0f)\n",
+                   static_cast<unsigned long long>(c), static_cast<double>(tr) / c,
+                   static_cast<double>(tt - tr) / c, static_cast<double>(tt) / c,
+                   tt ? 100.0 * static_cast<double>(tr) / static_cast<double>(tt) : 0.0);
+    }
+  }
   return r;
 }
 
