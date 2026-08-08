@@ -1,6 +1,8 @@
 // ROCm upload of Gemma-4 MoE expert stacks (BF16 fused or FP8→BF16 dequant).
+// Packs GPU0 first (compute device), then GPU1 — maximizes same-device fast path.
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -16,6 +18,34 @@ namespace {
 void Check(hipError_t e, const char* w) {
   if (e != hipSuccess)
     throw std::runtime_error(std::string("gemma4 resident: ") + w + ": " + hipGetErrorString(e));
+}
+
+bool TryUploadLayer(Gemma4FusedExperts& ex, int dev, const void* gu_src, const void* dn_src,
+                    size_t gu_bytes, size_t dn_bytes) {
+  Check(hipSetDevice(dev), "hipSetDevice");
+  size_t free_b = 0, tot_b = 0;
+  if (hipMemGetInfo(&free_b, &tot_b) == hipSuccess) {
+    // Keep ~3 GiB headroom for activations/KV/dense on compute GPU.
+    const size_t headroom = (dev == 0) ? (3ull << 30) : (1ull << 30);
+    if (free_b < gu_bytes + dn_bytes + headroom) return false;
+  }
+  void* gu = nullptr;
+  void* dn = nullptr;
+  if (hipMalloc(&gu, gu_bytes) != hipSuccess) return false;
+  if (hipMalloc(&dn, dn_bytes) != hipSuccess) {
+    (void)hipFree(gu);
+    return false;
+  }
+  if (hipMemcpy(gu, gu_src, gu_bytes, hipMemcpyHostToDevice) != hipSuccess ||
+      hipMemcpy(dn, dn_src, dn_bytes, hipMemcpyHostToDevice) != hipSuccess) {
+    (void)hipFree(gu);
+    (void)hipFree(dn);
+    return false;
+  }
+  ex.gate_up_dev = gu;
+  ex.down_dev = dn;
+  ex.dev_id = dev;
+  return true;
 }
 
 }  // namespace
@@ -34,6 +64,9 @@ size_t UploadGemma4ExpertsResident(std::vector<Gemma4MoeLayerWeights>& layers,
   if (const char* ml = std::getenv("VT_GEMMA4_RESIDENT_MAX_LAYERS"))
     max_layers = std::max(0, std::atoi(ml));
 
+  // Prefer packing compute GPU (0) first so RunGemma4Moe hits same_dev path.
+  int fill_dev = 0;
+
   for (size_t li = 0; li < layers.size(); ++li) {
     if (ok_layers >= max_layers) break;
     auto& moe = layers[li];
@@ -45,7 +78,6 @@ size_t UploadGemma4ExpertsResident(std::vector<Gemma4MoeLayerWeights>& layers,
     const size_t gu_bytes = static_cast<size_t>(E * 2 * I * H) * 2;
     const size_t dn_bytes = static_cast<size_t>(E * H * I) * 2;
 
-    // Materialize BF16 fused host buffer if FP8
     std::vector<uint16_t> gu_host;
     std::vector<uint16_t> dn_host;
     const void* gu_src = nullptr;
@@ -67,31 +99,28 @@ size_t UploadGemma4ExpertsResident(std::vector<Gemma4MoeLayerWeights>& layers,
                "gemma4 resident: bf16 fused size");
     }
 
-    const int dev = static_cast<int>(li % static_cast<size_t>(num_gpus));
-    Check(hipSetDevice(dev), "hipSetDevice");
-    void* gu = nullptr;
-    void* dn = nullptr;
-    hipError_t e1 = hipMalloc(&gu, gu_bytes);
-    hipError_t e2 = (e1 == hipSuccess) ? hipMalloc(&dn, dn_bytes) : hipErrorMemoryAllocation;
-    if (e1 != hipSuccess || e2 != hipSuccess) {
-      if (gu) (void)hipFree(gu);
-      if (dn) (void)hipFree(dn);
-      std::fprintf(stderr,
-                   "gemma4 moe: resident upload stopped at layer %zu on gpu %d (%s)\n", li,
-                   dev, hipGetErrorString(e1 != hipSuccess ? e1 : e2));
+    bool ok = TryUploadLayer(ex, fill_dev, gu_src, dn_src, gu_bytes, dn_bytes);
+    if (!ok && fill_dev + 1 < num_gpus) {
+      // GPU full — spill remaining layers to next GPU
+      ++fill_dev;
+      std::fprintf(stderr, "gemma4 moe: GPU%d full after %d layers; continuing on GPU%d\n",
+                   fill_dev - 1, ok_layers, fill_dev);
+      ok = TryUploadLayer(ex, fill_dev, gu_src, dn_src, gu_bytes, dn_bytes);
+    }
+    if (!ok) {
+      std::fprintf(stderr, "gemma4 moe: resident upload stopped at layer %zu (OOM)\n", li);
       break;
     }
-    Check(hipMemcpy(gu, gu_src, gu_bytes, hipMemcpyHostToDevice), "H2D gu");
-    Check(hipMemcpy(dn, dn_src, dn_bytes, hipMemcpyHostToDevice), "H2D dn");
-    ex.gate_up_dev = gu;
-    ex.down_dev = dn;
-    ex.dev_id = dev;
     total += gu_bytes + dn_bytes;
     ++ok_layers;
+    std::fprintf(stderr, "gemma4 moe: resident layer %zu -> gpu %d (%.2f GiB cumulative)\n", li,
+                 ex.dev_id, total / (1024.0 * 1024.0 * 1024.0));
+    std::fflush(stderr);
   }
   Check(hipSetDevice(0), "hipSetDevice0");
-  std::fprintf(stderr, "gemma4 moe: resident experts gpus=%d layers=%d %.2f GiB\n", num_gpus,
+  std::fprintf(stderr, "gemma4 moe: RESIDENT DONE gpus=%d layers=%d %.2f GiB\n", num_gpus,
                ok_layers, total / (1024.0 * 1024.0 * 1024.0));
+  std::fflush(stderr);
   return total;
 }
 
