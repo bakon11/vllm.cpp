@@ -92,9 +92,63 @@ void ExpertGeGLUFp8Native(Dev d, DBuf& out, const Tensor& x, const void* fp8_gu,
   }
 }
 
+// Top-k experts: all gate_up GEMMs → one GeluAndMul → all down GEMMs (alpha/beta mix).
+// Cuts (top_k-1) Gelu launches vs per-expert ExpertGeGLUDeviceAccum.
+bool ExpertGeGLUTopKFusedGelu(Dev d, DBuf& ysum, const Tensor& x, const uint16_t* const* gu_ptrs,
+                              const uint16_t* const* dn_ptrs, const float* wts, int G, int64_t I,
+                              int64_t H) {
+  if (G <= 0 || x.shape[0] != 1) return false;
+  struct Tls {
+    int dev = -1;
+    int Gcap = 0;
+    int64_t I = 0, H = 0;
+    std::optional<DBuf> gu;   // [G, 2I]
+    std::optional<DBuf> act;  // [G, I]
+  };
+  static thread_local Tls tls;
+  if (tls.dev != d.q.device.index || tls.Gcap < G || tls.I != I || tls.H != H) {
+    tls.gu.emplace(d, DType::kBF16, std::vector<int64_t>{G, 2 * I});
+    tls.act.emplace(d, DType::kBF16, std::vector<int64_t>{G, I});
+    tls.dev = d.q.device.index;
+    tls.Gcap = G;
+    tls.I = I;
+    tls.H = H;
+  }
+  const vt::Device dev = d.q.device;
+  const size_t gu_row = static_cast<size_t>(2 * I) * 2;
+  const size_t act_row = static_cast<size_t>(I) * 2;
+
+  // Phase 1: gate_up GEMMs into packed [G, 2I]
+  for (int g = 0; g < G; ++g) {
+    Tensor gu_w =
+        Tensor::Contiguous(const_cast<uint16_t*>(gu_ptrs[g]), DType::kBF16, dev, {2 * I, H});
+    Tensor gu_out = Tensor::Contiguous(static_cast<char*>(tls.gu->ptr()) + static_cast<size_t>(g) * gu_row,
+                                       DType::kBF16, dev, {1, 2 * I});
+    vt::MatmulBT(d.q, gu_out, x, gu_w);
+  }
+
+  // Phase 2: single GeluAndMul over all experts
+  Tensor gu_all = Tensor::Contiguous(static_cast<uint16_t*>(tls.gu->ptr()), DType::kBF16, dev,
+                                     {G, 2 * I});
+  Tensor act_all = Tensor::Contiguous(static_cast<uint16_t*>(tls.act->ptr()), DType::kBF16, dev,
+                                      {G, I});
+  vt::GeluAndMul(d.q, act_all, gu_all);
+
+  // Phase 3: down GEMMs with alpha/beta accumulate into ysum
+  for (int g = 0; g < G; ++g) {
+    const float alpha = wts[g];
+    const float beta = (g == 0) ? 0.f : 1.f;
+    void* act_g = static_cast<char*>(tls.act->ptr()) + static_cast<size_t>(g) * act_row;
+    vt::rocm::MatmulBTAlphaBetaRocm(d.q, ysum.ptr(), act_g, dn_ptrs[g], /*M=*/1,
+                                    static_cast<int>(H), static_cast<int>(I), alpha, beta,
+                                    DType::kBF16);
+  }
+  return true;
+}
+
 // Batched top-k path (gather+strided or pointer-batch): currently disabled.
 // Lab: gather+strided produced wrong tokens (~23 t/s); pointer-batch ~0.8 t/s.
-// Serial ExpertGeGLUDeviceAccum remains the correct/fast path (~34 t/s).
+// Serial / fused-gelu top-k remains the correct path (~34 t/s).
 bool ExpertGeGLUDeviceBatched(Dev /*d*/, DBuf& /*ysum*/, const Tensor& /*x*/,
                               const std::vector<const uint16_t*>& /*gu_ptrs*/,
                               const std::vector<const uint16_t*>& /*dn_ptrs*/,
@@ -598,6 +652,44 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
             static_cast<char*>(acc.ptr()) + static_cast<size_t>(t) * static_cast<size_t>(H) * 2,
             ysum.ptr(), static_cast<size_t>(H) * 2);
         continue;  // next token
+      }
+    }
+
+    // Fused-Gelu top-k: gate_up×G → one GeluAndMul → down×G (default BF16 device path).
+    if (!host_axpy && T == 1 && !fp8_native) {
+      std::vector<const uint16_t*> gu_p, dn_p;
+      gu_p.reserve(static_cast<size_t>(top_k));
+      dn_p.reserve(static_cast<size_t>(top_k));
+      bool ok = true;
+      for (int i = 0; i < top_k && ok; ++i) {
+        const int e = idx[static_cast<size_t>(i)];
+        if (same_dev) {
+          gu_p.push_back(static_cast<const uint16_t*>(ex.gate_up_dev) +
+                         static_cast<int64_t>(e) * gu_stride);
+          dn_p.push_back(static_cast<const uint16_t*>(ex.down_dev) +
+                         static_cast<int64_t>(e) * dn_stride);
+        } else if (ex.is_fp8) {
+          const auto& fex = ex.fp8[static_cast<size_t>(e)];
+          if (!fex.dev_gu || !fex.dev_dn) {
+            if (!EnsureGemma4Fp8ExpertOnDevice(d, fex, I, H)) {
+              ok = false;
+              break;
+            }
+          }
+          gu_p.push_back(static_cast<const uint16_t*>(fex.dev_gu));
+          dn_p.push_back(static_cast<const uint16_t*>(fex.dev_dn));
+        } else {
+          ok = false;
+        }
+      }
+      if (ok && static_cast<int>(gu_p.size()) == top_k &&
+          ExpertGeGLUTopKFusedGelu(d, ysum, xin.t(), gu_p.data(), dn_p.data(), wts.data(), top_k,
+                                   I, H)) {
+        d.b.Copy(
+            d.q,
+            static_cast<char*>(acc.ptr()) + static_cast<size_t>(t) * static_cast<size_t>(H) * 2,
+            ysum.ptr(), static_cast<size_t>(H) * 2);
+        continue;
       }
     }
 
