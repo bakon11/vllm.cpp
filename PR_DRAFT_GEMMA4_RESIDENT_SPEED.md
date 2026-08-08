@@ -32,6 +32,23 @@ Hardens dual-GPU FP8 expert residency for ~30 GB hosts, plus a full decode spe
 - Multi-block act + down-mix HIP path
 - **Correct** (Paris) but **~3.3 tok/s** (no MFMA; scalar dots) — default **off**
 
+### Layer profile (`VT_GEMMA4_PROFILE=1`, warm decode)
+Per layer-call (avg after warmup): **attn ~4% · dense MLP ~1% · MoE ~95%**
+
+### Expert GEMM microbench (gfx1201, M=1)
+| Shape | GemmEx BF16 | hipBLASLt FP8 |
+|-------|-------------|---------------|
+| gate_up N=1408 K=2816 | **~30 µs** | heuristic **FAIL** (unsupported) |
+| down N=2816 K=704 | **~17 µs** | heuristic **FAIL** |
+
+⇒ ~8×(30+17)×30 layers ≈ **11 ms** pure GEMM/token theoretical; wall ~30 ms → rest is launches/Gelu/router/etc. inside MoE.
+
+### Upstream (mudler/vllm.cpp, checked 2026-08-08)
+- **#154** (ours) OPEN, mergeable
+- **#140** merged (our base ROCm/Gemma4)
+- Decode-graph / async (#36/#39) is **CUDA/Qwen** — ROCm `SupportsGraphCapture=false` (hipGraph not wired)
+- No other open PRs targeting Gemma4 MoE ROCm speed
+
 ```bash
 HIP_VISIBLE_DEVICES=0 ./build-hip/examples/vllm-cli \
   --model .../gemma-4-26B-A4B-it-fp8 \

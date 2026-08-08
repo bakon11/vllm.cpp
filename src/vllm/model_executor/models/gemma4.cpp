@@ -31,8 +31,11 @@
 // residual, not a correctness gap).
 #include "vllm/model_executor/models/gemma4.h"
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -570,6 +573,13 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     Tensor w_in = ResidentWeight(d, w.input_layernorm, {H});
     vt::RmsNorm(d.q, dhn.t(), hidden.t(), w_in, plain);
 
+    static const bool layer_prof = [] {
+      const char* e = std::getenv("VT_GEMMA4_PROFILE");
+      return e && e[0] == '1';
+    }();
+    using clock = std::chrono::steady_clock;
+    const auto t0 = layer_prof ? clock::now() : clock::time_point{};
+
     DBuf attn = Gemma4AttnBlock(d, w, g, dhn.t(), si, attn_meta, kv, T, Dh, full,
                                 ones_dh, full ? &prop_cache.t() : nullptr, window,
                                 g.rope_theta_sliding);
@@ -578,9 +588,15 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     // h1 = rmsnorm(attn) + hidden  (one kernel)
     vt::rocm::RmsNormPlusAddRocm(d.q, h1.t(), attn.t(), w_pa, hidden.t(), plain);
 
+    if (layer_prof) d.b.Synchronize(d.q);
+    const auto t1 = layer_prof ? clock::now() : clock::time_point{};
+
     Tensor w_pf = ResidentWeight(d, w.pre_feedforward_layernorm, {H});
     vt::RmsNorm(d.q, dh2.t(), h1.t(), w_pf, plain);
     DBuf mlp = Gemma4MlpBlock(d, w.mlp, H, I, dh2.t(), T);
+
+    if (layer_prof) d.b.Synchronize(d.q);
+    const auto t2 = layer_prof ? clock::now() : clock::time_point{};
 
     if (w.moe.enabled) {
       Tensor w_pf2 = ResidentWeight(d, w.moe.pre_feedforward_layernorm_2, {H});
@@ -596,6 +612,31 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     } else {
       Tensor w_pff = ResidentWeight(d, w.post_feedforward_layernorm, {H});
       vt::rocm::RmsNormPlusAddRocm(d.q, h2.t(), mlp.t(), w_pff, h1.t(), plain);
+    }
+
+    if (layer_prof) {
+      d.b.Synchronize(d.q);
+      const auto t3 = clock::now();
+      static std::atomic<uint64_t> n{0}, us_attn{0}, us_mlp{0}, us_moe{0};
+      auto us = [](auto a, auto b) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+      };
+      us_attn.fetch_add(static_cast<uint64_t>(us(t0, t1)), std::memory_order_relaxed);
+      us_mlp.fetch_add(static_cast<uint64_t>(us(t1, t2)), std::memory_order_relaxed);
+      us_moe.fetch_add(static_cast<uint64_t>(us(t2, t3)), std::memory_order_relaxed);
+      const uint64_t c = n.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (c == 32 || c % 128 == 0) {
+        std::fprintf(stderr,
+                     "gemma4 layer profile: calls=%llu attn_us=%.1f mlp_us=%.1f moe_us=%.1f "
+                     "(attn%%=%.0f mlp%%=%.0f moe%%=%.0f)\n",
+                     static_cast<unsigned long long>(c),
+                     static_cast<double>(us_attn.load()) / c,
+                     static_cast<double>(us_mlp.load()) / c,
+                     static_cast<double>(us_moe.load()) / c,
+                     100.0 * us_attn.load() / (us_attn.load() + us_mlp.load() + us_moe.load() + 1),
+                     100.0 * us_mlp.load() / (us_attn.load() + us_mlp.load() + us_moe.load() + 1),
+                     100.0 * us_moe.load() / (us_attn.load() + us_mlp.load() + us_moe.load() + 1));
+      }
     }
 
     if (ple > 0) {
