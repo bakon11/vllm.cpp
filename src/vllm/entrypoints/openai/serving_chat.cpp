@@ -2,6 +2,7 @@
 // See serving_chat.h for scope, the chat-prompt seam and deferrals.
 #include "vllm/entrypoints/openai/serving_chat.h"
 
+#include <chrono>
 #include <ctime>
 #include <cstdlib>
 #include <iostream>
@@ -25,6 +26,25 @@ namespace {
 // get_chat_request_role (chat_completion/serving.py:399): the response role is
 // self.response_role ("assistant") when add_generation_prompt (the T0 default).
 constexpr const char* kAssistantRole = "assistant";
+
+bool ServerVerbose() {
+  static const bool v = [] {
+    const char* e = std::getenv("VT_SERVER_VERBOSE");
+    return e && e[0] == '1';
+  }();
+  return v;
+}
+
+void ChatDbg(const std::string& id, const std::string& msg) {
+  if (!ServerVerbose()) return;
+  using clock = std::chrono::steady_clock;
+  static const auto t0 = clock::now();
+  const auto ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0)
+          .count();
+  std::cerr << "chat-dbg t+" << ms << "ms id=" << id << " " << msg << "\n";
+  std::cerr.flush();
+}
 
 // Whether tool_choice selects a single named function (finish_reason stays the
 // model's own — "stop" — for named calls; chat_completion/serving.py:688,935).
@@ -419,6 +439,18 @@ class ChatSseStream final : public SseStream {
       previous_num_tokens_ += static_cast<int>(output.token_ids.size());
       const std::string current_text = previous_text_ + delta_text;
       const bool finished = output.finish_reason.has_value() || response.finished;
+      if (ServerVerbose()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (previous_num_tokens_ <= 1 || finished ||
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_dbg_)
+                    .count() >= 1000) {
+          ChatDbg(response_id_,
+                  "stage=async_sse prompt_tok=" + std::to_string(prompt_tokens_) +
+                      " gen_tok=" + std::to_string(previous_num_tokens_) +
+                      " finished=" + std::string(finished ? "1" : "0"));
+          last_dbg_ = now;
+        }
+      }
       std::optional<DeltaMessage> delta =
           engine_parser_ != nullptr
               ? ShapeChatDeltaEngine(
@@ -496,12 +528,13 @@ class ChatSseStream final : public SseStream {
   bool role_pending_ = true;
   bool usage_pending_ = false;
   bool done_pending_ = false;
-  bool engine_finished_ = false;
   bool complete_ = false;
+  bool engine_finished_ = false;
   bool aborted_ = false;
   bool tools_streamed_ = false;
   int previous_num_tokens_ = 0;
   std::string previous_text_;
+  std::chrono::steady_clock::time_point last_dbg_{std::chrono::steady_clock::now()};
 };
 
 }  // namespace
@@ -581,10 +614,7 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
       prompt_fn_(request.messages, /*add_generation_prompt=*/true, tools);
 
   // Verbose request logging (VT_SERVER_VERBOSE=1 or --verbose).
-  static const bool verbose = [] {
-    const char* e = std::getenv("VT_SERVER_VERBOSE");
-    return e && e[0] == '1';
-  }();
+  const bool verbose = ServerVerbose();
   if (verbose) {
     std::cerr << "chat: id=" << request_id << " model=" << model_name
               << " msgs=" << request.messages.size()
@@ -628,6 +658,8 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
     std::cerr << "\"\n";
     std::cerr.flush();
   }
+  ChatDbg(request_id, "stage=templated prompt_chars=" + std::to_string(prompt.size()) +
+                           " stream=" + std::string(request.stream ? "1" : "0"));
 
   // ── Multimodal (MM-SERVE-ENGINE) ─────────────────────────────────────────
   // When the mm seam is set AND a message carries a mm content part, decode +
@@ -743,10 +775,13 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   const std::string engine_request_id = request_id;
 
   if (request.stream) {
+    ChatDbg(request_id, "stage=stream_begin engine=" +
+                            std::string(async_engine_ != nullptr ? "async" : "sync"));
     if (async_engine_ != nullptr) {
       v1::AsyncRequest async_request = async_engine_->add_request(
           engine_request_id, prompt, std::move(sampling_params),
           request.priority);
+      ChatDbg(request_id, "stage=async_queued");
       ChatCompletionResult result;
       result.streaming = true;
       try {
@@ -776,12 +811,28 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
     if (sync_engine_ == nullptr) {
       throw std::runtime_error("chat handler has no engine");
     }
+    ChatDbg(request_id, "stage=sync_add_request (prefill may take a while on long prompts)");
     sync_engine_->add_request(engine_request_id, prompt,
                               std::move(sampling_params), request.priority);
+    ChatDbg(request_id, "stage=sync_step_loop");
+    int step_i = 0;
+    auto last_prog = std::chrono::steady_clock::now();
     while (sync_engine_->has_unfinished_requests()) {
       for (const RequestOutput& res : sync_engine_->step()) {
         if (res.request_id != engine_request_id) continue;
         num_prompt_tokens = static_cast<int>(res.prompt_token_ids.size());
+        ++step_i;
+        const auto now = std::chrono::steady_clock::now();
+        if (step_i == 1 || previous_num_tokens == 0 ||
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_prog)
+                    .count() >= 1000) {
+          ChatDbg(request_id,
+                  "stage=sync_step n=" + std::to_string(step_i) +
+                      " prompt_tok=" + std::to_string(num_prompt_tokens) +
+                      " gen_tok=" + std::to_string(previous_num_tokens) +
+                      " finished=" + std::string(res.finished ? "1" : "0"));
+          last_prog = now;
+        }
         if (!role_emitted) {
           role_emitted = true;
           ChatCompletionResponseStreamChoice role_choice;
@@ -880,6 +931,9 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
           "data: " + nlohmann::json(usage_chunk).dump() + "\n\n");
     }
     result.sse_chunks.push_back("data: [DONE]\n\n");
+    ChatDbg(request_id, "stage=stream_done prompt_tok=" +
+                            std::to_string(num_prompt_tokens) +
+                            " gen_tok=" + std::to_string(previous_num_tokens));
     return result;
   }
 
@@ -887,6 +941,7 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   // With mm inputs, drive the engine mm overload (placeholder-expanded prompt +
   // mm_features); otherwise the text-only string overload byte-identically. The
   // mm forward on the GPU worker consumes the mm_features (MM-SERVE-E2E).
+  ChatDbg(request_id, "stage=generate_blocking begin (prefill+decode; long prompts stall here)");
   const RequestOutput final_res =
       mm_inputs.has_value()
           ? (async_engine_ != nullptr
@@ -896,11 +951,15 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
                  : sync_engine_->generate(std::move(*mm_inputs),
                                           std::move(sampling_params),
                                           engine_request_id, request.priority))
-      : (async_engine_ != nullptr
-             ? async_engine_->generate(prompt, std::move(sampling_params),
-                                       engine_request_id, request.priority)
-             : sync_engine_->generate(prompt, std::move(sampling_params),
-                                      engine_request_id, request.priority));
+          : (async_engine_ != nullptr
+                 ? async_engine_->generate(prompt, std::move(sampling_params),
+                                           engine_request_id, request.priority)
+                 : sync_engine_->generate(prompt, std::move(sampling_params),
+                                          engine_request_id, request.priority));
+  ChatDbg(request_id, "stage=generate_blocking done outputs=" +
+                          std::to_string(final_res.outputs.size()) +
+                          " prompt_tok=" +
+                          std::to_string(final_res.prompt_token_ids.size()));
 
   ChatCompletionResponse response;
   response.id = request_id;

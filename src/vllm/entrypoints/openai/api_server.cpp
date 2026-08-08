@@ -4,6 +4,7 @@
 #include "vllm/entrypoints/openai/api_server.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <ctime>
 #include <exception>
 #include <fstream>
@@ -208,6 +209,14 @@ ApiServer::DispatchResult ApiServer::handle_chat_completions(
     return MakeError(500, "InternalServerError",
                      "The model does not support Chat Completions API "
                      "(transcription-only server)");
+  }
+  {
+    const char* e = std::getenv("VT_SERVER_VERBOSE");
+    if (e && e[0] == '1') {
+      std::cerr << "api: POST /v1/chat/completions body_bytes=" << request_body.size()
+                << "\n";
+      std::cerr.flush();
+    }
   }
   // chat_completion/api_router.py:53 (create_chat_completion).
   nlohmann::json body;
