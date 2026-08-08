@@ -32,33 +32,26 @@ using vt::Tensor;
 
 // Scratch reused across top-k experts within a token (and host H2D weight slots).
 struct ExpertScratch {
-  DBuf gate;
-  DBuf up;
-  DBuf act;
-  DBuf gate_w;  // host-path weight upload targets
-  DBuf up_w;
+  DBuf gu;    // [T, 2I] fused gate|up activations
+  DBuf act;   // [T, I]
+  DBuf gu_w;  // host-path [2I, H] weight upload
   DBuf down_w;
   ExpertScratch(Dev d, int64_t T, int64_t I, int64_t H)
-      : gate(d, DType::kBF16, {T, I}),
-        up(d, DType::kBF16, {T, I}),
+      : gu(d, DType::kBF16, {T, 2 * I}),
         act(d, DType::kBF16, {T, I}),
-        gate_w(d, DType::kBF16, {I, H}),
-        up_w(d, DType::kBF16, {I, H}),
+        gu_w(d, DType::kBF16, {2 * I, H}),
         down_w(d, DType::kBF16, {H, I}) {}
 };
 
 void ExpertGeGLUHost(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_up_e,
                      const uint16_t* down_e, int64_t I, int64_t H, ExpertScratch& s) {
-  const int64_t T = x.shape[0];
-  const size_t half = static_cast<size_t>(I * H) * sizeof(uint16_t);
+  const size_t gu_b = static_cast<size_t>(2 * I * H) * sizeof(uint16_t);
   const size_t dn_b = static_cast<size_t>(H * I) * sizeof(uint16_t);
-  d.b.Copy(d.q, s.gate_w.ptr(), gate_up_e, half);
-  d.b.Copy(d.q, s.up_w.ptr(), gate_up_e + I * H, half);
+  d.b.Copy(d.q, s.gu_w.ptr(), gate_up_e, gu_b);
   d.b.Copy(d.q, s.down_w.ptr(), down_e, dn_b);
-  vt::MatmulBT(d.q, s.gate.t(), x, s.gate_w.t());
-  vt::MatmulBT(d.q, s.up.t(), x, s.up_w.t());
-  vt::rocm::GeluMulSeparateRocm(d.q, s.act.ptr(), s.gate.ptr(), s.up.ptr(), T * I,
-                                DType::kBF16);
+  // One GEMM: x @ W_gu^T -> [T, 2I], then GeluAndMul (interleaved gate|up).
+  vt::MatmulBT(d.q, s.gu.t(), x, s.gu_w.t());
+  vt::GeluAndMul(d.q, s.act.t(), s.gu.t());
   vt::MatmulBT(d.q, out.t(), s.act.t(), s.down_w.t());
 }
 
@@ -67,14 +60,11 @@ void ExpertGeGLUDeviceAccum(Dev d, DBuf& out, const Tensor& x, const uint16_t* g
                             float alpha, float beta) {
   const int64_t T = x.shape[0];
   const vt::Device dev = d.q.device;
-  Tensor gate_w =
-      Tensor::Contiguous(const_cast<uint16_t*>(gate_up_e), DType::kBF16, dev, {I, H});
-  Tensor up_w = Tensor::Contiguous(const_cast<uint16_t*>(gate_up_e + I * H), DType::kBF16,
-                                   dev, {I, H});
-  vt::MatmulBT(d.q, s.gate.t(), x, gate_w);
-  vt::MatmulBT(d.q, s.up.t(), x, up_w);
-  vt::rocm::GeluMulSeparateRocm(d.q, s.act.ptr(), s.gate.ptr(), s.up.ptr(), T * I,
-                                DType::kBF16);
+  // gate_up_e is contiguous [2I, H] — one BT GEMM instead of two.
+  Tensor gu_w =
+      Tensor::Contiguous(const_cast<uint16_t*>(gate_up_e), DType::kBF16, dev, {2 * I, H});
+  vt::MatmulBT(d.q, s.gu.t(), x, gu_w);
+  vt::GeluAndMul(d.q, s.act.t(), s.gu.t());
   vt::rocm::MatmulBTAlphaBetaRocm(d.q, out.ptr(), s.act.ptr(), down_e, static_cast<int>(T),
                                   static_cast<int>(H), static_cast<int>(I), alpha, beta,
                                   DType::kBF16);
