@@ -16,6 +16,7 @@
 
 #include "vllm/entrypoints/beam_search.h"
 #include "vllm/entrypoints/openai/chat_mm.h"  // HasMultiModalParts (mm seam gate)
+#include "vllm/entrypoints/openai/request_logger.h"
 #include "vllm/entrypoints/openai/serving_utils.h"
 #include "vllm/entrypoints/openai/tool_parsers/structural_tags.h"
 #include "vllm/tokenizer/tokenizer.h"
@@ -27,23 +28,8 @@ namespace {
 // self.response_role ("assistant") when add_generation_prompt (the T0 default).
 constexpr const char* kAssistantRole = "assistant";
 
-bool ServerVerbose() {
-  static const bool v = [] {
-    const char* e = std::getenv("VT_SERVER_VERBOSE");
-    return e && e[0] == '1';
-  }();
-  return v;
-}
-
 void ChatDbg(const std::string& id, const std::string& msg) {
-  if (!ServerVerbose()) return;
-  using clock = std::chrono::steady_clock;
-  static const auto t0 = clock::now();
-  const auto ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0)
-          .count();
-  std::cerr << "chat-dbg t+" << ms << "ms id=" << id << " " << msg << "\n";
-  std::cerr.flush();
+  LogRequestStage(id, msg);
 }
 
 // Whether tool_choice selects a single named function (finish_reason stays the
@@ -439,7 +425,7 @@ class ChatSseStream final : public SseStream {
       previous_num_tokens_ += static_cast<int>(output.token_ids.size());
       const std::string current_text = previous_text_ + delta_text;
       const bool finished = output.finish_reason.has_value() || response.finished;
-      if (ServerVerbose()) {
+      if (GetRequestLogConfig().debug_stages) {
         const auto now = std::chrono::steady_clock::now();
         if (previous_num_tokens_ <= 1 || finished ||
             std::chrono::duration_cast<std::chrono::milliseconds>(now - last_dbg_)
@@ -613,53 +599,26 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   const std::string prompt =
       prompt_fn_(request.messages, /*add_generation_prompt=*/true, tools);
 
-  // Verbose request logging (VT_SERVER_VERBOSE=1 or --verbose).
-  const bool verbose = ServerVerbose();
-  if (verbose) {
-    std::cerr << "chat: id=" << request_id << " model=" << model_name
-              << " msgs=" << request.messages.size()
-              << " stream=" << (request.stream ? "1" : "0")
-              << " max_tokens="
-              << (request.max_completion_tokens.has_value()
-                      ? *request.max_completion_tokens
-                      : request.max_tokens.value_or(-1))
-              << " temp="
-              << (request.temperature.has_value() ? *request.temperature : -1.0)
-              << " tools=" << tools.size() << " prompt_chars=" << prompt.size()
-              << "\n";
-    // Role summary
-    std::cerr << "chat: roles=";
-    for (size_t i = 0; i < request.messages.size(); ++i) {
-      if (i) std::cerr << ",";
-      std::cerr << request.messages[i].role;
-      size_t clen = 0;
-      if (request.messages[i].content.has_value())
-        clen = request.messages[i].content->size();
-      std::cerr << "(" << clen << ")";
-    }
-    std::cerr << "\n";
-    // Prompt preview (escape newlines)
-    const size_t prev_n = std::min<size_t>(prompt.size(), 600);
-    std::cerr << "chat: prompt_preview=\"";
-    for (size_t i = 0; i < prev_n; ++i) {
-      const char c = prompt[i];
-      if (c == '\n')
-        std::cerr << "\\n";
-      else if (c == '\r')
-        std::cerr << "\\r";
-      else if (c == '"')
-        std::cerr << "\\\"";
-      else if (static_cast<unsigned char>(c) < 32)
-        std::cerr << '?';
-      else
-        std::cerr << c;
-    }
-    if (prompt.size() > prev_n) std::cerr << "...";
-    std::cerr << "\"\n";
-    std::cerr.flush();
+  const int max_tok_log =
+      request.max_completion_tokens.has_value()
+          ? *request.max_completion_tokens
+          : request.max_tokens.value_or(-1);
+  std::string roles_summary;
+  for (size_t i = 0; i < request.messages.size(); ++i) {
+    if (i) roles_summary += ",";
+    roles_summary += request.messages[i].role;
+    size_t clen = request.messages[i].content.has_value()
+                      ? request.messages[i].content->size()
+                      : 0;
+    roles_summary += "(" + std::to_string(clen) + ")";
   }
+  LogRequestReceived(request_id, "/v1/chat/completions", model_name, request.stream,
+                     max_tok_log, static_cast<int>(request.messages.size()),
+                     static_cast<int>(tools.size()), prompt.size(), prompt,
+                     roles_summary);
   ChatDbg(request_id, "stage=templated prompt_chars=" + std::to_string(prompt.size()) +
                            " stream=" + std::string(request.stream ? "1" : "0"));
+  const auto req_t0 = std::chrono::steady_clock::now();
 
   // ── Multimodal (MM-SERVE-ENGINE) ─────────────────────────────────────────
   // When the mm seam is set AND a message carries a mm content part, decode +
@@ -934,6 +893,13 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
     ChatDbg(request_id, "stage=stream_done prompt_tok=" +
                             std::to_string(num_prompt_tokens) +
                             " gen_tok=" + std::to_string(previous_num_tokens));
+    {
+      const double elapsed =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - req_t0)
+              .count();
+      LogRequestFinished(request_id, num_prompt_tokens, previous_num_tokens, "stream",
+                         elapsed, previous_text);
+    }
     return result;
   }
 
@@ -1010,21 +976,19 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   response.usage.completion_tokens = num_generated_tokens;
   response.usage.total_tokens = num_prompt_tokens + num_generated_tokens;
 
-  if (verbose) {
+  {
     std::string finish = response.choices.empty()
                              ? "?"
                              : response.choices[0].finish_reason.value_or("?");
-    std::string out_preview;
+    std::string out_text;
     if (!response.choices.empty() && response.choices[0].message.content.has_value()) {
-      out_preview = *response.choices[0].message.content;
-      if (out_preview.size() > 300) out_preview.resize(300);
-      for (char& c : out_preview)
-        if (c == '\n') c = ' ';
+      out_text = *response.choices[0].message.content;
     }
-    std::cerr << "chat: done id=" << request_id << " prompt_tok=" << num_prompt_tokens
-              << " completion_tok=" << num_generated_tokens << " finish=" << finish
-              << " out_preview=\"" << out_preview << "\"\n";
-    std::cerr.flush();
+    const double elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - req_t0)
+            .count();
+    LogRequestFinished(request_id, num_prompt_tokens, num_generated_tokens, finish,
+                       elapsed, out_text);
   }
 
   ChatCompletionResult result;
