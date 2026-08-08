@@ -71,6 +71,27 @@ void ExpertGeGLUDeviceAccum(Dev d, DBuf& out, const Tensor& x, const uint16_t* g
                                   DType::kBF16);
 }
 
+void ExpertGeGLUFp8Native(Dev d, DBuf& out, const Tensor& x, const void* fp8_gu,
+                          const void* s_gu, const void* fp8_dn, const void* s_dn, int64_t I,
+                          int64_t H, ExpertScratch& s, float alpha, float beta) {
+  VT_CHECK(x.shape[0] == 1, "fp8 native: T==1 only");
+  vt::rocm::MatmulBTFp8ChannelRocm(d.q, s.gu.ptr(), x.data, fp8_gu, s_gu, /*M=*/1,
+                                   static_cast<int>(2 * I), static_cast<int>(H), 1.f, 0.f);
+  vt::GeluAndMul(d.q, s.act.t(), s.gu.t());
+  if (beta == 0.f) {
+    vt::rocm::MatmulBTFp8ChannelRocm(d.q, out.ptr(), s.act.ptr(), fp8_dn, s_dn, /*M=*/1,
+                                     static_cast<int>(H), static_cast<int>(I), alpha, 0.f);
+  } else {
+    DBuf ytmp(d, DType::kBF16, {1, H});
+    vt::rocm::MatmulBTFp8ChannelRocm(d.q, ytmp.ptr(), s.act.ptr(), fp8_dn, s_dn, /*M=*/1,
+                                     static_cast<int>(H), static_cast<int>(I), 1.f, 0.f);
+    vt::MulScalar(d.q, out.t(), out.t(), static_cast<double>(beta));
+    DBuf ysc(d, DType::kBF16, {1, H});
+    vt::MulScalar(d.q, ysc.t(), ytmp.t(), static_cast<double>(alpha));
+    vt::Add(d.q, out.t(), out.t(), ysc.t());
+  }
+}
+
 // Batched top-k path (gather+strided or pointer-batch): currently disabled.
 // Lab: gather+strided produced wrong tokens (~23 t/s); pointer-batch ~0.8 t/s.
 // Serial ExpertGeGLUDeviceAccum remains the correct/fast path (~34 t/s).
@@ -138,6 +159,10 @@ struct DevExpertLru {
     const Gemma4Fp8ExpertMats* ex = nullptr;
     void* gu = nullptr;
     void* dn = nullptr;
+    void* fp8_gu = nullptr;
+    void* fp8_dn = nullptr;
+    void* s_gu = nullptr;
+    void* s_dn = nullptr;
     size_t bytes = 0;
     uint64_t tick = 0;
   };
@@ -149,7 +174,6 @@ struct DevExpertLru {
 
   size_t BudgetBytes() {
     if (budget) return budget;
-    // 0 = unlimited (legacy keep-all). Set VT_GEMMA4_EXPERT_VRAM_MB to cap.
     size_t mb = 0;
     if (const char* e = std::getenv("VT_GEMMA4_EXPERT_VRAM_MB")) {
       const long v = std::strtol(e, nullptr, 10);
@@ -167,25 +191,34 @@ struct DevExpertLru {
     Slot s = slots[victim];
     if (s.gu) d.b.Free(s.gu);
     if (s.dn) d.b.Free(s.dn);
+    if (s.fp8_gu) d.b.Free(s.fp8_gu);
+    if (s.fp8_dn) d.b.Free(s.fp8_dn);
+    if (s.s_gu) d.b.Free(s.s_gu);
+    if (s.s_dn) d.b.Free(s.s_dn);
     if (s.ex) {
       s.ex->dev_gu = nullptr;
       s.ex->dev_dn = nullptr;
+      s.ex->dev_fp8_gu = nullptr;
+      s.ex->dev_fp8_dn = nullptr;
+      s.ex->dev_s_gu = nullptr;
+      s.ex->dev_s_dn = nullptr;
     }
     used = used >= s.bytes ? used - s.bytes : 0;
     slots.erase(slots.begin() + static_cast<std::ptrdiff_t>(victim));
   }
 
-  void Note(const Gemma4Fp8ExpertMats* ex, void* gu, void* dn, size_t bytes, Dev d) {
+  void Note(const Gemma4Fp8ExpertMats* ex, void* gu, void* dn, size_t bytes, Dev d,
+            void* fp8_gu = nullptr, void* fp8_dn = nullptr, void* s_gu = nullptr,
+            void* s_dn = nullptr) {
     if (dev != d.q.device.index) {
-      // New device context — drop tracking (pointers are device-local).
       slots.clear();
       used = 0;
       dev = d.q.device.index;
     }
     const size_t bud = BudgetBytes();
     while (used + bytes > bud && !slots.empty()) EvictOne(d);
-    if (used + bytes > bud) return;  // cannot fit even alone
-    slots.push_back(Slot{ex, gu, dn, bytes, tick++});
+    if (used + bytes > bud) return;
+    slots.push_back(Slot{ex, gu, dn, fp8_gu, fp8_dn, s_gu, s_dn, bytes, tick++});
     used += bytes;
   }
 
@@ -218,14 +251,12 @@ bool EnsureGemma4Fp8ExpertOnDevice(Dev d, const Gemma4Fp8ExpertMats& ex, int64_t
   void* gu = nullptr;
   void* dn = nullptr;
   try {
-    // Make room under budget before alloc.
     auto& lru = ExpertLru();
     while (lru.used + total > lru.BudgetBytes() && !lru.slots.empty()) lru.EvictOne(d);
     gu = d.b.Alloc(gu_b);
     dn = d.b.Alloc(dn_b);
     d.b.Copy(d.q, gu, ex.cached_gu.data(), gu_b);
     d.b.Copy(d.q, dn, ex.cached_dn.data(), dn_b);
-    // No Synchronize — same-stream GEMM orders after these copies.
     ex.dev_gu = gu;
     ex.dev_dn = dn;
     lru.Note(&ex, gu, dn, total, d);
@@ -238,7 +269,54 @@ bool EnsureGemma4Fp8ExpertOnDevice(Dev d, const Gemma4Fp8ExpertMats& ex, int64_t
     if (n == 1 || n % 64 == 0)
       std::fprintf(stderr, "gemma4 moe: device expert upload fail #%d (falling back to H2D)\n",
                    n);
-    return false;  // fall back to host H2D path
+    return false;
+  }
+}
+
+// Upload FP8 weights + channel scales (no BF16 dequant). Half weight VRAM vs BF16 path.
+bool EnsureGemma4Fp8NativeOnDevice(Dev d, const Gemma4Fp8ExpertMats& ex, int64_t I, int64_t H) {
+  if (ex.dev_fp8_gu && ex.dev_fp8_dn && ex.dev_s_gu && ex.dev_s_dn) {
+    ExpertLru().Touch(&ex);
+    return true;
+  }
+  VT_CHECK(ex.gate_w.HasHostBytes() && ex.up_w.HasHostBytes() && ex.down_w.HasHostBytes(),
+           "fp8 native: missing weights");
+  VT_CHECK(ex.gate_s.HasHostBytes() && ex.up_s.HasHostBytes() && ex.down_s.HasHostBytes(),
+           "fp8 native: missing scales");
+  const size_t gu_b = static_cast<size_t>(2 * I * H);       // u8
+  const size_t dn_b = static_cast<size_t>(H * I);           // u8
+  const size_t sgu_b = static_cast<size_t>(2 * I) * 2;      // bf16
+  const size_t sdn_b = static_cast<size_t>(H) * 2;          // bf16
+  const size_t total = gu_b + dn_b + sgu_b + sdn_b;
+  void *fgu = nullptr, *fdn = nullptr, *sgu = nullptr, *sdn = nullptr;
+  try {
+    auto& lru = ExpertLru();
+    while (lru.used + total > lru.BudgetBytes() && !lru.slots.empty()) lru.EvictOne(d);
+    fgu = d.b.Alloc(gu_b);
+    fdn = d.b.Alloc(dn_b);
+    sgu = d.b.Alloc(sgu_b);
+    sdn = d.b.Alloc(sdn_b);
+    // Pack gate|up FP8 rows
+    d.b.Copy(d.q, fgu, ex.gate_w.bytes.data(), static_cast<size_t>(I * H));
+    d.b.Copy(d.q, static_cast<char*>(fgu) + static_cast<size_t>(I * H), ex.up_w.bytes.data(),
+             static_cast<size_t>(I * H));
+    d.b.Copy(d.q, fdn, ex.down_w.bytes.data(), dn_b);
+    d.b.Copy(d.q, sgu, ex.gate_s.bytes.data(), static_cast<size_t>(I) * 2);
+    d.b.Copy(d.q, static_cast<char*>(sgu) + static_cast<size_t>(I) * 2, ex.up_s.bytes.data(),
+             static_cast<size_t>(I) * 2);
+    d.b.Copy(d.q, sdn, ex.down_s.bytes.data(), sdn_b);
+    ex.dev_fp8_gu = fgu;
+    ex.dev_fp8_dn = fdn;
+    ex.dev_s_gu = sgu;
+    ex.dev_s_dn = sdn;
+    lru.Note(&ex, nullptr, nullptr, total, d, fgu, fdn, sgu, sdn);
+    return true;
+  } catch (...) {
+    if (fgu) d.b.Free(fgu);
+    if (fdn) d.b.Free(fdn);
+    if (sgu) d.b.Free(sgu);
+    if (sdn) d.b.Free(sdn);
+    return false;
   }
 }
 
@@ -404,6 +482,10 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     const char* e = std::getenv("VT_GEMMA4_BATCH_EXPERTS");
     return e && e[0] == '1';
   }();
+  static const bool fp8_native = [] {
+    const char* e = std::getenv("VT_GEMMA4_FP8_NATIVE");
+    return e && e[0] == '1';
+  }();
   std::vector<uint16_t> hsum;
   if (host_axpy) hsum.assign(static_cast<size_t>(H), vt::F32ToBF16(0.f));
 
@@ -457,8 +539,12 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     if (ex.is_fp8 && !same_dev && ex.gate_up_dev == nullptr) {
       for (int i = 0; i < top_k; ++i) {
         const int e = idx[static_cast<size_t>(i)];
-        if (e >= 0 && e < static_cast<int>(E))
-          (void)EnsureGemma4Fp8ExpertOnDevice(d, ex.fp8[static_cast<size_t>(e)], I, H);
+        if (e >= 0 && e < static_cast<int>(E)) {
+          if (fp8_native)
+            (void)EnsureGemma4Fp8NativeOnDevice(d, ex.fp8[static_cast<size_t>(e)], I, H);
+          else
+            (void)EnsureGemma4Fp8ExpertOnDevice(d, ex.fp8[static_cast<size_t>(e)], I, H);
+        }
       }
     }
 
@@ -528,6 +614,13 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
             static_cast<const uint16_t*>(ex.down_dev) + static_cast<int64_t>(e) * dn_stride;
         ExpertGeGLUDeviceAccum(d, ysum, xin.t(), gu, dn, I, H, esc, ww, beta);
         fused_mix = true;
+      } else if (fp8_native && ex.is_fp8 && T == 1) {
+        const auto& fex = ex.fp8[static_cast<size_t>(e)];
+        if (EnsureGemma4Fp8NativeOnDevice(d, fex, I, H)) {
+          ExpertGeGLUFp8Native(d, ysum, xin.t(), fex.dev_fp8_gu, fex.dev_s_gu, fex.dev_fp8_dn,
+                               fex.dev_s_dn, I, H, esc, ww, beta);
+          fused_mix = true;
+        }
       } else if (need_peer_sc && gu_sc && dn_sc) {
         if (PeerCopyGemma4ExpertSlice(ex.dev_id, ex.gate_up_dev, ex.down_dev, e, I, H,
                                       compute_dev, gu_sc->ptr(), dn_sc->ptr())) {

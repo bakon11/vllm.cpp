@@ -29,6 +29,11 @@ struct Gemma4Fp8ExpertMats {
   // Lazy device BF16 copy on compute GPU (avoids H2D every token).
   mutable void* dev_gu = nullptr;  // [2I,H] bf16
   mutable void* dev_dn = nullptr;  // [H,I] bf16
+  // Native FP8 on device (VT_GEMMA4_FP8_NATIVE=1): half weight bandwidth vs BF16.
+  mutable void* dev_fp8_gu = nullptr;  // u8 [2I,H] gate|up
+  mutable void* dev_fp8_dn = nullptr;  // u8 [H,I]
+  mutable void* dev_s_gu = nullptr;    // bf16 [2I]
+  mutable void* dev_s_dn = nullptr;    // bf16 [H]
 };
 
 struct Gemma4FusedExperts {

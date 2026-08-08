@@ -28,4 +28,9 @@ void MatmulBTPointerBatchABKernelRocm(Queue& q, void** out_ptrs, void** a_ptrs,
 void MatmulBTAlphaBetaRocm(Queue& q, void* out, const void* a, const void* b, int M, int N,
                            int K, float alpha, float beta, DType dtype);
 
+// M=1 BF16 act × FP8 weight [N,K] with BF16 channel scale[N]
+void MatmulBTFp8ChannelRocm(Queue& q, void* out, const void* a, const void* b_fp8,
+                            const void* scale_bf16, int M, int N, int K, float alpha,
+                            float beta);
+
 }  // namespace vt::rocm

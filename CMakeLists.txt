@@ -1146,6 +1146,7 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_paged_attn.hip
     src/vt/rocm/rocm_gemma4_experts.hip
     src/vt/rocm/rocm_gemma4_fused_experts.hip
+    src/vt/rocm/rocm_fp8_channel_gemv.hip
     src/vt/rocm/rocm_moe_router.hip
     src/vt/rocm/rocm_ops.hip)
   if(VLLM_CPP_HIP_ARCHITECTURES)
@@ -1158,6 +1159,7 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_paged_attn.hip
       src/vt/rocm/rocm_gemma4_experts.hip
       src/vt/rocm/rocm_gemma4_fused_experts.hip
+      src/vt/rocm/rocm_fp8_channel_gemv.hip
       src/vt/rocm/rocm_moe_router.hip
       src/vt/rocm/rocm_ops.hip
       PROPERTIES HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")
