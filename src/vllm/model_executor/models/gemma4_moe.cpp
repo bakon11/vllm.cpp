@@ -252,16 +252,25 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
         ExpertGeGLUDevice(d, y, xin.t(), gu, dn, I, H);
       } else if (ex.is_fp8) {
         const auto& fex = ex.fp8[static_cast<size_t>(e)];
-        if (EnsureGemma4Fp8ExpertOnDevice(d, fex, I, H)) {
+        // If full-layer stack already lives on another GPU, do NOT alloc more
+        // device experts (OOM). Ephemeral host dequant + H2D for this expert.
+        if (ex.gate_up_dev != nullptr) {
+          std::vector<uint16_t> gu_tmp(static_cast<size_t>(gu_stride));
+          std::vector<uint16_t> dn_tmp(static_cast<size_t>(dn_stride));
+          DequantGemma4Fp8ExpertToBf16Ephemeral(fex, I, H, gu_tmp.data(), dn_tmp.data());
+          ExpertGeGLUHost(d, y, xin.t(), gu_tmp.data(), dn_tmp.data(), I, H);
+        } else if (EnsureGemma4Fp8ExpertOnDevice(d, fex, I, H)) {
           ExpertGeGLUDevice(d, y, xin.t(), static_cast<const uint16_t*>(fex.dev_gu),
                             static_cast<const uint16_t*>(fex.dev_dn), I, H);
         } else {
           EnsureGemma4Fp8ExpertCached(fex, I, H);
           ExpertGeGLUHost(d, y, xin.t(), fex.cached_gu.data(), fex.cached_dn.data(), I, H);
         }
-      } else {
+      } else if (gu_host && dn_host) {
         ExpertGeGLUHost(d, y, xin.t(), gu_host + static_cast<int64_t>(e) * gu_stride,
                         dn_host + static_cast<int64_t>(e) * dn_stride, I, H);
+      } else {
+        VT_CHECK(false, "gemma4 moe: no expert weights");
       }
       d.b.Synchronize(d.q);
       std::vector<uint16_t> hy(static_cast<size_t>(H)), hs(static_cast<size_t>(H));

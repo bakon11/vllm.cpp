@@ -25,7 +25,8 @@ bool DeviceHasRoom(int dev, size_t need_bytes) {
   Check(hipSetDevice(dev), "hipSetDevice");
   size_t free_b = 0, tot_b = 0;
   if (hipMemGetInfo(&free_b, &tot_b) != hipSuccess) return true;
-  const size_t headroom = (dev == 0) ? (3ull << 30) : (1ull << 30);
+  // GPU0 is compute: dense weights + KV + activations need real headroom.
+  const size_t headroom = (dev == 0) ? (10ull << 30) : (512ull << 20);
   return free_b >= need_bytes + headroom;
 }
 
