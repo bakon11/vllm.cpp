@@ -28,31 +28,57 @@ using dense_attn::ResidentWeight;
 using vt::DType;
 using vt::Tensor;
 
-void ExpertGeGLUHost(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_up_e,
-                     const uint16_t* down_e, int64_t I, int64_t H) {
-  const int64_t T = x.shape[0];
-  DBuf gate_w(d, DType::kBF16, {I, H}, gate_up_e);
-  DBuf up_w(d, DType::kBF16, {I, H}, gate_up_e + I * H);
-  DBuf down_w(d, DType::kBF16, {H, I}, down_e);
-  DBuf gate(d, DType::kBF16, {T, I});
-  DBuf up(d, DType::kBF16, {T, I});
-  vt::MatmulBT(d.q, gate.t(), x, gate_w.t());
-  vt::MatmulBT(d.q, up.t(), x, up_w.t());
-  DBuf gu(d, DType::kBF16, {T, 2 * I});
+// Scratch reused across top-k experts within a token (and host H2D weight slots).
+struct ExpertScratch {
+  DBuf gate;
+  DBuf up;
+  DBuf gu;
+  DBuf act;
+  DBuf gate_w;  // host-path weight upload targets
+  DBuf up_w;
+  DBuf down_w;
+  ExpertScratch(Dev d, int64_t T, int64_t I, int64_t H)
+      : gate(d, DType::kBF16, {T, I}),
+        up(d, DType::kBF16, {T, I}),
+        gu(d, DType::kBF16, {T, 2 * I}),
+        act(d, DType::kBF16, {T, I}),
+        gate_w(d, DType::kBF16, {I, H}),
+        up_w(d, DType::kBF16, {I, H}),
+        down_w(d, DType::kBF16, {H, I}) {}
+};
+
+void PackGateUp(Dev d, DBuf& gu, DBuf& gate, DBuf& up, int64_t T, int64_t I) {
   const size_t row = static_cast<size_t>(I) * sizeof(uint16_t);
+  if (T == 1) {
+    d.b.Copy(d.q, gu.ptr(), gate.ptr(), row);
+    d.b.Copy(d.q, static_cast<char*>(gu.ptr()) + row, up.ptr(), row);
+    return;
+  }
   for (int64_t t = 0; t < T; ++t) {
     d.b.Copy(d.q, static_cast<char*>(gu.ptr()) + static_cast<size_t>(t) * 2 * row,
              static_cast<const char*>(gate.ptr()) + static_cast<size_t>(t) * row, row);
     d.b.Copy(d.q, static_cast<char*>(gu.ptr()) + static_cast<size_t>(t) * 2 * row + row,
              static_cast<const char*>(up.ptr()) + static_cast<size_t>(t) * row, row);
   }
-  DBuf act(d, DType::kBF16, {T, I});
-  vt::GeluAndMul(d.q, act.t(), gu.t());
-  vt::MatmulBT(d.q, out.t(), act.t(), down_w.t());
+}
+
+void ExpertGeGLUHost(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_up_e,
+                     const uint16_t* down_e, int64_t I, int64_t H, ExpertScratch& s) {
+  const int64_t T = x.shape[0];
+  const size_t half = static_cast<size_t>(I * H) * sizeof(uint16_t);
+  const size_t dn_b = static_cast<size_t>(H * I) * sizeof(uint16_t);
+  d.b.Copy(d.q, s.gate_w.ptr(), gate_up_e, half);
+  d.b.Copy(d.q, s.up_w.ptr(), gate_up_e + I * H, half);
+  d.b.Copy(d.q, s.down_w.ptr(), down_e, dn_b);
+  vt::MatmulBT(d.q, s.gate.t(), x, s.gate_w.t());
+  vt::MatmulBT(d.q, s.up.t(), x, s.up_w.t());
+  PackGateUp(d, s.gu, s.gate, s.up, T, I);
+  vt::GeluAndMul(d.q, s.act.t(), s.gu.t());
+  vt::MatmulBT(d.q, out.t(), s.act.t(), s.down_w.t());
 }
 
 void ExpertGeGLUDevice(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_up_e,
-                       const uint16_t* down_e, int64_t I, int64_t H) {
+                       const uint16_t* down_e, int64_t I, int64_t H, ExpertScratch& s) {
   const int64_t T = x.shape[0];
   const vt::Device dev = d.q.device;
   Tensor gate_w =
@@ -61,21 +87,11 @@ void ExpertGeGLUDevice(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_u
                                    dev, {I, H});
   Tensor down_w =
       Tensor::Contiguous(const_cast<uint16_t*>(down_e), DType::kBF16, dev, {H, I});
-  DBuf gate(d, DType::kBF16, {T, I});
-  DBuf up(d, DType::kBF16, {T, I});
-  vt::MatmulBT(d.q, gate.t(), x, gate_w);
-  vt::MatmulBT(d.q, up.t(), x, up_w);
-  DBuf gu(d, DType::kBF16, {T, 2 * I});
-  const size_t row = static_cast<size_t>(I) * sizeof(uint16_t);
-  for (int64_t t = 0; t < T; ++t) {
-    d.b.Copy(d.q, static_cast<char*>(gu.ptr()) + static_cast<size_t>(t) * 2 * row,
-             static_cast<const char*>(gate.ptr()) + static_cast<size_t>(t) * row, row);
-    d.b.Copy(d.q, static_cast<char*>(gu.ptr()) + static_cast<size_t>(t) * 2 * row + row,
-             static_cast<const char*>(up.ptr()) + static_cast<size_t>(t) * row, row);
-  }
-  DBuf act(d, DType::kBF16, {T, I});
-  vt::GeluAndMul(d.q, act.t(), gu.t());
-  vt::MatmulBT(d.q, out.t(), act.t(), down_w);
+  vt::MatmulBT(d.q, s.gate.t(), x, gate_w);
+  vt::MatmulBT(d.q, s.up.t(), x, up_w);
+  PackGateUp(d, s.gu, s.gate, s.up, T, I);
+  vt::GeluAndMul(d.q, s.act.t(), s.gu.t());
+  vt::MatmulBT(d.q, out.t(), s.act.t(), down_w);
 }
 
 }  // namespace
@@ -263,6 +279,7 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     // Reuse scratch across top-k (avoid alloc/free per expert).
     DBuf y(d, DType::kBF16, {1, H});
     DBuf ysc(d, DType::kBF16, {1, H});
+    ExpertScratch esc(d, /*T=*/1, I, H);
     // Peer scratch only when experts live on another device (~12MiB).
     const bool need_peer_sc =
         ex.gate_up_dev != nullptr && ex.down_dev != nullptr && !same_dev;
@@ -311,34 +328,35 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
                    static_cast<int64_t>(e) * gu_stride;
         auto* dn =
             static_cast<const uint16_t*>(ex.down_dev) + static_cast<int64_t>(e) * dn_stride;
-        ExpertGeGLUDevice(d, y, xin.t(), gu, dn, I, H);
+        ExpertGeGLUDevice(d, y, xin.t(), gu, dn, I, H, esc);
       } else if (need_peer_sc && gu_sc && dn_sc) {
         // Resident on another GPU: peer/stage one expert into compute scratch.
         if (PeerCopyGemma4ExpertSlice(ex.dev_id, ex.gate_up_dev, ex.down_dev, e, I, H,
                                       compute_dev, gu_sc->ptr(), dn_sc->ptr())) {
           ExpertGeGLUDevice(d, y, xin.t(), static_cast<const uint16_t*>(gu_sc->ptr()),
-                            static_cast<const uint16_t*>(dn_sc->ptr()), I, H);
+                            static_cast<const uint16_t*>(dn_sc->ptr()), I, H, esc);
         } else if (ex.is_fp8) {
           const auto& fex = ex.fp8[static_cast<size_t>(e)];
           DequantGemma4Fp8ExpertToBf16Ephemeral(fex, I, H, gu_tmp.data(), dn_tmp.data());
-          ExpertGeGLUHost(d, y, xin.t(), gu_tmp.data(), dn_tmp.data(), I, H);
+          ExpertGeGLUHost(d, y, xin.t(), gu_tmp.data(), dn_tmp.data(), I, H, esc);
         } else {
           VT_CHECK(gu_host && dn_host, "gemma4 moe: peer fail no host");
           ExpertGeGLUHost(d, y, xin.t(), gu_host + static_cast<int64_t>(e) * gu_stride,
-                          dn_host + static_cast<int64_t>(e) * dn_stride, I, H);
+                          dn_host + static_cast<int64_t>(e) * dn_stride, I, H, esc);
         }
       } else if (ex.is_fp8) {
         const auto& fex = ex.fp8[static_cast<size_t>(e)];
         if (EnsureGemma4Fp8ExpertOnDevice(d, fex, I, H)) {
           ExpertGeGLUDevice(d, y, xin.t(), static_cast<const uint16_t*>(fex.dev_gu),
-                            static_cast<const uint16_t*>(fex.dev_dn), I, H);
+                            static_cast<const uint16_t*>(fex.dev_dn), I, H, esc);
         } else {
           EnsureGemma4Fp8ExpertCached(fex, I, H);
-          ExpertGeGLUHost(d, y, xin.t(), fex.cached_gu.data(), fex.cached_dn.data(), I, H);
+          ExpertGeGLUHost(d, y, xin.t(), fex.cached_gu.data(), fex.cached_dn.data(), I, H,
+                          esc);
         }
       } else if (gu_host && dn_host) {
         ExpertGeGLUHost(d, y, xin.t(), gu_host + static_cast<int64_t>(e) * gu_stride,
-                        dn_host + static_cast<int64_t>(e) * dn_stride, I, H);
+                        dn_host + static_cast<int64_t>(e) * dn_stride, I, H, esc);
       } else {
         VT_CHECK(false, "gemma4 moe: no expert weights");
       }
