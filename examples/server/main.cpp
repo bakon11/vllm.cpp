@@ -178,6 +178,7 @@ struct Args {
   // routers only under `if envs.VLLM_SERVER_DEV_MODE` (api_server.py:238). Off by
   // default → /abort_requests 404s. Enables the /abort_requests production wiring.
   bool enable_server_dev_mode = false;
+  bool verbose = false;
   // Scheduling policy: "fcfs" (default), "priority" (mirrors vLLM's
   // --scheduling-policy / SchedulerConfig.policy), or "lpm" (SGLang's
   // cache-aware longest-prefix-match admission ordering, ENG-SGLANG-BEHAVIOR-FLAG;
@@ -225,6 +226,7 @@ struct Args {
          "               [--enable-force-include-usage]\n"
          "               [--enable-tokenizer-info-endpoint]\n"
          "               [--enable-server-dev-mode]\n"
+         "               [--verbose]\n"
          "               [--[no-]enable-prefix-caching]\n"
          "               [--[no-]enable-radix-attention]\n"
          "               [--scheduling-policy fcfs|priority|lpm]\n"
@@ -319,6 +321,8 @@ Args ParseArgs(int argc, char** argv) {
       a.video_dequant_bf16 = true;
     } else if (flag == "--enable-server-dev-mode") {
       a.enable_server_dev_mode = true;
+    } else if (flag == "--verbose" || flag == "-v") {
+      a.verbose = true;
     } else if (flag == "--enable-prefix-caching" ||
                flag == "--no-enable-prefix-caching" ||
                flag == "--enable-radix-attention" ||
@@ -416,6 +420,10 @@ Args ParseArgs(int argc, char** argv) {
 int main(int argc, char** argv) {
   try {
     const Args args = ParseArgs(argc, argv);
+    if (args.verbose) {
+      setenv("VT_SERVER_VERBOSE", "1", /*overwrite=*/1);
+      std::cerr << "server: verbose request logging enabled (VT_SERVER_VERBOSE=1)\n";
+    }
 
     const fs::path dir(args.model_dir);
     const std::string config_path = (dir / "config.json").string();
@@ -667,8 +675,9 @@ int main(int argc, char** argv) {
           tokenizer.EosId() >= 0 ? tokenizer.Decode({tokenizer.EosId()}) : "";
       chat_prompt_fn =
           vllm::entrypoints::MakeChatTemplatePromptFn(chat_template, bos, eos);
-      std::cerr << "server: using chat template from " << tokenizer_config_path
-                << "\n";
+      std::cerr << "server: using chat template (" << chat_template.size()
+                << " chars) from " << tokenizer_config_path
+                << " or sibling chat_template.jinja\n";
     } catch (const std::exception& e) {
       std::cerr << "server: no chat template (" << e.what()
                 << "); falling back to the simple role-join prompt\n";

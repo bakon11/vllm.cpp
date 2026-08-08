@@ -200,27 +200,43 @@ std::string LoadChatTemplateFromConfig(
                             e.what());
   }
   auto it = doc.find("chat_template");
-  if (it == doc.end() || it->is_null()) {
-    throw ChatTemplateError("tokenizer_config.json has no 'chat_template': " +
-                            tokenizer_config_path);
-  }
-  if (it->is_string()) return it->get<std::string>();
-  // List-of-{name,template} form: pick "default", else the first.
-  if (it->is_array()) {
-    const nlohmann::json* chosen = nullptr;
-    for (const auto& entry : *it) {
-      if (entry.is_object() && entry.value("name", std::string()) == "default") {
-        chosen = &entry;
-        break;
+  if (it != doc.end() && !it->is_null()) {
+    if (it->is_string()) return it->get<std::string>();
+    // List-of-{name,template} form: pick "default", else the first.
+    if (it->is_array()) {
+      const nlohmann::json* chosen = nullptr;
+      for (const auto& entry : *it) {
+        if (entry.is_object() && entry.value("name", std::string()) == "default") {
+          chosen = &entry;
+          break;
+        }
+      }
+      if (!chosen && !it->empty()) chosen = &it->front();
+      if (chosen && chosen->contains("template") &&
+          (*chosen)["template"].is_string()) {
+        return (*chosen)["template"].get<std::string>();
       }
     }
-    if (!chosen && !it->empty()) chosen = &it->front();
-    if (chosen && chosen->contains("template") &&
-        (*chosen)["template"].is_string()) {
-      return (*chosen)["template"].get<std::string>();
-    }
+    throw ChatTemplateError("unrecognized 'chat_template' shape in " +
+                            tokenizer_config_path);
   }
-  throw ChatTemplateError("unrecognized 'chat_template' shape in " +
+
+  // Sibling chat_template.jinja (HF layout for Gemma4 / many multimodal models).
+  std::string dir = tokenizer_config_path;
+  const auto slash = dir.find_last_of("/\\");
+  if (slash != std::string::npos) dir.resize(slash + 1);
+  else dir.clear();
+  const std::string jinja_path = dir + "chat_template.jinja";
+  std::ifstream jf(jinja_path, std::ios::binary);
+  if (jf) {
+    std::ostringstream ss;
+    ss << jf.rdbuf();
+    std::string tmpl = ss.str();
+    if (!tmpl.empty()) return tmpl;
+  }
+
+  throw ChatTemplateError("tokenizer_config.json has no 'chat_template' and no "
+                          "sibling chat_template.jinja: " +
                           tokenizer_config_path);
 }
 
