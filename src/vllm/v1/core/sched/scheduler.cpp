@@ -53,7 +53,9 @@ void MaybeLogPrefillProgress(const Request& request) {
   using clock = std::chrono::steady_clock;
   struct State {
     clock::time_point last{};
+    clock::time_point first{};
     int last_computed = -1;
+    int first_computed = -1;
     bool logged_done = false;
   };
   static std::mutex mu;
@@ -61,12 +63,22 @@ void MaybeLogPrefillProgress(const Request& request) {
   std::lock_guard<std::mutex> lock(mu);
   State& st = states[request.request_id];
   const auto now = clock::now();
+  if (st.first.time_since_epoch().count() == 0) {
+    st.first = now;
+    st.first_computed = computed;
+  }
   const bool done = !request.is_prefill_chunk && computed >= prompt;
   if (done) {
     if (!st.logged_done) {
+      const double elapsed_s =
+          std::chrono::duration<double>(now - st.first).count();
+      const int done_tok = std::min(computed, prompt);
+      const double tok_s =
+          elapsed_s > 0.0 ? static_cast<double>(done_tok) / elapsed_s : 0.0;
       std::cerr << "INFO prefill id=" << request.request_id
-                << " computed=" << std::min(computed, prompt) << "/" << prompt
-                << " (100%) status=done\n";
+                << " computed=" << done_tok << "/" << prompt
+                << " (100%) status=done elapsed_s=" << elapsed_s
+                << " prefill_tok_s=" << tok_s << "\n";
       std::cerr.flush();
       st.logged_done = true;
     }
@@ -83,15 +95,24 @@ void MaybeLogPrefillProgress(const Request& request) {
 
   const auto ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last).count();
-  if (st.last_computed >= 0 && ms < 500 && (computed - st.last_computed) < 2048) {
+  // Long contexts: log at least every 500ms OR every 512 new tokens so
+  // "prefill gets slower as seq grows" is visible in the log.
+  if (st.last_computed >= 0 && ms < 500 && (computed - st.last_computed) < 512) {
     return;
   }
+  const double window_s = st.last.time_since_epoch().count() == 0
+                              ? 0.0
+                              : std::chrono::duration<double>(now - st.last).count();
+  const int delta =
+      st.last_computed < 0 ? 0 : std::max(0, computed - st.last_computed);
+  const double inst_tok_s = window_s > 0.0 ? static_cast<double>(delta) / window_s : 0.0;
   st.last = now;
   st.last_computed = computed;
   const int shown = std::min(computed, prompt);
   const double pct = 100.0 * static_cast<double>(shown) / static_cast<double>(prompt);
   std::cerr << "INFO prefill id=" << request.request_id << " computed=" << shown
-            << "/" << prompt << " (" << pct << "%) status=running\n";
+            << "/" << prompt << " (" << pct << "%) status=running"
+            << " inst_tok_s=" << inst_tok_s << "\n";
   std::cerr.flush();
 }
 

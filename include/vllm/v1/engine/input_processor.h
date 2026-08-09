@@ -31,7 +31,9 @@
 //   - update_from_generation_config: sets eos_token_id, adds the eos id(s) to
 //     all_stop_token_ids (for MinTokens masking) and merges the SECONDARY eos
 //     ids into stop_token_ids, matching sampling_params.py:627-655 (ROAD-V1-C7
-//     wired all_stop_token_ids; it was previously dropped).
+//     wired all_stop_token_ids; it was previously dropped). The eos list comes
+//     from HfConfig.raw["eos_token_id"], which LoadHfConfig unions with sibling
+//     generation_config.json (e.g. Gemma-4 [1,106] U [1,106,50]).
 //   - update_from_tokenizer tokenizes bad_words into bad_words_token_ids
 //     (sampling_params.py:659-698), ROAD-V1-C7 (previously a no-op stub while
 //     bad_words was deferred on SamplingParams).

@@ -89,6 +89,8 @@ bool PeerCopyGemma4ExpertSlice(int src_dev, const void* gate_up_base,
 
 // hipHostRegister BF16 expert cache for faster H2D (no-op if already pinned).
 void PinGemma4Fp8ExpertHostCache(const Gemma4Fp8ExpertMats& ex);
+// hipHostUnregister before dropping host BF16 cache (no-op if not pinned).
+void UnpinGemma4Fp8ExpertHostCache(const Gemma4Fp8ExpertMats& ex);
 
 // Dequant one FP8 expert into host BF16 gate_up[2I,H] and down[H,I] (caller-owned).
 // Fills permanent host cache (decode path). Prefer Ephemeral for bulk upload.

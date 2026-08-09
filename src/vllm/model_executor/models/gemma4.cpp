@@ -572,11 +572,25 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     Tensor w_in = ResidentWeight(d, w.input_layernorm, {H});
     vt::RmsNorm(d.q, dhn.t(), hidden.t(), w_in, plain);
 
-    static const bool layer_prof = [] {
-      const char* e = std::getenv("VT_GEMMA4_PROFILE");
-      return e && e[0] == '1';
+    static const int layer_trace = [] {
+      // 0=off, 1=aggregate VT_GEMMA4_PROFILE, 2=per-layer begin/end (hang bisect)
+      const char* e = std::getenv("VT_GEMMA4_LAYER_TRACE");
+      if (e && e[0] == '2') return 2;
+      if (e && e[0] == '1') return 1;
+      const char* p = std::getenv("VT_GEMMA4_PROFILE");
+      return (p && p[0] == '1') ? 1 : 0;
     }();
     using clock = std::chrono::steady_clock;
+    const bool layer_prof = layer_trace >= 1;
+    const bool layer_hb = layer_trace >= 2;
+    if (layer_hb) {
+      std::fprintf(stderr,
+                   "INFO gemma4-layer begin l=%lld/%lld T=%lld full=%d moe=%d kv=%lld\n",
+                   static_cast<long long>(l), static_cast<long long>(L),
+                   static_cast<long long>(T), full ? 1 : 0, w.moe.enabled ? 1 : 0,
+                   static_cast<long long>(kv_idx));
+      std::fflush(stderr);
+    }
     const auto t0 = layer_prof ? clock::now() : clock::time_point{};
 
     DBuf attn = Gemma4AttnBlock(d, w, g, dhn.t(), si, attn_meta, kv, T, Dh, full,
@@ -589,6 +603,13 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
 
     if (layer_prof) d.b.Synchronize(d.q);
     const auto t1 = layer_prof ? clock::now() : clock::time_point{};
+    if (layer_hb) {
+      const double ms =
+          std::chrono::duration<double, std::milli>(t1 - t0).count();
+      std::fprintf(stderr, "INFO gemma4-layer attn-done l=%lld ms=%.2f\n",
+                   static_cast<long long>(l), ms);
+      std::fflush(stderr);
+    }
 
     Tensor w_pf = ResidentWeight(d, w.pre_feedforward_layernorm, {H});
     vt::RmsNorm(d.q, dh2.t(), h1.t(), w_pf, plain);
@@ -616,6 +637,16 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     if (layer_prof) {
       d.b.Synchronize(d.q);
       const auto t3 = clock::now();
+      if (layer_hb) {
+        const double mlp_ms =
+            std::chrono::duration<double, std::milli>(t2 - t1).count();
+        const double moe_ms =
+            std::chrono::duration<double, std::milli>(t3 - t2).count();
+        std::fprintf(stderr,
+                     "INFO gemma4-layer end l=%lld mlp_ms=%.2f moe_ms=%.2f\n",
+                     static_cast<long long>(l), mlp_ms, moe_ms);
+        std::fflush(stderr);
+      }
       static std::atomic<uint64_t> n{0}, us_attn{0}, us_mlp{0}, us_moe{0};
       auto us = [](auto a, auto b) {
         return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();

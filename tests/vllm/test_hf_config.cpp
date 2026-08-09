@@ -4,6 +4,7 @@
 // 33-112,243-283 @ e24d1b24fe96.
 #include <doctest/doctest.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -33,6 +34,34 @@ class TempJson {
 
  private:
   std::string path_;
+};
+
+// Temp directory with config.json + optional generation_config.json (HF layout).
+class TempModelDir {
+ public:
+  TempModelDir(const std::string& config_json, const std::string& gen_json) {
+    static int counter = 0;
+    dir_ = (std::filesystem::temp_directory_path() /
+            ("vllm_hf_cfgdir_" + std::to_string(counter++)))
+               .string();
+    std::filesystem::create_directories(dir_);
+    {
+      std::ofstream out(dir_ + "/config.json", std::ios::binary);
+      out << config_json;
+    }
+    if (!gen_json.empty()) {
+      std::ofstream out(dir_ + "/generation_config.json", std::ios::binary);
+      out << gen_json;
+    }
+  }
+  ~TempModelDir() {
+    std::error_code ec;
+    std::filesystem::remove_all(dir_, ec);
+  }
+  std::string config_path() const { return dir_ + "/config.json"; }
+
+ private:
+  std::string dir_;
 };
 
 // Qwen3-Next-like hybrid MoE config (key names per upstream
@@ -302,6 +331,45 @@ TEST_CASE("LoadHfConfig parses a minimal llama-like config with defaults") {
   CHECK(cfg.linear_conv_kernel_dim == 0);
 
   CHECK(cfg.torch_dtype == "float16");
+}
+
+TEST_CASE("LoadHfConfig unions generation_config.json eos_token_id (Gemma4)") {
+  // config.json has [1, 106]; generation_config adds 50 (<turn|>) — same shape
+  // as google/gemma-4-26B-A4B-it.
+  const char* cfg_json = R"({
+    "model_type": "gemma4",
+    "architectures": ["Gemma4ForConditionalGeneration"],
+    "hidden_size": 2816,
+    "num_hidden_layers": 30,
+    "num_attention_heads": 16,
+    "eos_token_id": [1, 106]
+  })";
+  const char* gen_json = R"({
+    "bos_token_id": 2,
+    "eos_token_id": [1, 106, 50],
+    "pad_token_id": 0
+  })";
+  TempModelDir d(cfg_json, gen_json);
+  vllm::HfConfig cfg = vllm::LoadHfConfig(d.config_path());
+  REQUIRE(cfg.raw.contains("eos_token_id"));
+  REQUIRE(cfg.raw["eos_token_id"].is_array());
+  std::vector<int32_t> eos = cfg.raw["eos_token_id"].get<std::vector<int32_t>>();
+  // Unique sorted union.
+  CHECK(eos == std::vector<int32_t>({1, 50, 106}));
+}
+
+TEST_CASE("LoadHfConfig generation_config missing is a no-op") {
+  TempJson f(R"({
+    "model_type": "llama",
+    "hidden_size": 16,
+    "num_hidden_layers": 1,
+    "num_attention_heads": 2,
+    "eos_token_id": 2
+  })");
+  vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+  // No sibling generation_config.json → raw eos stays a single int.
+  CHECK(cfg.raw.at("eos_token_id").is_number_integer());
+  CHECK(cfg.raw.at("eos_token_id").get<int>() == 2);
 }
 
 TEST_CASE("LoadHfConfig applies upstream rotary and head_dim defaults") {

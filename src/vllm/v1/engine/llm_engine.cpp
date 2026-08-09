@@ -3,8 +3,12 @@
 // generate driver loop). See llm_engine.h for scope, wiring and deviations.
 #include "vllm/v1/engine/llm_engine.h"
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 
 #include "vllm/v1/engine/parallel_sampling.h"
@@ -14,6 +18,32 @@
 #include "vllm/v1/request.h"
 
 namespace vllm::v1 {
+namespace {
+
+// VT_ENGINE_STEP_LOG=1 or VT_SERVER_VERBOSE=1: log first few generate steps so
+// a post-prefill hang shows "begin" without "end" (stuck inside step()).
+bool EngineStepLogEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_ENGINE_STEP_LOG");
+    if (e != nullptr && e[0] == '1' && e[1] == '\0') return true;
+    const char* v = std::getenv("VT_SERVER_VERBOSE");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+  }();
+  return on;
+}
+
+void LogEngineStep(const char* phase, const std::string& request_id, int step,
+                   int outs, double elapsed_s) {
+  if (!EngineStepLogEnabled()) return;
+  // Only spam the first few steps (prefill + first decode tokens).
+  if (step > 6) return;
+  std::fprintf(stderr,
+               "INFO eng-step id=%s phase=%s step=%d outs=%d elapsed_s=%.3f\n",
+               request_id.c_str(), phase, step, outs, elapsed_s);
+  std::fflush(stderr);
+}
+
+}  // namespace
 
 LLMEngine::LLMEngine(InputProcessor& input_processor, EngineCore& engine_core,
                      OutputProcessor& output_processor, BlockHasher block_hasher)
@@ -236,7 +266,14 @@ RequestOutput LLMEngine::generate(const std::string& prompt,
   int steps = 0;
   constexpr int kMaxIdleSteps = 100000;  // safety; max_tokens should stop sooner
   while (true) {
+    const auto t0 = std::chrono::steady_clock::now();
+    LogEngineStep("begin", request_id, steps, -1, 0.0);
     std::vector<RequestOutput> step_outputs = step();
+    const double dt =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+            .count();
+    LogEngineStep("end", request_id, steps, static_cast<int>(step_outputs.size()),
+                  dt);
     ++steps;
     bool saw_self = false;
     bool self_finished = false;
@@ -276,9 +313,18 @@ RequestOutput LLMEngine::generate(std::vector<int32_t> prompt_token_ids,
               priority);
   RequestOutput result;
   int idle_steps = 0;
+  int steps = 0;
   constexpr int kMaxIdleSteps = 100000;
   while (true) {
+    const auto t0 = std::chrono::steady_clock::now();
+    LogEngineStep("begin", request_id, steps, -1, 0.0);
     std::vector<RequestOutput> step_outputs = step();
+    const double dt =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+            .count();
+    LogEngineStep("end", request_id, steps, static_cast<int>(step_outputs.size()),
+                  dt);
+    ++steps;
     bool saw_self = false;
     bool self_finished = false;
     for (RequestOutput& out : step_outputs) {

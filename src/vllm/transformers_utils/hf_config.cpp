@@ -7,9 +7,13 @@
 #include "vllm/transformers_utils/hf_config.h"
 
 #include <cmath>
+#include <cstdint>
 #include <fstream>
 #include <limits>
+#include <set>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace vllm {
 
@@ -312,6 +316,58 @@ RopeParameters ParseRopeParameters(const nlohmann::json& text,
   return params;
 }
 
+// Collect eos_token_id from a JSON object as a unique ordered vector.
+void CollectEosIds(const nlohmann::json& doc, std::set<int32_t>* out) {
+  auto it = doc.find("eos_token_id");
+  if (it == doc.end() || it->is_null()) return;
+  if (it->is_number_integer()) {
+    out->insert(it->get<int32_t>());
+    return;
+  }
+  if (it->is_array()) {
+    for (const auto& e : *it) {
+      if (e.is_number_integer()) out->insert(e.get<int32_t>());
+    }
+  }
+}
+
+// Sibling of config.json: generation_config.json (HF transformers layout).
+// path may be ".../config.json" or a directory containing it.
+std::string SiblingGenerationConfigPath(const std::string& path) {
+  std::string dir = path;
+  // Strip trailing slashes.
+  while (!dir.empty() && (dir.back() == '/' || dir.back() == '\\')) dir.pop_back();
+  // If path ends with config.json, take parent directory.
+  const std::string leaf = "config.json";
+  if (dir.size() >= leaf.size() &&
+      dir.compare(dir.size() - leaf.size(), leaf.size(), leaf) == 0) {
+    const auto slash = dir.find_last_of("/\\");
+    dir = (slash == std::string::npos) ? std::string(".") : dir.substr(0, slash);
+  }
+  return dir + "/generation_config.json";
+}
+
+// Merge generation_config.json eos_token_id into cfg.raw["eos_token_id"].
+// Silent no-op if generation_config is missing or has no eos field.
+void MergeGenerationConfigEos(const std::string& config_path, nlohmann::json* raw) {
+  if (raw == nullptr || !raw->is_object()) return;
+  std::set<int32_t> ids;
+  CollectEosIds(*raw, &ids);
+
+  const std::string gen_path = SiblingGenerationConfigPath(config_path);
+  std::ifstream gin(gen_path, std::ios::binary);
+  if (!gin) return;
+  nlohmann::json gdoc = nlohmann::json::parse(gin, /*cb=*/nullptr,
+                                              /*allow_exceptions=*/false);
+  if (gdoc.is_discarded() || !gdoc.is_object()) return;
+  CollectEosIds(gdoc, &ids);
+  if (ids.empty()) return;
+
+  nlohmann::json arr = nlohmann::json::array();
+  for (int32_t id : ids) arr.push_back(id);
+  (*raw)["eos_token_id"] = std::move(arr);
+}
+
 }  // namespace
 
 std::vector<std::string> PeekHfArchitectures(const std::string& path) {
@@ -484,6 +540,15 @@ HfConfig LoadHfConfig(const std::string& path) {
   }
 
   cfg.raw = std::move(doc);
+
+  // Union generation_config.json eos_token_id into cfg.raw["eos_token_id"].
+  // Upstream SamplingParams.update_from_generation_config loads BOTH
+  // config.json and generation_config.json. Gemma-4-26B ships:
+  //   config.json eos:            [1, 106]
+  //   generation_config.json eos: [1, 106, 50]   // 50 = <turn|> stop
+  // Missing the generation_config extras leaves chat gens without full EOG.
+  MergeGenerationConfigEos(path, &cfg.raw);
+
   return cfg;
 }
 

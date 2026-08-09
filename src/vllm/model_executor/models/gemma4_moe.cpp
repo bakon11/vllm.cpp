@@ -36,6 +36,9 @@ struct ExpertScratch {
   DBuf act;   // [T, I]
   DBuf gu_w;  // host-path [2I, H] weight upload
   DBuf down_w;
+  // Sticky H2D key (expert identity). Do NOT key on buffer pointers — ephemeral
+  // dequant reuses the same gu_tmp/dn_tmp addresses for every expert.
+  const void* sticky_key = nullptr;
   ExpertScratch(Dev d, int64_t T, int64_t I, int64_t H)
       : gu(d, DType::kBF16, {T, 2 * I}),
         act(d, DType::kBF16, {T, I}),
@@ -44,28 +47,47 @@ struct ExpertScratch {
 };
 
 void ExpertGeGLUHost(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_up_e,
-                     const uint16_t* down_e, int64_t I, int64_t H, ExpertScratch& s) {
+                     const uint16_t* down_e, int64_t I, int64_t H, ExpertScratch& s,
+                     const void* sticky_key = nullptr) {
+  const int64_t T = x.shape[0];
+  VT_CHECK(out.t().shape[0] >= T && out.t().shape[1] == H, "ExpertGeGLUHost out shape");
+  VT_CHECK(s.gu.t().shape[0] >= T && s.act.t().shape[0] >= T, "ExpertGeGLUHost scratch T");
   const size_t gu_b = static_cast<size_t>(2 * I * H) * sizeof(uint16_t);
   const size_t dn_b = static_cast<size_t>(H * I) * sizeof(uint16_t);
-  d.b.Copy(d.q, s.gu_w.ptr(), gate_up_e, gu_b);
-  d.b.Copy(d.q, s.down_w.ptr(), down_e, dn_b);
-  // One GEMM: x @ W_gu^T -> [T, 2I], then GeluAndMul (interleaved gate|up).
-  vt::MatmulBT(d.q, s.gu.t(), x, s.gu_w.t());
-  vt::GeluAndMul(d.q, s.act.t(), s.gu.t());
-  vt::MatmulBT(d.q, out.t(), s.act.t(), s.down_w.t());
+  const void* key = sticky_key != nullptr ? sticky_key : static_cast<const void*>(gate_up_e);
+  if (s.sticky_key != key) {
+    d.b.Copy(d.q, s.gu_w.ptr(), gate_up_e, gu_b);
+    d.b.Copy(d.q, s.down_w.ptr(), down_e, dn_b);
+    s.sticky_key = key;
+  }
+  const vt::Device dev = d.q.device;
+  Tensor gu_act =
+      Tensor::Contiguous(s.gu.ptr(), DType::kBF16, dev, {T, 2 * I});
+  Tensor act = Tensor::Contiguous(s.act.ptr(), DType::kBF16, dev, {T, I});
+  Tensor out_view = Tensor::Contiguous(out.ptr(), DType::kBF16, dev, {T, H});
+  vt::MatmulBT(d.q, gu_act, x, s.gu_w.t());
+  vt::GeluAndMul(d.q, act, gu_act);
+  vt::MatmulBT(d.q, out_view, act, s.down_w.t());
+  // Per-expert drain: once-per-token-only still lost the server after pollution
+  // (connection refused). Keep barrier until a safer fused device path exists.
+  d.b.Synchronize(d.q);
 }
 
 void ExpertGeGLUDeviceAccum(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_up_e,
                             const uint16_t* down_e, int64_t I, int64_t H, ExpertScratch& s,
                             float alpha, float beta) {
   const int64_t T = x.shape[0];
+  VT_CHECK(s.gu.t().shape[0] >= T && s.act.t().shape[0] >= T, "ExpertGeGLUDeviceAccum scratch T");
   const vt::Device dev = d.q.device;
   // gate_up_e is contiguous [2I, H] — one BT GEMM instead of two.
   Tensor gu_w =
       Tensor::Contiguous(const_cast<uint16_t*>(gate_up_e), DType::kBF16, dev, {2 * I, H});
-  vt::MatmulBT(d.q, s.gu.t(), x, gu_w);
-  vt::GeluAndMul(d.q, s.act.t(), s.gu.t());
-  vt::MatmulBTAlphaBeta(d.q, out.ptr(), s.act.ptr(), down_e, static_cast<int>(T),
+  Tensor gu_act =
+      Tensor::Contiguous(s.gu.ptr(), DType::kBF16, dev, {T, 2 * I});
+  Tensor act = Tensor::Contiguous(s.act.ptr(), DType::kBF16, dev, {T, I});
+  vt::MatmulBT(d.q, gu_act, x, gu_w);
+  vt::GeluAndMul(d.q, act, gu_act);
+  vt::MatmulBTAlphaBeta(d.q, out.ptr(), act.data, down_e, static_cast<int>(T),
                                   static_cast<int>(H), static_cast<int>(I), alpha, beta,
                                   DType::kBF16);
 }
@@ -159,13 +181,110 @@ bool ExpertGeGLUDeviceBatched(Dev /*d*/, DBuf& /*ysum*/, const Tensor& /*x*/,
 
 }  // namespace
 
-// Ensure FP8 expert has BF16 cache filled (idempotent).
+namespace {
+// Bound permanent host BF16 expert packs. Unbounded cache + hipHostRegister OOM'd
+// the 30G box (~27G RSS) during pollution. Default 2 GiB; override VT_GEMMA4_HOST_EXPERT_MB.
+struct HostExpertLru {
+  struct Slot {
+    const Gemma4Fp8ExpertMats* ex = nullptr;
+    size_t bytes = 0;
+    uint64_t tick = 0;
+  };
+  std::vector<Slot> slots;
+  size_t used = 0;
+  uint64_t tick = 1;
+
+  size_t BudgetBytes() const {
+    static const size_t b = []() -> size_t {
+      size_t mb = 2048;
+      if (const char* e = std::getenv("VT_GEMMA4_HOST_EXPERT_MB")) {
+        const long v = std::strtol(e, nullptr, 10);
+        if (v == 0) return size_t{0};
+        if (v > 0) mb = static_cast<size_t>(v);
+      }
+      return mb * static_cast<size_t>(1024ull * 1024ull);
+    }();
+    return b;
+  }
+
+  void EvictOne() {
+    if (slots.empty()) return;
+    size_t victim = 0;
+    for (size_t i = 1; i < slots.size(); ++i) {
+      if (slots[i].tick < slots[victim].tick) victim = i;
+    }
+    auto& s = slots[victim];
+    if (s.ex) {
+      UnpinGemma4Fp8ExpertHostCache(*s.ex);
+      s.ex->cached_gu.clear();
+      s.ex->cached_gu.shrink_to_fit();
+      s.ex->cached_dn.clear();
+      s.ex->cached_dn.shrink_to_fit();
+    }
+    used = used >= s.bytes ? used - s.bytes : 0;
+    slots.erase(slots.begin() + static_cast<std::ptrdiff_t>(victim));
+  }
+
+  void MakeRoom(size_t need) {
+    const size_t bud = BudgetBytes();
+    if (bud == 0) {
+      // No permanent host cache — caller should use ephemeral path.
+      return;
+    }
+    while (used + need > bud && !slots.empty()) EvictOne();
+  }
+
+  void Note(const Gemma4Fp8ExpertMats* ex, size_t bytes) {
+    const size_t bud = BudgetBytes();
+    if (bud == 0) return;
+    // Already tracked?
+    for (auto& s : slots) {
+      if (s.ex == ex) {
+        s.tick = tick++;
+        return;
+      }
+    }
+    MakeRoom(bytes);
+    if (used + bytes > bud) {
+      // Still no room for a single expert — keep this one untracked; drop immediately
+      // after use is caller's problem. Prefer: allow one oversize by evicting all.
+      while (!slots.empty()) EvictOne();
+    }
+    if (used + bytes > bud) return;
+    slots.push_back(Slot{ex, bytes, tick++});
+    used += bytes;
+  }
+
+  void Touch(const Gemma4Fp8ExpertMats* ex) {
+    for (auto& s : slots) {
+      if (s.ex == ex) {
+        s.tick = tick++;
+        return;
+      }
+    }
+  }
+};
+
+HostExpertLru& HostCacheLru() {
+  static HostExpertLru lru;
+  return lru;
+}
+}  // namespace
+
+// Ensure FP8 expert has BF16 cache filled (idempotent), under host LRU budget.
 void EnsureGemma4Fp8ExpertCached(const Gemma4Fp8ExpertMats& ex, int64_t I, int64_t H) {
   if (!ex.cached_gu.empty() && !ex.cached_dn.empty() &&
       static_cast<int64_t>(ex.cached_gu.size()) == 2 * I * H &&
       static_cast<int64_t>(ex.cached_dn.size()) == H * I) {
+    HostCacheLru().Touch(&ex);
     return;
   }
+  const size_t bytes =
+      (static_cast<size_t>(2 * I * H) + static_cast<size_t>(H * I)) * sizeof(uint16_t);
+  // Budget 0 → do not retain permanent packs (ephemeral-only mode).
+  if (HostCacheLru().BudgetBytes() == 0) return;
+
+  HostCacheLru().MakeRoom(bytes);
   ex.cached_gu.resize(static_cast<size_t>(2 * I * H));
   ex.cached_dn.resize(static_cast<size_t>(H * I));
   DequantFp8ChannelToBf16(ex.gate_w.bytes.data(),
@@ -178,6 +297,7 @@ void EnsureGemma4Fp8ExpertCached(const Gemma4Fp8ExpertMats& ex, int64_t I, int64
                           reinterpret_cast<const uint16_t*>(ex.down_s.bytes.data()), H, I,
                           ex.cached_dn.data());
   PinGemma4Fp8ExpertHostCache(ex);
+  HostCacheLru().Note(&ex, bytes);
 }
 
 // Dequant into caller buffers without retaining a permanent host BF16 cache.
@@ -204,10 +324,10 @@ void DequantGemma4Fp8ExpertToBf16Ephemeral(const Gemma4Fp8ExpertMats& ex, int64_
                           down_out);
 }
 
-// Host BF16 cache + device upload once (subsequent tokens use device GEMM path).
-// H2D is async on d.q — later GEMMs on the same stream see the data without a
-// device-wide Synchronize (was serializing every expert upload).
-// A positive VT_GEMMA4_EXPERT_VRAM_MB caps the expert LRU in MiB; unset/0 is unlimited.
+// Host BF16 cache + optional device upload. H2D is async on d.q.
+// VT_GEMMA4_EXPERT_VRAM_MB: unset/0 = device expert LRU off; N>0 = N MiB fill-only
+// budget (evict only with VT_GEMMA4_EXPERT_EVICT=1). Free VRAM probed via
+// Backend::DeviceMemoryInfo when admitting new experts.
 namespace {
 struct DevExpertLru {
   struct Slot {
@@ -224,22 +344,49 @@ struct DevExpertLru {
   std::vector<Slot> slots;
   size_t used = 0;
   size_t budget = 0;
+  bool budget_set = false;
   uint64_t tick = 1;
   int dev = -1;
 
   size_t BudgetBytes() {
-    if (budget) return budget;
-    size_t mb = 0;
+    if (budget_set) return budget;
+    // unset → 2048 MiB fill-only cache (no eviction by default). "0" → off.
+    // N>0 → N MiB. Eviction opt-in: VT_GEMMA4_EXPERT_EVICT=1.
     if (const char* e = std::getenv("VT_GEMMA4_EXPERT_VRAM_MB")) {
       const long v = std::strtol(e, nullptr, 10);
-      if (v >= 0) mb = static_cast<size_t>(v);
+      if (v == 0) {
+        budget = 0;
+        budget_set = true;
+        return 0;
+      }
+      if (v > 0) {
+        budget = static_cast<size_t>(v) * 1024ull * 1024ull;
+        budget_set = true;
+        return budget;
+      }
     }
-    budget = mb == 0 ? static_cast<size_t>(-1) : mb * 1024ull * 1024ull;
+    budget = 2048ull * 1024ull * 1024ull;  // fill-only default
+    budget_set = true;
     return budget;
+  }
+
+  bool Enabled() { return BudgetBytes() > 0; }
+
+  // Free VRAM via Backend::DeviceMemoryInfo (ROCm/CUDA). No HIP in this TU.
+  static bool FreeBytes(Dev d, size_t* free_out) {
+    *free_out = 0;
+    size_t free_b = 0, tot_b = 0;
+    if (!d.b.DeviceMemoryInfo(&free_b, &tot_b)) return false;
+    *free_out = free_b;
+    return true;
   }
 
   void EvictOne(Dev d) {
     if (slots.empty()) return;
+    // CRITICAL: async H2D/GEMM may still reference the victim. hipFree without
+    // a stream barrier races the compute stream and has been observed as a
+    // permanent kfd_wait hang (GPU idle, prefill done, no decode tokens).
+    d.b.Synchronize(d.q);
     size_t victim = 0;
     for (size_t i = 1; i < slots.size(); ++i)
       if (slots[i].tick < slots[victim].tick) victim = i;
@@ -262,17 +409,49 @@ struct DevExpertLru {
     slots.erase(slots.begin() + static_cast<std::ptrdiff_t>(victim));
   }
 
+  // Evict until bookkeeping budget AND free VRAM (if knowable) can take `need`.
+  // DEFAULT: no hipFree eviction — ROCm hangs in kfd_wait when we free under
+  // load (hoist/pollution). Fill until full, then caller falls back to host H2D.
+  // Opt-in eviction: VT_GEMMA4_EXPERT_EVICT=1.
+  bool MakeRoom(Dev d, size_t need) {
+    const size_t bud = BudgetBytes();
+    if (bud == 0) return false;
+    static const bool allow_evict = [] {
+      const char* e = std::getenv("VT_GEMMA4_EXPERT_EVICT");
+      return e && e[0] == '1';
+    }();
+    constexpr size_t kHeadroom = 1536ull << 20;  // 1.5 GiB after expert — hipMalloc hung at 512MiB
+    constexpr size_t kMaxSlots = 24;             // hard cap; further experts stay host
+    if (slots.size() >= kMaxSlots) return false;
+    if (allow_evict) {
+      while (used + need > bud && !slots.empty()) EvictOne(d);
+    }
+    if (used + need > bud) return false;
+    size_t free_b = 0;
+    // Refuse device upload if free VRAM unknown — Alloc-without-headroom has
+    // hung hipMalloc (hoist start without hoist-done under pollution).
+    if (!FreeBytes(d, &free_b)) return false;
+    if (allow_evict) {
+      int guard = 0;
+      while (free_b < need + kHeadroom && !slots.empty() && guard++ < 256) {
+        EvictOne(d);
+        if (!FreeBytes(d, &free_b)) return false;
+      }
+    }
+    return free_b >= need + kHeadroom;
+  }
+
   void Note(const Gemma4Fp8ExpertMats* ex, void* gu, void* dn, size_t bytes, Dev d,
             void* fp8_gu = nullptr, void* fp8_dn = nullptr, void* s_gu = nullptr,
             void* s_dn = nullptr) {
     if (dev != d.q.device.index) {
+      // Device change: drop bookkeeping only (buffers owned by prior device).
       slots.clear();
       used = 0;
       dev = d.q.device.index;
     }
     const size_t bud = BudgetBytes();
-    while (used + bytes > bud && !slots.empty()) EvictOne(d);
-    if (used + bytes > bud) return;
+    if (used + bytes > bud) return;  // no eviction — drop tracking if over
     slots.push_back(Slot{ex, gu, dn, fp8_gu, fp8_dn, s_gu, s_dn, bytes, tick++});
     used += bytes;
   }
@@ -295,11 +474,14 @@ DevExpertLru& ExpertLru() {
 
 bool EnsureGemma4Fp8ExpertOnDevice(Dev d, const Gemma4Fp8ExpertMats& ex, int64_t I,
                                    int64_t H) {
-  EnsureGemma4Fp8ExpertCached(ex, I, H);
+  // When device LRU disabled, do NOT host-cache-dequant here — that path was
+  // unbounded (every expert forever) and OOM'd the 30G host (~27G RSS) under pollution.
+  if (!ExpertLru().Enabled()) return false;
   if (ex.dev_gu != nullptr && ex.dev_dn != nullptr) {
     ExpertLru().Touch(&ex);
     return true;
   }
+  EnsureGemma4Fp8ExpertCached(ex, I, H);
   const size_t gu_b = static_cast<size_t>(2 * I * H) * sizeof(uint16_t);
   const size_t dn_b = static_cast<size_t>(H * I) * sizeof(uint16_t);
   const size_t total = gu_b + dn_b;
@@ -307,11 +489,13 @@ bool EnsureGemma4Fp8ExpertOnDevice(Dev d, const Gemma4Fp8ExpertMats& ex, int64_t
   void* dn = nullptr;
   try {
     auto& lru = ExpertLru();
-    while (lru.used + total > lru.BudgetBytes() && !lru.slots.empty()) lru.EvictOne(d);
+    if (!lru.MakeRoom(d, total)) return false;
     gu = d.b.Alloc(gu_b);
     dn = d.b.Alloc(dn_b);
     d.b.Copy(d.q, gu, ex.cached_gu.data(), gu_b);
     d.b.Copy(d.q, dn, ex.cached_dn.data(), dn_b);
+    // Ensure H2D lands before any later free/evict on another admission path.
+    d.b.Synchronize(d.q);
     ex.dev_gu = gu;
     ex.dev_dn = dn;
     lru.Note(&ex, gu, dn, total, d);
@@ -330,6 +514,7 @@ bool EnsureGemma4Fp8ExpertOnDevice(Dev d, const Gemma4Fp8ExpertMats& ex, int64_t
 
 // Upload FP8 weights + channel scales (no BF16 dequant). Half weight VRAM vs BF16 path.
 bool EnsureGemma4Fp8NativeOnDevice(Dev d, const Gemma4Fp8ExpertMats& ex, int64_t I, int64_t H) {
+  if (!ExpertLru().Enabled()) return false;
   if (ex.dev_fp8_gu && ex.dev_fp8_dn && ex.dev_s_gu && ex.dev_s_dn) {
     ExpertLru().Touch(&ex);
     return true;
@@ -346,7 +531,7 @@ bool EnsureGemma4Fp8NativeOnDevice(Dev d, const Gemma4Fp8ExpertMats& ex, int64_t
   void *fgu = nullptr, *fdn = nullptr, *sgu = nullptr, *sdn = nullptr;
   try {
     auto& lru = ExpertLru();
-    while (lru.used + total > lru.BudgetBytes() && !lru.slots.empty()) lru.EvictOne(d);
+    if (!lru.MakeRoom(d, total)) return false;
     fgu = d.b.Alloc(gu_b);
     fdn = d.b.Alloc(dn_b);
     sgu = d.b.Alloc(sgu_b);
@@ -360,6 +545,7 @@ bool EnsureGemma4Fp8NativeOnDevice(Dev d, const Gemma4Fp8ExpertMats& ex, int64_t
     d.b.Copy(d.q, static_cast<char*>(sgu) + static_cast<size_t>(I) * 2, ex.up_s.bytes.data(),
              static_cast<size_t>(I) * 2);
     d.b.Copy(d.q, sdn, ex.down_s.bytes.data(), sdn_b);
+    d.b.Synchronize(d.q);
     ex.dev_fp8_gu = fgu;
     ex.dev_fp8_dn = fdn;
     ex.dev_s_gu = sgu;
@@ -548,7 +734,175 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
   std::vector<uint16_t> hsum;
   if (host_axpy) hsum.assign(static_cast<size_t>(H), vt::F32ToBF16(0.f));
 
+  // Device expert cache: DECODE-ONLY (T==1), fill-only. NO bulk hoist — pre-upload
+  // of top_k experts hung hipMalloc (hoist without hoist-done). Lazy Ensure in the
+  // expert loop only. Prefill stays host. Opt out: EXPERT_VRAM_MB=0.
+  static const bool moe_trace = [] {
+    const char* e = std::getenv("VT_GEMMA4_LAYER_TRACE");
+    return e && e[0] == '2';
+  }();
+  const bool use_dev_expert_lru =
+      (T == 1) && ex.is_fp8 && !same_dev && ex.gate_up_dev == nullptr && ExpertLru().Enabled();
+  // Lazy Ensure only (below). Bulk hoist removed — was the pollution hang site.
+  (void)moe_trace;
+
+  // Prefill batch MoE: DEFAULT OFF. Chunked host-scatter still kfd_wait-hangs on
+  // long prefill (~T=400 l=9) under ROCm. Serial token MoE + EXPERT_VRAM_MB=0 is
+  // the pollution-stable path. Enable: VT_GEMMA4_PREFILL_BATCH_MOE=1.
+  static const bool prefill_batch_moe = [] {
+    const char* e = std::getenv("VT_GEMMA4_PREFILL_BATCH_MOE");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+  }();
+  if (T > 1 && prefill_batch_moe && !host_axpy) {
+    const vt::Device dev = d.q.device;
+    std::vector<std::vector<int32_t>> etok(static_cast<size_t>(E));
+    std::vector<std::vector<float>> ewt(static_cast<size_t>(E));
+    for (int64_t t = 0; t < T; ++t) {
+      for (int k = 0; k < top_k; ++k) {
+        const size_t o = static_cast<size_t>(t * top_k + k);
+        const int e = static_cast<int>(hi[o]);
+        if (e < 0 || e >= static_cast<int>(E)) continue;
+        etok[static_cast<size_t>(e)].push_back(static_cast<int32_t>(t));
+        ewt[static_cast<size_t>(e)].push_back(hw[o]);
+      }
+    }
+    int64_t max_n = 0;
+    for (int64_t e = 0; e < E; ++e) {
+      max_n = std::max<int64_t>(max_n, static_cast<int64_t>(etok[static_cast<size_t>(e)].size()));
+    }
+    if (max_n > 0) {
+      // Cap GeGLU M — ROCm hipBLAS hung with n~400 (kfd_wait after attn-done,
+      // before host-scatter finished). Chunk tokens per expert.
+      constexpr int64_t kMaxGemmM = 64;
+      const int64_t scratch_n = std::min(max_n, kMaxGemmM);
+      ExpertScratch besc(d, scratch_n, I, H);
+      DBuf bx(d, DType::kBF16, {scratch_n, H});
+      DBuf by(d, DType::kBF16, {scratch_n, H});
+      std::vector<float> hacc(static_cast<size_t>(T * H), 0.f);
+      std::vector<uint16_t> hy(static_cast<size_t>(scratch_n * H));
+      int experts_run = 0;
+      for (int64_t e = 0; e < E; ++e) {
+        const auto& toks = etok[static_cast<size_t>(e)];
+        if (toks.empty()) continue;
+        const auto& wts_e = ewt[static_cast<size_t>(e)];
+        const int64_t n_all = static_cast<int64_t>(toks.size());
+
+        const uint16_t* gu_p = nullptr;
+        const uint16_t* dn_p = nullptr;
+        const uint16_t* gu_host_e = nullptr;
+        const uint16_t* dn_host_e = nullptr;
+        bool use_device_w = false;
+        if (same_dev) {
+          gu_p = static_cast<const uint16_t*>(ex.gate_up_dev) + e * gu_stride;
+          dn_p = static_cast<const uint16_t*>(ex.down_dev) + e * dn_stride;
+          use_device_w = true;
+        } else if (ex.is_fp8) {
+          auto& fex = ex.fp8[static_cast<size_t>(e)];
+          if (use_dev_expert_lru && !fp8_native &&
+              EnsureGemma4Fp8ExpertOnDevice(d, fex, I, H)) {
+            gu_p = static_cast<const uint16_t*>(fex.dev_gu);
+            dn_p = static_cast<const uint16_t*>(fex.dev_dn);
+            use_device_w = true;
+          } else {
+            // Prefill-batch host path: ephemeral dequant (no unbounded host cache).
+            static thread_local std::vector<uint16_t> bgu, bdn;
+            const size_t gu_n = static_cast<size_t>(2 * I * H);
+            const size_t dn_n = static_cast<size_t>(H * I);
+            if (bgu.size() != gu_n) bgu.resize(gu_n);
+            if (bdn.size() != dn_n) bdn.resize(dn_n);
+            DequantGemma4Fp8ExpertToBf16Ephemeral(fex, I, H, bgu.data(), bdn.data());
+            gu_host_e = bgu.data();
+            dn_host_e = bdn.data();
+          }
+        } else if (gu_host && dn_host) {
+          gu_host_e = gu_host + e * gu_stride;
+          dn_host_e = dn_host + e * dn_stride;
+        } else {
+          continue;
+        }
+
+        for (int64_t base = 0; base < n_all; base += kMaxGemmM) {
+          const int64_t n = std::min(kMaxGemmM, n_all - base);
+          for (int64_t i = 0; i < n; ++i) {
+            const int64_t t = toks[static_cast<size_t>(base + i)];
+            d.b.Copy(d.q,
+                     static_cast<char*>(bx.ptr()) +
+                         static_cast<size_t>(i) * static_cast<size_t>(H) * 2,
+                     static_cast<const char*>(expert_in.data) +
+                         static_cast<size_t>(t) * static_cast<size_t>(H) * 2,
+                     static_cast<size_t>(H) * 2);
+          }
+          Tensor x = Tensor::Contiguous(bx.ptr(), DType::kBF16, dev, {n, H});
+          if (use_device_w) {
+            ExpertGeGLUDeviceAccum(d, by, x, gu_p, dn_p, I, H, besc, 1.f, 0.f);
+          } else {
+            ExpertGeGLUHost(d, by, x, gu_host_e, dn_host_e, I, H, besc, &ex.fp8[static_cast<size_t>(e)]);
+          }
+          d.b.Synchronize(d.q);
+          d.b.Copy(d.q, hy.data(), by.ptr(),
+                   static_cast<size_t>(n) * static_cast<size_t>(H) * 2);
+          d.b.Synchronize(d.q);
+          for (int64_t i = 0; i < n; ++i) {
+            const int64_t t = toks[static_cast<size_t>(base + i)];
+            const float w = wts_e[static_cast<size_t>(base + i)];
+            const size_t yoff = static_cast<size_t>(i) * static_cast<size_t>(H);
+            const size_t aoff = static_cast<size_t>(t) * static_cast<size_t>(H);
+            for (int64_t j = 0; j < H; ++j) {
+              hacc[aoff + static_cast<size_t>(j)] +=
+                  w * vt::BF16ToF32(hy[yoff + static_cast<size_t>(j)]);
+            }
+          }
+        }
+        ++experts_run;
+      }
+      std::vector<uint16_t> hbf(static_cast<size_t>(T * H));
+      for (size_t i = 0; i < hbf.size(); ++i) hbf[i] = vt::F32ToBF16(hacc[i]);
+      d.b.Copy(d.q, acc.ptr(), hbf.data(), hbf.size() * sizeof(uint16_t));
+      d.b.Synchronize(d.q);
+      if (moe_trace) {
+        std::fprintf(stderr,
+                     "INFO gemma4-moe prefill-batch T=%lld experts_run=%d max_n=%lld "
+                     "chunk=%lld (host-scatter)\n",
+                     static_cast<long long>(T), experts_run, static_cast<long long>(max_n),
+                     static_cast<long long>(kMaxGemmM));
+        std::fflush(stderr);
+      }
+      Gemma4MoeScratch r;
+      r.tensor = acc.t();
+      const size_t alloc = acc.alloc_bytes();
+      void* p = acc.Release();
+      r.storage = std::shared_ptr<void>(p, [alloc](void* q) { Pool().Put(alloc, q); });
+      if (profile) {
+        const auto t_all1 = clock::now();
+        static std::atomic<uint64_t> ncalls{0};
+        static std::atomic<uint64_t> us_router{0};
+        static std::atomic<uint64_t> us_total{0};
+        const auto ur =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_router1 - t_all0).count();
+        const auto ut =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_all1 - t_all0).count();
+        us_router.fetch_add(static_cast<uint64_t>(ur), std::memory_order_relaxed);
+        us_total.fetch_add(static_cast<uint64_t>(ut), std::memory_order_relaxed);
+        const uint64_t c = ncalls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (c == 1 || c % 64 == 0) {
+          const uint64_t tr = us_router.load(std::memory_order_relaxed);
+          const uint64_t tt = us_total.load(std::memory_order_relaxed);
+          std::fprintf(stderr,
+                       "gemma4 moe profile: calls=%llu router_us/call=%.1f expert+rest_us/call=%.1f "
+                       "total_us/call=%.1f (router%%=%.0f) [prefill-batch-chunked]\n",
+                       static_cast<unsigned long long>(c), static_cast<double>(tr) / c,
+                       static_cast<double>(tt - tr) / c, static_cast<double>(tt) / c,
+                       tt ? 100.0 * static_cast<double>(tr) / static_cast<double>(tt) : 0.0);
+        }
+      }
+      return r;
+    }
+  }
+
   for (int64_t t = 0; t < T; ++t) {
+    // Drain previous token's device work before starting the next (prefill only).
+    if (T > 1 && t > 0) d.b.Synchronize(d.q);
+
     std::vector<int> idx(static_cast<size_t>(top_k));
     std::vector<float> wts(static_cast<size_t>(top_k));
     for (int i = 0; i < top_k; ++i) {
@@ -567,35 +921,8 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     }
     // device path: first expert MulScalar writes ysum (no Zero needed)
 
-    // Prefetch BF16 caches for this token's top-k experts in parallel (cold only).
-    if (ex.is_fp8 && !same_dev && ex.gate_up_dev == nullptr) {
-      bool any_cold = false;
-      for (int i = 0; i < top_k; ++i) {
-        const auto& fex = ex.fp8[static_cast<size_t>(idx[static_cast<size_t>(i)])];
-        if (fex.cached_gu.empty() || fex.cached_dn.empty()) {
-          any_cold = true;
-          break;
-        }
-      }
-      if (any_cold) {
-        Fp8DequantBeginOuterParallel();
-        std::vector<std::thread> pref;
-        pref.reserve(static_cast<size_t>(top_k));
-        for (int i = 0; i < top_k; ++i) {
-          const int e = idx[static_cast<size_t>(i)];
-          pref.emplace_back([&, e] {
-            EnsureGemma4Fp8ExpertCached(ex.fp8[static_cast<size_t>(e)], I, H);
-          });
-        }
-        for (auto& th : pref) th.join();
-        Fp8DequantEndOuterParallel();
-      }
-    }
-
-    // Prefetch: queue device expert H2D for all top-k before any GEMM (same stream).
-    // Skip when fused resident packs exist (same_dev or peer) — those are the source of truth
-    // and VRAM is already tight after full resident upload.
-    if (ex.is_fp8 && !same_dev && ex.gate_up_dev == nullptr) {
+    // Decode-only device Ensure (Touch/fallback). Prefill skips device LRU.
+    if (use_dev_expert_lru) {
       for (int i = 0; i < top_k; ++i) {
         const int e = idx[static_cast<size_t>(i)];
         if (e >= 0 && e < static_cast<int>(E)) {
@@ -634,8 +961,8 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
       }
     }
 
-    // Batched path: VT_GEMMA4_BATCH_EXPERTS=1 (default off).
-    if (batch_experts && ex.is_fp8 && !host_axpy) {
+    // Batched path: VT_GEMMA4_BATCH_EXPERTS=1 (default off). Decode-only device.
+    if (batch_experts && ex.is_fp8 && !host_axpy && T == 1) {
       std::vector<const uint16_t*> gu_ptrs;
       std::vector<const uint16_t*> dn_ptrs;
       gu_ptrs.reserve(static_cast<size_t>(top_k));
@@ -710,6 +1037,7 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
               d.q,
               static_cast<char*>(acc.ptr()) + static_cast<size_t>(t) * static_cast<size_t>(H) * 2,
               ysum.ptr(), static_cast<size_t>(H) * 2);
+          d.b.Synchronize(d.q);
           continue;
         }
       }
@@ -745,32 +1073,42 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
         } else if (ex.is_fp8) {
           const auto& fex = ex.fp8[static_cast<size_t>(e)];
           DequantGemma4Fp8ExpertToBf16Ephemeral(fex, I, H, gu_tmp.data(), dn_tmp.data());
-          ExpertGeGLUHost(d, y, xin.t(), gu_tmp.data(), dn_tmp.data(), I, H, esc);
+          ExpertGeGLUHost(d, y, xin.t(), gu_tmp.data(), dn_tmp.data(), I, H, esc, &fex);
         } else {
           VT_CHECK(gu_host && dn_host, "gemma4 moe: peer fail no host");
           ExpertGeGLUHost(d, y, xin.t(), gu_host + static_cast<int64_t>(e) * gu_stride,
-                          dn_host + static_cast<int64_t>(e) * dn_stride, I, H, esc);
+                          dn_host + static_cast<int64_t>(e) * dn_stride, I, H, esc,
+                          gu_host + static_cast<int64_t>(e) * gu_stride);
         }
       } else if (ex.is_fp8) {
-        const auto& fex = ex.fp8[static_cast<size_t>(e)];
-        if (EnsureGemma4Fp8ExpertOnDevice(d, fex, I, H)) {
-          ExpertGeGLUDeviceAccum(d, ysum, xin.t(), static_cast<const uint16_t*>(fex.dev_gu),
-                                 static_cast<const uint16_t*>(fex.dev_dn), I, H, esc, ww,
-                                 beta);
-          fused_mix = true;
-        } else {
-          EnsureGemma4Fp8ExpertCached(fex, I, H);
-          ExpertGeGLUHost(d, y, xin.t(), fex.cached_gu.data(), fex.cached_dn.data(), I, H,
-                          esc);
-        }
-      } else if (gu_host && dn_host) {
-        ExpertGeGLUHost(d, y, xin.t(), gu_host + static_cast<int64_t>(e) * gu_stride,
-                        dn_host + static_cast<int64_t>(e) * dn_stride, I, H, esc);
+      const auto& fex = ex.fp8[static_cast<size_t>(e)];
+      if (EnsureGemma4Fp8ExpertOnDevice(d, fex, I, H)) {
+        ExpertGeGLUDeviceAccum(d, ysum, xin.t(), static_cast<const uint16_t*>(fex.dev_gu),
+                               static_cast<const uint16_t*>(fex.dev_dn), I, H, esc, ww,
+                               beta);
+        fused_mix = true;
       } else {
-        VT_CHECK(false, "gemma4 moe: no expert weights");
+        // Prefer bounded host BF16 LRU; fall back to stack ephemeral dequant.
+        EnsureGemma4Fp8ExpertCached(fex, I, H);
+        if (!fex.cached_gu.empty() && !fex.cached_dn.empty()) {
+          ExpertGeGLUHost(d, y, xin.t(), fex.cached_gu.data(), fex.cached_dn.data(), I, H, esc,
+                          &fex);
+        } else {
+          DequantGemma4Fp8ExpertToBf16Ephemeral(fex, I, H, gu_tmp.data(), dn_tmp.data());
+          ExpertGeGLUHost(d, y, xin.t(), gu_tmp.data(), dn_tmp.data(), I, H, esc, &fex);
+        }
+      }
+      } else if (gu_host && dn_host) {
+      ExpertGeGLUHost(d, y, xin.t(), gu_host + static_cast<int64_t>(e) * gu_stride,
+                      dn_host + static_cast<int64_t>(e) * dn_stride, I, H, esc,
+                      gu_host + static_cast<int64_t>(e) * gu_stride);
+      } else {
+      VT_CHECK(false, "gemma4 moe: no expert weights");
       }
 
-      if (fused_mix) continue;  // already accumulated into ysum
+      if (fused_mix) {
+        continue;  // already accumulated into ysum (same stream)
+      }
 
       if (host_axpy) {
         d.b.Synchronize(d.q);
@@ -794,6 +1132,8 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     d.b.Copy(d.q,
              static_cast<char*>(acc.ptr()) + static_cast<size_t>(t) * static_cast<size_t>(H) * 2,
              ysum.ptr(), static_cast<size_t>(H) * 2);
+    // One drain per token after all top_k experts (prefill + decode).
+    d.b.Synchronize(d.q);
   }
 
   Gemma4MoeScratch r;
@@ -861,6 +1201,7 @@ bool PeerCopyGemma4ExpertSlice(int, const void*, const void*, int, int64_t, int6
   return false;
 }
 void PinGemma4Fp8ExpertHostCache(const Gemma4Fp8ExpertMats&) {}
+void UnpinGemma4Fp8ExpertHostCache(const Gemma4Fp8ExpertMats&) {}
 #endif  // VLLM_CPP_HIP
 
 }  // namespace vllm

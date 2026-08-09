@@ -174,6 +174,26 @@ to one built without video support. See
 | `--cuda-profile-graph-batch N` | `16` when replays are armed | Batch size the profiler traces. Must not exceed `--max-num-seqs` |
 | `-h`, `--help` | | Print usage and exit |
 
+### Gemma-4 MoE on ROCm (long-prompt / dual-GPU)
+
+`LoadHfConfig` unions `eos_token_id` from **both** `config.json` and sibling
+`generation_config.json` (Gemma-4-26B needs stop ids `[1, 50, 106]` including
+`<turn|>`). Prefer GPU-resident experts when VRAM allows:
+
+```sh
+export VT_GEMMA4_RESIDENT_EXPERTS=1
+export VT_GEMMA4_RESIDENT_GPUS=2   # spread BF16 expert stacks across cards
+export HIP_VISIBLE_DEVICES=0,1
+build-hip/examples/server --model /path/to/gemma-4-26B-A4B-it-fp8 \
+  --host 127.0.0.1 --port 8010 --max-model-len 8192 --max-num-seqs 1 \
+  --no-enable-thinking --verbose
+```
+
+Host BF16 expert packs (when not fully resident) are capped by
+`VT_GEMMA4_HOST_EXPERT_MB` (default 2048). Device expert LRU is off unless
+`VT_GEMMA4_EXPERT_VRAM_MB=N` with optional `VT_GEMMA4_EXPERT_EVICT=1`. See
+[ENVIRONMENT.md](ENVIRONMENT.md) for the full ROCm + Gemma-4 table.
+
 For a production deployment, use [LocalAI](https://localai.io), which can embed
 engines like this behind a model gallery, multi-model serving, the full OpenAI
 API surface, auth, and metrics.

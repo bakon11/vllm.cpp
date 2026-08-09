@@ -150,17 +150,22 @@ Read-only observability; none change output.
 | `VT_H3_ACT_DUMP` | unset | Path to which ONE MiniMax-H3 device DiT forward writes a per-STAGE activation FINGERPRINT: mean/rms/absmax/finite plus a fixed set of positional sample values, for every stage and for the input-independent weight classes (islands, biases, output heads). Two weight arms running the SAME graph on the SAME inputs (e.g. an NVFP4-bf16 stream vs a GGUF-bf16 control) can then be diffed layer by layer: a JUMP at a stage names the guilty tensor class, and a scramble/transpose is caught by the positional samples even when rms matches. This is the instrument that REFUTED a #94 load-path defect (spec §8.12). Byte-identical to production when unset (no file is opened) |
 | `VT_H3_ACT_CALL` | 0 | Which forward `VT_H3_ACT_DUMP` captures, as a 0-based call index within the process. Only that one forward dumps, so a single small render (`--denoise-only --steps 1`) yields exactly one clean fingerprint file instead of 50 overwrites. Read only when `VT_H3_ACT_DUMP` is set |
 
-## ROCm + Gemma-4 residency (contributor #140)
+## ROCm + Gemma-4 residency (contributor #140 + long-prompt lab)
 
-Discrete-ROCm (gfx1201) bring-up knobs from PR #140. Off by default; no effect
-on CUDA/CPU builds beyond the documented behavior.
+Discrete-ROCm (gfx1201) bring-up knobs. Defaults favor GPU-resident MoE when
+VRAM allows; host-stream paths remain for small-VRAM / debug.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `VT_GEMMA4_EXPERT_VRAM_MB` | unlimited (unset or `0`) | A positive MiB value caps the device expert-cache LRU; unset or `0` leaves the cache unlimited |
-| `VT_GEMMA4_RESIDENT_EXPERTS` | unset | `=1` preloads the Gemma-4 MoE experts resident on the GPU(s) after the first use instead of streaming them per step (discrete-ROCm optimization). No-op (with a stderr note) on a binary built without `-DVLLM_CPP_HIP` |
-| `VT_GEMMA4_RESIDENT_GPUS` | `2` | Number of GPUs across which resident Gemma-4 experts are spread; clamped to the ROCm device count. Read only when `VT_GEMMA4_RESIDENT_EXPERTS=1` |
-| `VT_GEMMA4_RESIDENT_MAX_LAYERS` | (all) | Caps how many MoE layers get resident-preloaded, to fit a smaller VRAM budget. Read only when `VT_GEMMA4_RESIDENT_EXPERTS=1` |
+| `VT_GEMMA4_EXPERT_VRAM_MB` | off (`unset` or `0`) | Device expert-cache LRU in MiB. `unset`/`0` disables device expert upload (host path / resident stacks only). `N>0` admits up to N MiB of fill-only device experts (evict only with `VT_GEMMA4_EXPERT_EVICT=1`). Free VRAM is probed via `Backend::DeviceMemoryInfo` before Alloc |
+| `VT_GEMMA4_EXPERT_EVICT` | off | `=1` allows hipFree eviction from the device expert LRU under pressure. Default off — eviction under load has hung ROCm (`kfd_wait`) on gfx1201 |
+| `VT_GEMMA4_HOST_EXPERT_MB` | `2048` | Caps permanent host BF16 expert dequant packs (MiB). Unbounded cache OOM'd ~30G hosts under pollution. `0` = ephemeral dequant only (no retained packs) |
+| `VT_GEMMA4_RESIDENT_EXPERTS` | unset | `=1` preloads MoE experts resident on GPU(s) at prepare (FP8→BF16 stacks today). Preferred path on dual discrete ROCm. No-op without `-DVLLM_CPP_HIP` |
+| `VT_GEMMA4_RESIDENT_GPUS` | `2` | GPUs used to spread resident experts; clamped to device count. Read only when `VT_GEMMA4_RESIDENT_EXPERTS=1` |
+| `VT_GEMMA4_RESIDENT_MAX_LAYERS` | (all) | Caps how many MoE layers get resident-preloaded. Read only when `VT_GEMMA4_RESIDENT_EXPERTS=1` |
+| `VT_GEMMA4_PREFILL_BATCH_MOE` | off | `=1` enables experimental group-by-expert prefill MoE (chunked GEMM + host scatter). Default off on ROCm until fully proven |
+| `VT_GEMMA4_LAYER_TRACE` | off | `=2` logs per-layer attn/moe wall times (and MoE hoist markers). Debug only |
+| `VT_ENGINE_STEP_LOG` | off | `=1` logs EngineCore step begin/end wall times (also enabled by `VT_SERVER_VERBOSE=1`) |
 | `VLLM_CPP_HTTP_FIXED_POOL` | `1` (fixed) | `=0` reverts the HTTP worker pool to the legacy dynamic mode. Production uses the capacity-derived fixed pool; the opt-out exists for same-binary A/B attribution |
 | `VT_ROCM_ATTN_CPU_REF` | unset | `=1` routes ROCm paged attention through the CPU reference kernel instead of the HIP kernel — a correctness A/B for the ROCm attention bring-up |
 | `VT_DEBUG_SAMPLED` | unset | `=1` prints the per-step sampled token id(s) to stderr (sampling-loop debug). Read-only; does not change output. Read once per token, so it does not stall the hot loop |

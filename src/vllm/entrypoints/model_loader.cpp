@@ -1057,6 +1057,14 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     }
   }
   HfConfig config = vllm::LoadHfConfig(config_path);
+  // Surface the effective multi-EOS set (config.json U generation_config.json).
+  if (config.raw.is_object()) {
+    auto it = config.raw.find("eos_token_id");
+    if (it != config.raw.end() && !it->is_null()) {
+      std::cerr << "vllm.cpp: eos_token_id (config U generation_config) = "
+                << it->dump() << "\n";
+    }
+  }
   const ModelRegistration& registration = ModelRegistry::Resolve(config);
   tok::Tokenizer tokenizer = tok::Tokenizer::FromHfJson(tokenizer_path);
 

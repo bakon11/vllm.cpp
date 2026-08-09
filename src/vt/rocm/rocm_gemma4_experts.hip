@@ -241,4 +241,15 @@ void PinGemma4Fp8ExpertHostCache(const Gemma4Fp8ExpertMats& ex) {
   }
 }
 
+void UnpinGemma4Fp8ExpertHostCache(const Gemma4Fp8ExpertMats& ex) {
+  if (!ex.host_pinned) return;
+  if (!ex.cached_gu.empty()) {
+    (void)hipHostUnregister(const_cast<uint16_t*>(ex.cached_gu.data()));
+  }
+  if (!ex.cached_dn.empty()) {
+    (void)hipHostUnregister(const_cast<uint16_t*>(ex.cached_dn.data()));
+  }
+  ex.host_pinned = false;
+}
+
 }  // namespace vllm

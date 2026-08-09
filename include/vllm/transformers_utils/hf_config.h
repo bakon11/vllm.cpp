@@ -111,8 +111,11 @@ struct HfConfig {
   nlohmann::json raw;  // full doc for fields we don't type yet
 };
 
-// Loads and parses `path`. Throws std::runtime_error (message includes the
-// path) on missing file, malformed JSON, or missing required fields.
+// Loads and parses `path` (typically `<model_dir>/config.json`). Also unions
+// sibling `generation_config.json` `eos_token_id` into `raw["eos_token_id"]`
+// when present (HF layout; e.g. Gemma-4 adds `<turn|>` id 50). Throws
+// std::runtime_error (message includes the path) on missing file, malformed
+// JSON, or missing required fields.
 HfConfig LoadHfConfig(const std::string& path);
 
 // Cheap, non-throwing peek at config.json's `architectures` array — empty on
