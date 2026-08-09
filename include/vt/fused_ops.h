@@ -30,4 +30,9 @@ void MatmulBTFp8Channel(Queue& q, void* out, const void* a, const void* b_fp8,
 bool ExpertGeGLUBf16TopKM1(Queue& q, void* ysum, const void* x, const void* const* w_gu,
                            const void* const* w_dn, const float* wts, int G, int I, int H);
 
+// Fused FP8 expert GeGLU top-k (T=1). Uses hipBLASLt FP8 when available, else fast HIP.
+bool ExpertGeGLUFp8TopKM1(Queue& q, void* ysum, const void* x, const void* const* fp8_gu,
+                          const void* const* s_gu, const void* const* fp8_dn,
+                          const void* const* s_dn, const float* wts, int G, int I, int H);
+
 }  // namespace vt

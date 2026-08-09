@@ -160,12 +160,12 @@ VRAM allows; host-stream paths remain for small-VRAM / debug.
 | `VT_GEMMA4_EXPERT_VRAM_MB` | off (`unset` or `0`) | Device expert-cache LRU in MiB. `unset`/`0` disables device expert upload (host path / resident stacks only). `N>0` admits up to N MiB of fill-only device experts (evict only with `VT_GEMMA4_EXPERT_EVICT=1`). Free VRAM is probed via `Backend::DeviceMemoryInfo` before Alloc |
 | `VT_GEMMA4_EXPERT_EVICT` | off | `=1` allows hipFree eviction from the device expert LRU under pressure. Default off — eviction under load has hung ROCm (`kfd_wait`) on gfx1201 |
 | `VT_GEMMA4_HOST_EXPERT_MB` | `2048` | Caps permanent host BF16 expert dequant packs (MiB). Unbounded cache OOM'd ~30G hosts under pollution. `0` = ephemeral dequant only (no retained packs) |
-| `VT_GEMMA4_RESIDENT_EXPERTS` | unset | `=1` preloads MoE experts resident on GPU(s) at prepare. Dual-GPU default packs **BF16** stacks (fast hipBLAS). No-op without `-DVLLM_CPP_HIP` |
+| `VT_GEMMA4_RESIDENT_EXPERTS` | unset | `=1` preloads MoE experts resident on GPU(s). Default packs **native FP8** (fast fused ExpertGeGLU + ½ VRAM). No-op without `-DVLLM_CPP_HIP` |
 | `VT_GEMMA4_RESIDENT_GPUS` | `2` | GPUs used to spread resident experts; clamped to device count. Read only when `VT_GEMMA4_RESIDENT_EXPERTS=1` |
 | `VT_GEMMA4_RESIDENT_MAX_LAYERS` | (all) | Caps how many MoE layers get resident-preloaded. Read only when `VT_GEMMA4_RESIDENT_EXPERTS=1` |
-| `VT_GEMMA4_RESIDENT_NATIVE` | off | `=1` packs **native FP8** expert weights+scales (~½ VRAM vs BF16 expand). Single-GPU auto-enables native unless `VT_GEMMA4_RESIDENT_BF16=1` |
-| `VT_GEMMA4_RESIDENT_BF16` | off | `=1` force BF16 expand resident even on single GPU |
-| `VT_GEMMA4_FP8_NATIVE` | off | `=1` decode via FP8 channel GEMV (needs device FP8 packs or LRU). Default off — prefer BF16 resident hipBLAS |
+| `VT_GEMMA4_RESIDENT_NATIVE` | on | `=0` disables native FP8 packs. Default on: u8 weights + channel scales on device |
+| `VT_GEMMA4_RESIDENT_BF16` | off | `=1` force BF16 expand resident (hipBLAS A/B; ~2× VRAM, usually slower than fused FP8) |
+| `VT_GEMMA4_FP8_NATIVE` | on | `=0` disables fused FP8 expert decode path. Default on when FP8 packs present |
 | `VT_GEMMA4_PREFILL_BATCH_MOE` | off | `=1` enables experimental group-by-expert prefill MoE (chunked GEMM + host scatter). Default off on ROCm until fully proven |
 | `VT_GEMMA4_LAYER_TRACE` | off | `=2` logs per-layer attn/moe wall times (and MoE hoist markers). Debug only |
 | `VT_ENGINE_STEP_LOG` | off | `=1` logs EngineCore step begin/end wall times (also enabled by `VT_SERVER_VERBOSE=1`) |

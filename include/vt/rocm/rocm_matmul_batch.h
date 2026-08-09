@@ -33,4 +33,12 @@ void MatmulBTFp8ChannelRocm(Queue& q, void* out, const void* a, const void* b_fp
                             const void* scale_bf16, int M, int N, int K, float alpha,
                             float beta);
 
+// Fused Expert GeGLU FP8 decode (T=1). Faster than 3× MatmulBTFp8Channel.
+bool ExpertGeGLUFp8M1Rocm(Queue& q, void* y, const void* x, const void* fp8_gu, const void* s_gu,
+                          const void* fp8_dn, const void* s_dn, int I, int H, float alpha,
+                          float beta);
+bool ExpertGeGLUFp8TopKM1Rocm(Queue& q, void* ysum, const void* x, const void* const* fp8_gu,
+                              const void* const* s_gu, const void* const* fp8_dn,
+                              const void* const* s_dn, const float* wts, int G, int I, int H);
+
 }  // namespace vt::rocm

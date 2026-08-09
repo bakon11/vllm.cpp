@@ -131,4 +131,26 @@ bool ExpertGeGLUBf16TopKM1(Queue& q, void* ysum, const void* x, const void* cons
   return false;
 }
 
+bool ExpertGeGLUFp8TopKM1(Queue& q, void* ysum, const void* x, const void* const* fp8_gu,
+                          const void* const* s_gu, const void* const* fp8_dn,
+                          const void* const* s_dn, const float* wts, int G, int I, int H) {
+#if defined(VLLM_CPP_HIP)
+  if (q.device.type == DeviceType::kROCM) {
+    return rocm::ExpertGeGLUFp8TopKM1Rocm(q, ysum, x, fp8_gu, s_gu, fp8_dn, s_dn, wts, G, I, H);
+  }
+#endif
+  (void)q;
+  (void)ysum;
+  (void)x;
+  (void)fp8_gu;
+  (void)s_gu;
+  (void)fp8_dn;
+  (void)s_dn;
+  (void)wts;
+  (void)G;
+  (void)I;
+  (void)H;
+  return false;
+}
+
 }  // namespace vt

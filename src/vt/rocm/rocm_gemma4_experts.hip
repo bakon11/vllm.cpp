@@ -241,16 +241,17 @@ size_t UploadGemma4ExpertsResident(std::vector<Gemma4MoeLayerWeights>& layers,
   int fill_dev = 0;
 
   // FP8 resident mode:
-  // - Default dual-GPU: BF16 expand (hipBLAS; ~2× VRAM, much faster decode).
-  // - VT_GEMMA4_RESIDENT_NATIVE=1 → native FP8 packs (~½ VRAM, GEMV kernel).
-  // - Single GPU auto-prefers native to fit; override with RESIDENT_BF16=1.
+  // Default: native FP8 packs (½ VRAM + fast fused ExpertGeGLU FP8 kernels).
+  // VT_GEMMA4_RESIDENT_BF16=1 forces BF16 expand (hipBLAS reference / A/B).
   static const bool force_bf16 = [] {
     const char* e = std::getenv("VT_GEMMA4_RESIDENT_BF16");
     return e && e[0] == '1';
   }();
   static const bool force_native = [] {
     const char* e = std::getenv("VT_GEMMA4_RESIDENT_NATIVE");
-    return e && e[0] == '1';
+    // Default ON when unset. =0 disables native (use BF16 expand).
+    if (e == nullptr) return true;
+    return e[0] == '1';
   }();
 
   for (size_t li = 0; li < layers.size(); ++li) {
@@ -261,8 +262,7 @@ size_t UploadGemma4ExpertsResident(std::vector<Gemma4MoeLayerWeights>& layers,
     const int64_t E = ex.num_experts;
     const int64_t I = ex.intermediate;
     const int64_t H = ex.hidden;
-    const bool want_native =
-        ex.is_fp8 && !force_bf16 && (force_native || (num_gpus <= 1 && !force_bf16));
+    const bool want_native = ex.is_fp8 && !force_bf16 && force_native;
     const size_t layer_bytes =
         want_native
             ? (static_cast<size_t>(E) * (static_cast<size_t>(2 * I * H) + static_cast<size_t>(H * I) +

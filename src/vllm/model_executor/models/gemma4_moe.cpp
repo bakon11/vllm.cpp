@@ -784,9 +784,10 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
   }();
   static const bool fp8_native = [] {
     const char* e = std::getenv("VT_GEMMA4_FP8_NATIVE");
-    // Default OFF: software FP8 GEMV is slower/riskier than BF16 hipBLAS resident.
-    // Enable with =1 (or use VT_GEMMA4_RESIDENT_NATIVE=1 at load for packs).
-    return e && e[0] == '1';
+    // Default ON: use fused FP8 expert kernels when packs/LRU available.
+    // =0 forces BF16 device/host paths only.
+    if (e == nullptr) return true;
+    return e[0] == '1';
   }();
   static const bool custom_expert = [] {
     const char* e = std::getenv("VT_GEMMA4_CUSTOM_EXPERT");
@@ -1059,10 +1060,8 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
       fdn.reserve(static_cast<size_t>(top_k));
       sdn.reserve(static_cast<size_t>(top_k));
       bool ok = true;
-      // Peer path: copy each expert into scratch one at a time into a packed TLS
-      // would need G packs — fall back to serial ExpertGeGLUFp8Native with peer.
       if (fp8_res_peer) {
-        ok = false;
+        ok = false;  // serial peer path below
       } else {
         for (int i = 0; i < top_k && ok; ++i) {
           const int e = idx[static_cast<size_t>(i)];
@@ -1082,14 +1081,22 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
           }
         }
       }
-      if (ok && static_cast<int>(fgu.size()) == top_k &&
-          ExpertGeGLUFp8TopKFusedGelu(d, ysum, xin.t(), fgu.data(), sgu.data(), fdn.data(),
-                                      sdn.data(), wts.data(), top_k, I, H)) {
+      bool ran = false;
+      if (ok && static_cast<int>(fgu.size()) == top_k) {
+        // Prefer fused HIP expert kernel (vectorized FP8) over 3× channel GEMV.
+        ran = vt::ExpertGeGLUFp8TopKM1(d.q, ysum.ptr(), xin.ptr(), fgu.data(), sgu.data(),
+                                       fdn.data(), sdn.data(), wts.data(), top_k,
+                                       static_cast<int>(I), static_cast<int>(H));
+        if (!ran) {
+          ran = ExpertGeGLUFp8TopKFusedGelu(d, ysum, xin.t(), fgu.data(), sgu.data(), fdn.data(),
+                                            sdn.data(), wts.data(), top_k, I, H);
+        }
+      }
+      if (ran) {
         d.b.Copy(
             d.q,
             static_cast<char*>(acc.ptr()) + static_cast<size_t>(t) * static_cast<size_t>(H) * 2,
             ysum.ptr(), static_cast<size_t>(H) * 2);
-        // One drain per token on full device path (not per expert).
         d.b.Synchronize(d.q);
         continue;
       }
