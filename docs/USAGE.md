@@ -184,6 +184,7 @@ to one built without video support. See
 export VT_GEMMA4_RESIDENT_EXPERTS=1
 export VT_GEMMA4_RESIDENT_GPUS=2   # spread BF16 expert stacks across cards
 export HIP_VISIBLE_DEVICES=0,1
+# optional VRAM saver (slower GEMV): export VT_GEMMA4_RESIDENT_NATIVE=1
 build-hip/examples/server --model /path/to/gemma-4-26B-A4B-it-fp8 \
   --host 127.0.0.1 --port 8010 --max-model-len 8192 --max-num-seqs 1 \
   --no-enable-thinking --verbose
@@ -191,8 +192,9 @@ build-hip/examples/server --model /path/to/gemma-4-26B-A4B-it-fp8 \
 
 Host BF16 expert packs (when not fully resident) are capped by
 `VT_GEMMA4_HOST_EXPERT_MB` (default 2048). Device expert LRU is off unless
-`VT_GEMMA4_EXPERT_VRAM_MB=N` with optional `VT_GEMMA4_EXPERT_EVICT=1`. See
-[ENVIRONMENT.md](ENVIRONMENT.md) for the full ROCm + Gemma-4 table.
+`VT_GEMMA4_EXPERT_VRAM_MB=N` with optional `VT_GEMMA4_EXPERT_EVICT=1`.
+Dual-GPU default packs BF16 (fast); `VT_GEMMA4_RESIDENT_NATIVE=1` packs native
+FP8 (~half VRAM). See [ENVIRONMENT.md](ENVIRONMENT.md) for the full table.
 
 For a production deployment, use [LocalAI](https://localai.io), which can embed
 engines like this behind a model gallery, multi-model serving, the full OpenAI

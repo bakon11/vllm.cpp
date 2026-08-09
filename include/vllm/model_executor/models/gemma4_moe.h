@@ -49,6 +49,13 @@ struct Gemma4FusedExperts {
   // Optional device-resident BF16 fused stacks after Prepare.
   mutable void* gate_up_dev = nullptr;
   mutable void* down_dev = nullptr;
+  // Native FP8 layer packs (preferred for is_fp8 resident). Per-expert
+  // dev_fp8_* / dev_s_* point into these bases; free bases on teardown only.
+  mutable void* fp8_gu_base = nullptr;   // u8 [E, 2I, H]
+  mutable void* fp8_dn_base = nullptr;   // u8 [E, H, I]
+  mutable void* fp8_sgu_base = nullptr;  // bf16 [E, 2I]
+  mutable void* fp8_sdn_base = nullptr;  // bf16 [E, H]
+  mutable bool fp8_native_resident = false;
   mutable int dev_id = -1;
   bool Empty() const { return gate_up.Empty() && fp8.empty(); }
 };
@@ -80,12 +87,18 @@ size_t UploadGemma4ExpertsResident(std::vector<Gemma4MoeLayerWeights>& layers,
                                    int num_gpus);
 size_t UploadGemma4ExpertsResidentForWeights(Gemma4Weights& weights, int num_gpus);
 
-// Peer-copy one resident expert (fused stacks on src_dev) into dst buffers on
+// Peer-copy one resident expert (fused BF16 stacks on src_dev) into dst buffers on
 // compute_dev. Returns false if peer path unavailable.
 bool PeerCopyGemma4ExpertSlice(int src_dev, const void* gate_up_base,
                                const void* down_base, int expert_id, int64_t I,
                                int64_t H, int compute_dev, void* gate_up_dst,
                                void* down_dst);
+
+// Peer-copy one native FP8 expert (weights+scales) into compute_dev dsts.
+bool PeerCopyGemma4Fp8ExpertSlice(int src_dev, const void* fp8_gu, const void* fp8_dn,
+                                  const void* s_gu, const void* s_dn, int64_t I, int64_t H,
+                                  int compute_dev, void* fp8_gu_dst, void* fp8_dn_dst,
+                                  void* s_gu_dst, void* s_dn_dst);
 
 // hipHostRegister BF16 expert cache for faster H2D (no-op if already pinned).
 void PinGemma4Fp8ExpertHostCache(const Gemma4Fp8ExpertMats& ex);

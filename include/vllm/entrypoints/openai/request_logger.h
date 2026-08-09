@@ -38,9 +38,11 @@ void LogRequestReceived(const std::string& request_id, const std::string& endpoi
 void LogRequestStage(const std::string& request_id, const std::string& stage);
 
 // Completion of a request.
+// prefill_sec >= 0: also log decode_tok_s = completion / (elapsed - prefill).
 void LogRequestFinished(const std::string& request_id, int prompt_tokens,
                         int completion_tokens, const std::string& finish_reason,
-                        double elapsed_sec, const std::string& output_text);
+                        double elapsed_sec, const std::string& output_text,
+                        double prefill_sec = -1.0);
 
 // Errors.
 void LogRequestError(const std::string& request_id, const std::string& endpoint,

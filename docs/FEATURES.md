@@ -309,4 +309,4 @@ mark on this page moved**. An inventoried backend is not a supported one, and th
 holds for the 31 architectures inventoried on 2026-08-05. A row's lifecycle state and its support mark
 are independent: see [STATUS.md](STATUS.md). Parakeet ASR (encoder + CTC/RNN-T/TDT) runs natively on CPU, 4 checkpoints token-exact vs HF.
 
-| Gemma4 MoE ROCm fused helpers (`vt::fused_ops`) | partial | Multi-EOS from generation_config; host expert LRU; device fill-only expert LRU; dual-GPU resident experts; step/layer debug envs. |
+| Gemma4 MoE ROCm fused helpers (`vt::fused_ops`) | partial | Multi-EOS; host expert LRU; dual-GPU resident BF16 (default) or native FP8 packs; fused top-k device MoE; step/layer debug. |

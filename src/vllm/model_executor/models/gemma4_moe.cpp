@@ -99,18 +99,58 @@ void ExpertGeGLUFp8Native(Dev d, DBuf& out, const Tensor& x, const void* fp8_gu,
   vt::MatmulBTFp8Channel(d.q, s.gu.ptr(), x.data, fp8_gu, s_gu, /*M=*/1,
                                    static_cast<int>(2 * I), static_cast<int>(H), 1.f, 0.f);
   vt::GeluAndMul(d.q, s.act.t(), s.gu.t());
-  if (beta == 0.f) {
-    vt::MatmulBTFp8Channel(d.q, out.ptr(), s.act.ptr(), fp8_dn, s_dn, /*M=*/1,
-                                     static_cast<int>(H), static_cast<int>(I), alpha, 0.f);
-  } else {
-    DBuf ytmp(d, DType::kBF16, {1, H});
-    vt::MatmulBTFp8Channel(d.q, ytmp.ptr(), s.act.ptr(), fp8_dn, s_dn, /*M=*/1,
-                                     static_cast<int>(H), static_cast<int>(I), 1.f, 0.f);
-    vt::MulScalar(d.q, out.t(), out.t(), static_cast<double>(beta));
-    DBuf ysc(d, DType::kBF16, {1, H});
-    vt::MulScalar(d.q, ysc.t(), ytmp.t(), static_cast<double>(alpha));
-    vt::Add(d.q, out.t(), out.t(), ysc.t());
+  // Channel GEMV supports alpha/beta accumulate into out.
+  vt::MatmulBTFp8Channel(d.q, out.ptr(), s.act.ptr(), fp8_dn, s_dn, /*M=*/1,
+                                   static_cast<int>(H), static_cast<int>(I), alpha, beta);
+}
+
+// Top-k FP8 native: gate_up×G → one GeluAndMul → down×G (alpha/beta mix). Decode M=1.
+bool ExpertGeGLUFp8TopKFusedGelu(Dev d, DBuf& ysum, const Tensor& x, const void* const* fp8_gu,
+                                 const void* const* s_gu, const void* const* fp8_dn,
+                                 const void* const* s_dn, const float* wts, int G, int64_t I,
+                                 int64_t H) {
+  if (G <= 0 || x.shape[0] != 1) return false;
+  struct Tls {
+    int dev = -1;
+    int Gcap = 0;
+    int64_t I = 0, H = 0;
+    std::optional<DBuf> gu;   // [G, 2I]
+    std::optional<DBuf> act;  // [G, I]
+  };
+  static thread_local Tls tls;
+  if (tls.dev != d.q.device.index || tls.Gcap < G || tls.I != I || tls.H != H) {
+    tls.gu.emplace(d, DType::kBF16, std::vector<int64_t>{G, 2 * I});
+    tls.act.emplace(d, DType::kBF16, std::vector<int64_t>{G, I});
+    tls.dev = d.q.device.index;
+    tls.Gcap = G;
+    tls.I = I;
+    tls.H = H;
   }
+  const vt::Device dev = d.q.device;
+  const size_t gu_row = static_cast<size_t>(2 * I) * 2;
+  const size_t act_row = static_cast<size_t>(I) * 2;
+  const int Ngu = static_cast<int>(2 * I);
+  const int Nh = static_cast<int>(H);
+  const int Ki = static_cast<int>(I);
+  const int Kh = static_cast<int>(H);
+
+  for (int g = 0; g < G; ++g) {
+    void* gu_out = static_cast<char*>(tls.gu->ptr()) + static_cast<size_t>(g) * gu_row;
+    vt::MatmulBTFp8Channel(d.q, gu_out, x.data, fp8_gu[g], s_gu[g], /*M=*/1, Ngu, Kh, 1.f, 0.f);
+  }
+  Tensor gu_all = Tensor::Contiguous(static_cast<uint16_t*>(tls.gu->ptr()), DType::kBF16, dev,
+                                     {G, 2 * I});
+  Tensor act_all = Tensor::Contiguous(static_cast<uint16_t*>(tls.act->ptr()), DType::kBF16, dev,
+                                      {G, I});
+  vt::GeluAndMul(d.q, act_all, gu_all);
+  for (int g = 0; g < G; ++g) {
+    const float alpha = wts[g];
+    const float beta = (g == 0) ? 0.f : 1.f;
+    void* act_g = static_cast<char*>(tls.act->ptr()) + static_cast<size_t>(g) * act_row;
+    vt::MatmulBTFp8Channel(d.q, ysum.ptr(), act_g, fp8_dn[g], s_dn[g], /*M=*/1, Nh, Ki, alpha,
+                           beta);
+  }
+  return true;
 }
 
 // Top-k experts: all gate_up GEMMs → one GeluAndMul → all down GEMMs (alpha/beta mix).
@@ -659,6 +699,13 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
   const int64_t dn_stride = H * I;
   const bool same_dev =
       ex.gate_up_dev != nullptr && ex.down_dev != nullptr && ex.dev_id == compute_dev;
+  const bool fp8_res =
+      ex.fp8_native_resident && !ex.fp8.empty() && ex.fp8[0].dev_fp8_gu != nullptr &&
+      ex.dev_id >= 0;
+  const bool fp8_res_same = fp8_res && ex.dev_id == compute_dev;
+  const bool fp8_res_peer = fp8_res && ex.dev_id != compute_dev;
+  const bool need_peer_sc = (!same_dev && ex.gate_up_dev && ex.down_dev && ex.dev_id >= 0) ||
+                            fp8_res_peer;
 
   const auto* gu_host = ex.gate_up.Empty()
                             ? nullptr
@@ -676,7 +723,9 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     std::unique_ptr<ExpertScratch> esc;
     std::optional<DBuf> xin, ysum, y, ysc;
     std::optional<DBuf> gu_sc, dn_sc;
+    std::optional<DBuf> fp8_gu_sc, fp8_dn_sc, fp8_sgu_sc, fp8_sdn_sc;
     bool have_peer = false;
+    bool have_fp8_peer = false;
     std::vector<uint16_t> gu_tmp, dn_tmp;
   };
   static thread_local MoeTlsScratch tls;
@@ -688,7 +737,12 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     tls.ysc.emplace(d, DType::kBF16, std::vector<int64_t>{1, H});
     tls.gu_sc.reset();
     tls.dn_sc.reset();
+    tls.fp8_gu_sc.reset();
+    tls.fp8_dn_sc.reset();
+    tls.fp8_sgu_sc.reset();
+    tls.fp8_sdn_sc.reset();
     tls.have_peer = false;
+    tls.have_fp8_peer = false;
     tls.gu_tmp.clear();
     tls.dn_tmp.clear();
     tls.dev = compute_dev;
@@ -700,12 +754,17 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
   DBuf& ysum = *tls.ysum;
   DBuf& y = *tls.y;
   DBuf& ysc = *tls.ysc;
-  const bool need_peer_sc =
-      ex.gate_up_dev != nullptr && ex.down_dev != nullptr && !same_dev;
-  if (need_peer_sc && !tls.have_peer) {
+  if (need_peer_sc && !fp8_res_peer && !tls.have_peer) {
     tls.gu_sc.emplace(d, DType::kBF16, std::vector<int64_t>{2 * I, H});
     tls.dn_sc.emplace(d, DType::kBF16, std::vector<int64_t>{H, I});
     tls.have_peer = true;
+  }
+  if (fp8_res_peer && !tls.have_fp8_peer) {
+    tls.fp8_gu_sc.emplace(d, DType::kI8, std::vector<int64_t>{2 * I * H});
+    tls.fp8_dn_sc.emplace(d, DType::kI8, std::vector<int64_t>{H * I});
+    tls.fp8_sgu_sc.emplace(d, DType::kBF16, std::vector<int64_t>{2 * I});
+    tls.fp8_sdn_sc.emplace(d, DType::kBF16, std::vector<int64_t>{H});
+    tls.have_fp8_peer = true;
   }
   std::optional<DBuf>& gu_sc = tls.gu_sc;
   std::optional<DBuf>& dn_sc = tls.dn_sc;
@@ -725,6 +784,8 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
   }();
   static const bool fp8_native = [] {
     const char* e = std::getenv("VT_GEMMA4_FP8_NATIVE");
+    // Default OFF: software FP8 GEMV is slower/riskier than BF16 hipBLAS resident.
+    // Enable with =1 (or use VT_GEMMA4_RESIDENT_NATIVE=1 at load for packs).
     return e && e[0] == '1';
   }();
   static const bool custom_expert = [] {
@@ -746,14 +807,17 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
   // Lazy Ensure only (below). Bulk hoist removed — was the pollution hang site.
   (void)moe_trace;
 
-  // Prefill batch MoE: DEFAULT OFF. Chunked host-scatter still kfd_wait-hangs on
-  // long prefill (~T=400 l=9) under ROCm. Serial token MoE + EXPERT_VRAM_MB=0 is
-  // the pollution-stable path. Enable: VT_GEMMA4_PREFILL_BATCH_MOE=1.
-  static const bool prefill_batch_moe = [] {
+  // Prefill batch MoE: ON when BF16 device-resident same GPU (group-by-expert).
+  // Native FP8 is M=1 GEMV — stay serial. Explicit 0/1 overrides.
+  static const int prefill_batch_env = [] {
     const char* e = std::getenv("VT_GEMMA4_PREFILL_BATCH_MOE");
-    return e != nullptr && e[0] == '1' && e[1] == '\0';
+    if (e == nullptr) return -1;  // auto
+    return (e[0] == '1') ? 1 : 0;
   }();
-  if (T > 1 && prefill_batch_moe && !host_axpy) {
+  const bool prefill_batch_moe =
+      (T > 1) && !host_axpy &&
+      ((prefill_batch_env == 1) || (prefill_batch_env < 0 && same_dev));
+  if (prefill_batch_moe) {
     const vt::Device dev = d.q.device;
     std::vector<std::vector<int32_t>> etok(static_cast<size_t>(E));
     std::vector<std::vector<float>> ewt(static_cast<size_t>(E));
@@ -987,9 +1051,54 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
       }
     }
 
-    // Fused-Gelu top-k: gate_up×G → one GeluAndMul → down×G (default BF16 device path).
+    // Fused-Gelu top-k FP8 native (resident or LRU). xin is always 1×H in this loop.
+    if (!host_axpy && (fp8_native || fp8_res) && ex.is_fp8) {
+      std::vector<const void*> fgu, sgu, fdn, sdn;
+      fgu.reserve(static_cast<size_t>(top_k));
+      sgu.reserve(static_cast<size_t>(top_k));
+      fdn.reserve(static_cast<size_t>(top_k));
+      sdn.reserve(static_cast<size_t>(top_k));
+      bool ok = true;
+      // Peer path: copy each expert into scratch one at a time into a packed TLS
+      // would need G packs — fall back to serial ExpertGeGLUFp8Native with peer.
+      if (fp8_res_peer) {
+        ok = false;
+      } else {
+        for (int i = 0; i < top_k && ok; ++i) {
+          const int e = idx[static_cast<size_t>(i)];
+          const auto& fex = ex.fp8[static_cast<size_t>(e)];
+          if (fex.dev_fp8_gu && fex.dev_fp8_dn && fex.dev_s_gu && fex.dev_s_dn) {
+            fgu.push_back(fex.dev_fp8_gu);
+            sgu.push_back(fex.dev_s_gu);
+            fdn.push_back(fex.dev_fp8_dn);
+            sdn.push_back(fex.dev_s_dn);
+          } else if (EnsureGemma4Fp8NativeOnDevice(d, fex, I, H)) {
+            fgu.push_back(fex.dev_fp8_gu);
+            sgu.push_back(fex.dev_s_gu);
+            fdn.push_back(fex.dev_fp8_dn);
+            sdn.push_back(fex.dev_s_dn);
+          } else {
+            ok = false;
+          }
+        }
+      }
+      if (ok && static_cast<int>(fgu.size()) == top_k &&
+          ExpertGeGLUFp8TopKFusedGelu(d, ysum, xin.t(), fgu.data(), sgu.data(), fdn.data(),
+                                      sdn.data(), wts.data(), top_k, I, H)) {
+        d.b.Copy(
+            d.q,
+            static_cast<char*>(acc.ptr()) + static_cast<size_t>(t) * static_cast<size_t>(H) * 2,
+            ysum.ptr(), static_cast<size_t>(H) * 2);
+        // One drain per token on full device path (not per expert).
+        d.b.Synchronize(d.q);
+        continue;
+      }
+    }
+
+    // Fused-Gelu top-k BF16 device path (resident gate_up_dev or LRU BF16).
     // Optional custom RDNA4 expert kernels: VT_GEMMA4_CUSTOM_EXPERT=1
-    if (!host_axpy && T == 1 && !fp8_native) {
+    // Always try when BF16 stacks are on this GPU; peer BF16 uses serial+PeerCopy.
+    if (!host_axpy && !fp8_res) {
       std::vector<const uint16_t*> gu_p, dn_p;
       gu_p.reserve(static_cast<size_t>(top_k));
       dn_p.reserve(static_cast<size_t>(top_k));
@@ -1056,7 +1165,23 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
             static_cast<const uint16_t*>(ex.down_dev) + static_cast<int64_t>(e) * dn_stride;
         ExpertGeGLUDeviceAccum(d, ysum, xin.t(), gu, dn, I, H, esc, ww, beta);
         fused_mix = true;
-      } else if (fp8_native && ex.is_fp8 && T == 1) {
+      } else if (fp8_res_same && ex.is_fp8) {
+        const auto& fex = ex.fp8[static_cast<size_t>(e)];
+        ExpertGeGLUFp8Native(d, ysum, xin.t(), fex.dev_fp8_gu, fex.dev_s_gu, fex.dev_fp8_dn,
+                             fex.dev_s_dn, I, H, esc, ww, beta);
+        fused_mix = true;
+      } else if (fp8_res_peer && ex.is_fp8 && tls.fp8_gu_sc && tls.fp8_dn_sc && tls.fp8_sgu_sc &&
+                 tls.fp8_sdn_sc) {
+        const auto& fex = ex.fp8[static_cast<size_t>(e)];
+        if (PeerCopyGemma4Fp8ExpertSlice(ex.dev_id, fex.dev_fp8_gu, fex.dev_fp8_dn, fex.dev_s_gu,
+                                         fex.dev_s_dn, I, H, compute_dev, tls.fp8_gu_sc->ptr(),
+                                         tls.fp8_dn_sc->ptr(), tls.fp8_sgu_sc->ptr(),
+                                         tls.fp8_sdn_sc->ptr())) {
+          ExpertGeGLUFp8Native(d, ysum, xin.t(), tls.fp8_gu_sc->ptr(), tls.fp8_sgu_sc->ptr(),
+                               tls.fp8_dn_sc->ptr(), tls.fp8_sdn_sc->ptr(), I, H, esc, ww, beta);
+          fused_mix = true;
+        }
+      } else if (fp8_native && ex.is_fp8) {
         const auto& fex = ex.fp8[static_cast<size_t>(e)];
         if (EnsureGemma4Fp8NativeOnDevice(d, fex, I, H)) {
           ExpertGeGLUFp8Native(d, ysum, xin.t(), fex.dev_fp8_gu, fex.dev_s_gu, fex.dev_fp8_dn,
@@ -1198,6 +1323,10 @@ bool RunGemma4FusedTopkExpertGeGLU(vt::Queue&, void*, const void*, const uint16_
 }
 bool PeerCopyGemma4ExpertSlice(int, const void*, const void*, int, int64_t, int64_t, int, void*,
                                void*) {
+  return false;
+}
+bool PeerCopyGemma4Fp8ExpertSlice(int, const void*, const void*, const void*, const void*, int64_t,
+                                  int64_t, int, void*, void*, void*, void*) {
   return false;
 }
 void PinGemma4Fp8ExpertHostCache(const Gemma4Fp8ExpertMats&) {}
