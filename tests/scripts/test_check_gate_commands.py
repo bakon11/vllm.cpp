@@ -245,6 +245,19 @@ class RatchetTests(unittest.TestCase):
         runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
+    def test_live_row_audit_demotions_are_not_in_runnable_baseline(self):
+        # 2026-08-08 abandoned ACTIVE->SPIKE: these IDs left the gated population
+        # and must stay out of RUNNABLE_BASELINE until they regain ACTIVE/GATING
+        # with real Git evidence.
+        demoted = {
+            "BACKEND-CUDA-ARCH-ADDITIVITY",
+            "BACKEND-METAL-MLX",
+            "MODEL-TEXT-glm4-moe-lite-glm4-moe-lite-for-causal-lm",
+            "QUANT-NVFP4-CT-W4A16",
+            "SERVE-POOLING-ENDPOINTS",
+        }
+        self.assertTrue(demoted.isdisjoint(gates.RUNNABLE_BASELINE))
+
     def test_a_row_that_loses_its_command_is_refused(self):
         # Still present, still gated, no longer runnable -- a real regression.
         victim = sorted(gates.RUNNABLE_BASELINE)[0]

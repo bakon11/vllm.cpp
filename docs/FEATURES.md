@@ -309,3 +309,4 @@ holds for the 31 architectures inventoried on 2026-08-05. A row's lifecycle stat
 are independent: see [STATUS.md](STATUS.md). Parakeet ASR (encoder + CTC/RNN-T/TDT) runs natively on CPU, 4 checkpoints token-exact vs HF.
 
 | Gemma4 MoE ROCm fused helpers (`vt::fused_ops`) | partial | Portable seam; ROCm fast path; CPU/Vulkan link |
+| Live-row audit demotion (abandoned ACTIVE->SPIKE) | done | Matrices only; unblocks agent-record |

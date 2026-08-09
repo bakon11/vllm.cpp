@@ -234,8 +234,11 @@ def audit() -> list[dict]:
 RUNNABLE_BASELINE = frozenset({
     "ATTN-CHUNKED-LOCAL",
     "ATTN-ROPE-FAMILY",
-    "BACKEND-CUDA-ARCH-ADDITIVITY",
-    "BACKEND-METAL-MLX",
+    # Live-row audit 2026-08-08: demoted abandoned ACTIVE -> SPIKE (no branch /
+    # no main commit mentioning the row ID). Left gated population; re-pin:
+    # BACKEND-CUDA-ARCH-ADDITIVITY, BACKEND-METAL-MLX,
+    # MODEL-TEXT-glm4-moe-lite-glm4-moe-lite-for-causal-lm, QUANT-NVFP4-CT-W4A16,
+    # SERVE-POOLING-ENDPOINTS.
     "BACKEND-VULKAN",
     "ENG-ASYNC-SCHED",
     "ENG-CORE-BUSY-LOOP",
@@ -244,21 +247,13 @@ RUNNABLE_BASELINE = frozenset({
     "KERNEL-GEMM-CPU-ELEM",
     "KV-CHUNKED-LOCAL-SPEC",
     "KV-SLIDING-LOCAL-SPECS",
-    # ARCH-ONE-SURFACE ROW 6 (2026-08-08): SERVE remains gated, while the
-    # merged MODEL row legitimately moved ACTIVE -> PARTIAL because only one
-    # of eight upstream embedding memberships is live. Re-pin removes that
-    # model row from this lifecycle-scoped runnable population; its completed
-    # fold commands remain preserved in embeddings-one-surface.md.
-    "SERVE-POOLING-ENDPOINTS",
     "KV-SLIDING-WINDOW-SPEC",
     "LOAD-SAFETENSORS-DIRECT-DENSE",
     "MODEL-FACTORY-registry",
     "MODEL-TEXT-deepseek-v2-glm-moe-dsa-for-causal-lm",
     "MODEL-TEXT-gemma4-gemma4-for-causal-lm",
     "MODEL-TEXT-glm4-glm4-for-causal-lm",
-    "MODEL-TEXT-glm4-moe-lite-glm4-moe-lite-for-causal-lm",
     "QUANT-GGUF-COMPUTE",
-    "QUANT-NVFP4-CT-W4A16",
     "SERVE-ASYNC-LLM",
     "SERVE-HTTP-TRANSPORT",
     "SERVE-STREAM-USAGE",
