@@ -103,8 +103,7 @@ void MaybeLogPrefillProgress(const Request& request,
                 << " computed=" << std::min(computed, prompt) << "/" << prompt
                 << " (100%) status=done"
                 << " tok_s=" << avg_tps
-                << " elapsed_s=" << elapsed << "
-";
+                << " elapsed_s=" << elapsed << '\n';
       std::cerr.flush();
       st.logged_done = true;
     }
@@ -131,8 +130,7 @@ void MaybeLogPrefillProgress(const Request& request,
       100.0 * static_cast<double>(shown) / static_cast<double>(prompt);
   std::cerr << "INFO prefill id=" << request.request_id << " computed=" << shown
             << "/" << prompt << " (" << pct << "%) status=running"
-            << " tok_s=" << inst_tps << " avg_tok_s=" << avg_tps << "
-";
+            << " tok_s=" << inst_tps << " avg_tok_s=" << avg_tps << '\n';
   std::cerr.flush();
 }
 
