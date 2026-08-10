@@ -1004,3 +1004,7 @@ were removed when the example became a thin ABI client; see the header comment i
 Served over HTTP too: pass `--video-dit` (plus the VAEs and configs) to `examples/server` and
 `POST /v1/videos`, `POST /v1/videos/sync` and `GET /v1/videos/{id}` register. Without it the
 routes stay unregistered.
+
+## Scheduler fail-fast (KV too small)
+
+If a waiting prompt cannot fit in the configured KV pool (`--num-blocks` / `--kv-cache-memory` / max model len) while nothing is running, the scheduler **aborts immediately** with a finished-aborted status instead of spinning forever at `model_executed=0`. Adequately sized requests are unchanged.

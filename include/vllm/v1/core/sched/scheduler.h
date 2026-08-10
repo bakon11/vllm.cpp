@@ -153,6 +153,14 @@ class Scheduler {
   void finish_requests(const std::string& request_id,
                        RequestStatus finished_status);
 
+
+  // When RUNNING is empty but WAITING requests can never admit (KV pool too
+  // small for full_sequence_must_fit / free blocks), abort the head waiter(s)
+  // so AsyncLLM does not spin forever at model_executed=0. Returns aborted ids
+  // for the engine to emit FinishReason::kAbort to clients. Also tries one
+  // prefix-cache reset when APC is holding the only free blocks.
+  std::vector<std::string> abort_unschedulable_waiting();
+
   // schedule(): the core token-budget algorithm. See the file header.
   SchedulerOutput schedule();
 

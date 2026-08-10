@@ -184,7 +184,30 @@ void EngineCoreProc::process_input_queue() {
 bool EngineCoreProc::process_engine_step() {
   // core.py:1300-1318. "Called only when there are unfinished local requests."
   // core.py:1303: step the engine core.
+  static const bool kStepHb = [] {
+    const char* e = std::getenv("VT_ENGINE_STEP_LOG");
+    if (e != nullptr && e[0] == '1') return true;
+    return false;
+  }();
+  const double t0 = MonotonicSeconds();
+  if (kStepHb) {
+    std::fprintf(stderr,
+                 "INFO core-step begin unfinished=%d finished_pending=%d\n",
+                 scheduler_.get_num_unfinished_requests(),
+                 scheduler_.has_finished_requests() ? 1 : 0);
+    std::fflush(stderr);
+  }
   auto [outputs, model_executed] = (this->*step_fn_)();
+  if (kStepHb) {
+    int n_out = 0;
+    for (const auto& kv : outputs) {
+      n_out += static_cast<int>(kv.second.outputs.size());
+    }
+    std::fprintf(stderr,
+                 "INFO core-step end model_executed=%d n_out=%d elapsed_s=%.3f\n",
+                 model_executed ? 1 : 0, n_out, MonotonicSeconds() - t0);
+    std::fflush(stderr);
+  }
   // core.py:1305-1306: put EngineCoreOutputs into the output queue.
   for (auto& [client_index, engine_core_outputs] : outputs) {
     EngineCoreOutputItem out;
@@ -204,6 +227,16 @@ bool EngineCoreProc::process_engine_step() {
   // so the `step()` path calling post_step internally and this call cannot
   // double-install, and a step that proposed nothing pulls nullopt.
   post_step(model_executed);
+
+  // Lab reliability: unfinished WAITING that can never admit (KV too small
+  // for Hermes SOUL etc.) used to spin forever at model_executed=0.
+  if (!model_executed && scheduler_.get_num_unfinished_requests() > 0) {
+    std::vector<std::string> aborted = scheduler_.abort_unschedulable_waiting();
+    if (!aborted.empty()) {
+      // finish_requests already ran inside abort_unschedulable_waiting.
+      send_finish_outputs(aborted, FinishReason::kAbort);
+    }
+  }
 
   // core.py:1314: `if not model_executed and self.scheduler.has_requests():`
   // yield briefly (upstream: lets KV-connector background threads take the GIL;

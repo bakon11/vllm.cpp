@@ -1147,4 +1147,93 @@ SchedulerStats Scheduler::make_stats() const {
   return stats;
 }
 
+std::vector<std::string> Scheduler::abort_unschedulable_waiting() {
+  // Deadlock class (lab 2026-08-09): Hermes full SOUL (~35k tok) with default
+  // num_blocks=256 (8k tok capacity) → allocate_slots fails forever while
+  // running is empty → core-step unfinished>0 model_executed=0 spin, GPU idle.
+  std::vector<std::string> aborted;
+  if (!running.empty() || waiting == nullptr || waiting->empty()) {
+    return aborted;
+  }
+
+  // One APC reset attempt: cached prefix blocks can pin the whole pool even
+  // with no RUNNING request.
+  bool tried_reset = false;
+  while (!waiting->empty()) {
+    Request* request = waiting->peek_request();
+    if (request == nullptr) break;
+
+    int num_computed_tokens = 0;
+    // Pure prefix match count — do NOT call get_computed_blocks here (it
+    // records prefix_cache_stats and would double-count every stall step).
+    // Real admission still uses get_computed_blocks in schedule().
+    KVCacheBlocks new_computed_blocks = kv_cache_manager->empty_kv_cache_blocks;
+    if (request->num_computed_tokens == 0) {
+      num_computed_tokens =
+          static_cast<int>(kv_cache_manager->num_matched_prefix_tokens(*request));
+    } else {
+      num_computed_tokens = request->num_computed_tokens;
+    }
+    int num_new_tokens = request->NumTokens() - num_computed_tokens;
+    if (num_new_tokens <= 0) {
+      // Nothing to compute — should not stay waiting; abort defensively.
+      const std::string id = request->request_id;
+      std::cerr << "ERROR schedule: waiting request id=" << id
+                << " has num_new_tokens<=0 — aborting\n";
+      std::cerr.flush();
+      finish_requests(id, RequestStatus::kFinishedAborted);
+      aborted.push_back(id);
+      continue;
+    }
+    if (0 < long_prefill_token_threshold_ &&
+        long_prefill_token_threshold_ < num_new_tokens) {
+      num_new_tokens = long_prefill_token_threshold_;
+    }
+    num_new_tokens = std::min(num_new_tokens, max_num_scheduled_tokens);
+    if (num_new_tokens <= 0) break;
+
+    std::optional<KVCacheBlocks> new_blocks = kv_cache_manager->allocate_slots(
+        *request, num_new_tokens, /*num_new_computed_tokens=*/num_computed_tokens,
+        new_computed_blocks, /*num_lookahead_tokens=*/num_lookahead_tokens_,
+        /*num_external_computed_tokens=*/0, /*delay_cache_blocks=*/false,
+        /*num_encoder_tokens=*/0,
+        /*full_sequence_must_fit=*/scheduler_reserve_full_isl_,
+        /*reserved_blocks=*/0, /*has_scheduled_reqs=*/false);
+    if (new_blocks.has_value()) {
+      // Probe only — free the trial allocation and leave admission to schedule().
+      kv_cache_manager->free(*request);
+      break;
+    }
+
+    if (!tried_reset) {
+      tried_reset = true;
+      if (kv_cache_manager->reset_prefix_cache()) {
+        std::cerr << "INFO schedule: reset prefix cache to free blocks for waiting "
+                     "request id="
+                  << request->request_id << "\n";
+        std::cerr.flush();
+        continue;  // retry same head
+      }
+    }
+
+    const int free_b =
+        static_cast<int>(kv_cache_manager->block_pool.get_num_free_blocks());
+    const int total_b =
+        static_cast<int>(kv_cache_manager->block_pool.num_gpu_blocks);
+    const std::string id = request->request_id;
+    std::cerr << "ERROR schedule: cannot admit waiting id=" << id
+              << " prompt_tokens=" << request->NumTokens()
+              << " max_model_len=" << max_model_len << " free_blocks=" << free_b
+              << "/" << total_b << " block_size=" << block_size_
+              << " (~" << (total_b * std::max(block_size_, 1))
+              << " tok capacity) — aborting. Raise --num-blocks / "
+                 "--kv-cache-memory or shrink the prompt.\n";
+    std::cerr.flush();
+    finish_requests(id, RequestStatus::kFinishedAborted);
+    aborted.push_back(id);
+    // Continue: abort further waiters that also cannot fit (e.g. Hermes retry pile).
+  }
+  return aborted;
+}
+
 }  // namespace vllm::v1
