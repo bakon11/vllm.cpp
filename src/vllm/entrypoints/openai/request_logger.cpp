@@ -92,7 +92,8 @@ void LogRequestStage(const std::string& request_id, const std::string& stage) {
 
 void LogRequestFinished(const std::string& request_id, int prompt_tokens,
                         int completion_tokens, const std::string& finish_reason,
-                        double elapsed_sec, const std::string& output_text) {
+                        double elapsed_sec, const std::string& output_text,
+                        double prefill_sec) {
   if (!g_cfg.enable_log_requests) return;
   std::ostringstream os;
   os << "Finished request " << request_id << " prompt_tokens=" << prompt_tokens
@@ -101,6 +102,13 @@ void LogRequestFinished(const std::string& request_id, int prompt_tokens,
      << " finish_reason=" << finish_reason << " elapsed_s=" << elapsed_sec;
   if (completion_tokens > 0 && elapsed_sec > 0.001) {
     os << " gen_tok_s=" << (static_cast<double>(completion_tokens) / elapsed_sec);
+  }
+  if (prefill_sec >= 0.0 && completion_tokens > 0) {
+    const double dec = elapsed_sec - prefill_sec;
+    if (dec > 0.001) {
+      os << " prefill_s=" << prefill_sec
+         << " decode_tok_s=" << (static_cast<double>(completion_tokens) / dec);
+    }
   }
   if (g_cfg.enable_log_outputs && !output_text.empty()) {
     os << " output: '" << LogPreview(output_text, g_cfg.max_log_len) << "'";

@@ -48,6 +48,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "vllm/model_executor/models/model_registry.h"
@@ -223,6 +224,30 @@ std::unique_ptr<LoadedModel> BorrowGemma4LoadedModel(const Gemma4Weights& weight
 // num_kv_shared_layers, global_head_dim, final_logit_softcapping) are read from
 // config.raw by the loader/forward. No-op hook.
 void ParseGemma4ForConditionalGenerationConfig(const HfConfig& config);
+
+// Opt-in pure-decode hipGraph driver (VLLM_CPP_GEMMA4_DECODE_GRAPH=1).
+// Default OFF. Fail-soft: capture errors disable graph for the process.
+class Gemma4DecodeGraph {
+ public:
+  Gemma4DecodeGraph(const Gemma4Weights& weights, const HfConfig& config, vt::Queue queue);
+  ~Gemma4DecodeGraph();
+  Gemma4DecodeGraph(const Gemma4DecodeGraph&) = delete;
+  Gemma4DecodeGraph& operator=(const Gemma4DecodeGraph&) = delete;
+  ForwardLogits Step(const std::vector<int32_t>& token_ids,
+                     const std::vector<int32_t>& positions,
+                     const v1::CommonAttentionMetadata& attn_meta,
+                     const std::vector<PagedKvCache>& attn_kv);
+  bool captured() const;
+  int64_t replay_count() const;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+bool Gemma4DecodeGraphEnabled();
+std::optional<ForwardLogits> Gemma4DecodeGraphForward(
+    std::unique_ptr<Gemma4DecodeGraph>& graph, const Gemma4Weights& weights,
+    const ModelForwardInput& input);
 
 // KV-cache spec builder. Emits TWO groups reflecting the true topology: sliding
 // layers (head_dim 256) and full-attention layers (head_dim 512). NOTE: the

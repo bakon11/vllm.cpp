@@ -36,6 +36,15 @@ namespace vllm::entrypoints::openai {
 // result is always well-formed UTF-8 and therefore safe for nlohmann json dump.
 std::string SanitizeUtf8(const std::string& s);
 
+// SSE comment keepalives while the stream is silent (long prefill / TTFT).
+// Mirrors llama.cpp server `--sse-ping-interval` (comment body ":\n\n").
+// Clients (Hermes inactivity_timeout, undici, proxies) treat no body bytes as
+// dead even when TCP is up; OpenAI data: frames are not required for liveness.
+// VT_SERVER_SSE_PING_S: seconds between pings; default 15; <=0 disables.
+int SsePingIntervalSec();
+// SSE comment frame (not a data: event). Safe for OpenAI SSE clients to ignore.
+inline constexpr const char kSsePingFrame[] = ":\n\n";
+
 // Ported from: vllm/entrypoints/serve/utils/api_utils.py:276-289
 // (should_include_usage). Force mode enables final and continuous usage;
 // request-level continuous stats never take effect without include_usage.

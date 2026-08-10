@@ -14,6 +14,7 @@
 // towers are G2/G3 (skipped by the weight loader). See gemma4-multimodal.md.
 #include "vllm/model_executor/models/model_registry.h"
 
+#include <set>
 #include <algorithm>
 #include <memory>
 #include <optional>
@@ -26,6 +27,7 @@
 
 #include "vllm/model_executor/models/gemma4.h"
 #include "vllm/model_executor/models/gemma4_moe.h"
+#include "vt/fused_ops.h"
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits (shared carrier)
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/v1/kv_cache_dtype.h"
@@ -67,10 +69,12 @@ class Gemma4LoadedModel final : public LoadedModel {
                     const Gemma4Weights& weights, BorrowedWeightsTag)
       : LoadedModel(registration), weights_(&weights) {}
   const Gemma4Weights& weights() const { return *weights_; }
+  std::unique_ptr<Gemma4DecodeGraph>& decode_graph() { return decode_graph_; }
 
  private:
   std::optional<Gemma4Weights> owned_weights_;
   const Gemma4Weights* weights_ = nullptr;
+  std::unique_ptr<Gemma4DecodeGraph> decode_graph_;
 };
 
 std::unique_ptr<LoadedModel> LoadGemma4ForConditionalGeneration(
@@ -105,12 +109,39 @@ void PrepareGemma4ForConditionalGeneration(LoadedModel& model,
   if (const char* g = std::getenv("VT_GEMMA4_RESIDENT_GPUS"))
     ngpu = std::max(1, std::atoi(g));
   UploadGemma4ExpertsResidentForWeights(w, ngpu);
+  // Pre-warm ExpertGeGLU scratch on every GPU that holds resident experts (no mid-decode malloc).
+  {
+    std::set<int> devs;
+    int G = 8, I = 0, H = 0;
+    for (const auto& layer : w.layers) {
+      if (!layer.moe.enabled || !layer.moe.experts.fp8_native_resident) continue;
+      devs.insert(layer.moe.experts.dev_id);
+      if (I == 0) {
+        I = static_cast<int>(layer.moe.experts.intermediate);
+        H = static_cast<int>(layer.moe.experts.hidden);
+        G = layer.moe.top_k > 0 ? layer.moe.top_k : 8;
+      }
+    }
+    if (I > 0 && H > 0) {
+      for (int d : devs) {
+        if (d < 0) continue;
+        if (!vt::PrewarmExpertGeGLUFp8TopK(d, G, I, H)) {
+          std::fprintf(stderr, "gemma4: ExpertGeGLU prewarm failed on gpu %d\n", d);
+        } else {
+          std::fprintf(stderr, "gemma4: ExpertGeGLU prewarm ok gpu %d G=%d I=%d H=%d\n", d, G, I, H);
+        }
+      }
+    }
+  }
 }
 
 ForwardLogits ForwardGemma4ForConditionalGeneration(
     LoadedModel& model, const ModelForwardInput& input) {
-  const auto& gemma = static_cast<Gemma4LoadedModel&>(model);
+  auto& gemma = static_cast<Gemma4LoadedModel&>(model);
   const Gemma4Weights& weights = gemma.weights();
+  if (auto graphed = Gemma4DecodeGraphForward(gemma.decode_graph(), weights, input)) {
+    return std::move(*graphed);
+  }
   // CLAIM-GEMMA4-MM-E2E: the multimodal branch. When ModelForwardInput.mm is set
   // (the Gemma4GenerateGreedyViaRegistry driver / the runner mm-path) the hidden
   // stream starts from the ALREADY-MERGED inputs_embeds and the PLE lookup uses the

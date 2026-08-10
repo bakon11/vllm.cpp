@@ -43,57 +43,96 @@ bool PrefillProgressEnabled() {
   return on;
 }
 
-void MaybeLogPrefillProgress(const Request& request) {
+void MaybeLogPrefillProgress(const Request& request,
+                               int num_scheduled_token = 0) {
   if (!PrefillProgressEnabled()) return;
   const int prompt = request.num_prompt_tokens > 0 ? request.num_prompt_tokens
                                                    : request.NumTokens();
   if (prompt <= 0) return;
   const int computed = request.num_computed_tokens;
-  // Decode phase: computed exceeds prompt once generation tokens append.
   if (computed > prompt && !request.is_prefill_chunk) return;
 
   using clock = std::chrono::steady_clock;
   struct State {
+    clock::time_point start{};
     clock::time_point last{};
     int last_computed = -1;
+    int start_computed = -1;
     bool logged_done = false;
+    bool started = false;
   };
   static std::mutex mu;
   static std::unordered_map<std::string, State> states;
   std::lock_guard<std::mutex> lock(mu);
   State& st = states[request.request_id];
   const auto now = clock::now();
+
+  if (num_scheduled_token > 0) {
+    if (!st.started) {
+      st.start = now;
+      st.start_computed = std::max(0, computed - num_scheduled_token);
+      st.last = now;
+      st.last_computed = st.start_computed;
+      st.started = true;
+    }
+    return;
+  }
+
+  if (!st.started) {
+    st.start = now;
+    st.start_computed = 0;
+    st.last = now;
+    st.last_computed = 0;
+    st.started = true;
+  }
+
+  auto tok_s = [](int d_tok, double sec) -> double {
+    if (d_tok <= 0 || sec <= 1e-6) return 0.0;
+    return static_cast<double>(d_tok) / sec;
+  };
+  const double elapsed =
+      std::chrono::duration<double>(now - st.start).count();
+  const int total_new =
+      std::max(0, std::min(computed, prompt) - st.start_computed);
+  const double avg_tps = tok_s(total_new, elapsed);
+
   const bool done = !request.is_prefill_chunk && computed >= prompt;
   if (done) {
     if (!st.logged_done) {
       std::cerr << "INFO prefill id=" << request.request_id
                 << " computed=" << std::min(computed, prompt) << "/" << prompt
-                << " (100%) status=done\n";
+                << " (100%) status=done"
+                << " tok_s=" << avg_tps
+                << " elapsed_s=" << elapsed << "
+";
       std::cerr.flush();
       st.logged_done = true;
     }
-    if (states.size() > 64) {
-      for (auto it = states.begin(); it != states.end();) {
-        if (it->second.logged_done)
-          it = states.erase(it);
-        else
-          ++it;
-      }
-    }
+    states.erase(request.request_id);
     return;
   }
 
   const auto ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last).count();
-  if (st.last_computed >= 0 && ms < 500 && (computed - st.last_computed) < 2048) {
+      std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last)
+          .count();
+  if (st.last_computed >= 0 && ms < 500 &&
+      (computed - st.last_computed) < 2048) {
     return;
   }
+  const double dt =
+      std::chrono::duration<double>(now - st.last).count();
+  const int d_tok = std::max(0, computed - st.last_computed);
+  if (dt < 1e-3 || d_tok <= 0) return;
+  const double inst_tps = tok_s(d_tok, dt);
   st.last = now;
   st.last_computed = computed;
   const int shown = std::min(computed, prompt);
-  const double pct = 100.0 * static_cast<double>(shown) / static_cast<double>(prompt);
+  const double pct =
+      100.0 * static_cast<double>(shown) / static_cast<double>(prompt);
   std::cerr << "INFO prefill id=" << request.request_id << " computed=" << shown
-            << "/" << prompt << " (" << pct << "%) status=running\n";
+            << "/" << prompt << " (" << pct << "%) status=running"
+            << " tok_s=" << inst_tps << " avg_tok_s=" << avg_tps << "
+";
   std::cerr.flush();
 }
 
@@ -800,6 +839,8 @@ EngineCoreOutputs Scheduler::update_from_output(
       continue;
     }
     Request* request = it->second.get();
+    // Post-execute prefill progress tick.
+    MaybeLogPrefillProgress(*request, /*num_scheduled_token=*/0);
 
     const int req_index = model_runner_output.req_id_to_index.at(req_id);
     // sampled_token_ids[req_index] if sampled_token_ids else []. A request still
@@ -1060,7 +1101,7 @@ void Scheduler::update_after_schedule(SchedulerOutput& scheduler_output) {
     // needs a grammar bitmask this step.
     scheduler_output.has_structured_output_requests |=
         request->use_structured_output() && !request->is_prefill_chunk;
-    MaybeLogPrefillProgress(*request);
+    MaybeLogPrefillProgress(*request, num_scheduled_token);
   }
   // Flush the finished / preempted id sets (assign fresh sets so the already
   // copied-out scheduler_output is unaffected).

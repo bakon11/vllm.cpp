@@ -416,6 +416,27 @@ generation then runs to the token budget. The ids still count toward
 `min_tokens` masking either way, so `min_tokens` cannot be satisfied by emitting
 a stop token early.
 
+
+### Gemma-4 MoE on ROCm (long-prompt / dual-GPU)
+
+Stop ids come from both `config.json` and sibling `generation_config.json`
+(see “Which token ids stop a generation” above — #262). Prefer GPU-resident
+**native FP8** experts when VRAM allows:
+
+```sh
+export VT_GEMMA4_RESIDENT_EXPERTS=1
+export VT_GEMMA4_RESIDENT_GPUS=2
+export VT_GEMMA4_PREFILL_BATCH_MOE=1
+export HIP_VISIBLE_DEVICES=0,1
+build-hip/examples/vllm-server --model /path/to/gemma-4-26B-A4B-it-fp8 \
+  --host 127.0.0.1 --port 8010 --max-model-len 49152 --num-blocks 1536 \
+  --max-num-seqs 1 --no-enable-thinking --verbose
+```
+
+Default resident packs are **native FP8** (fused ExpertGeGLU decode; prefill uses
+GPU FP8 channel GEMM for T≥64 + device scatter). `VT_GEMMA4_RESIDENT_BF16=1`
+forces BF16 expand for A/B. See [ENVIRONMENT.md](ENVIRONMENT.md).
+
 ### Server flags
 
 | Flag | Default | Meaning |

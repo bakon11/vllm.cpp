@@ -8,6 +8,7 @@
 #include <string>
 
 #include "vt/ops.h"
+#include "vt/rocm/rocm_device_bind.h"
 
 namespace vt::rocm {
 namespace {
@@ -165,6 +166,7 @@ __global__ void ArgmaxK(int64_t* out, const Tin* logits, int64_t rows, int64_t c
 }  // namespace
 
 void MulScalarKernelRocm(Queue& q, Tensor& out, const Tensor& x, double scalar) {
+  EnsureQueueDevice(q);
   const int64_t n = x.Numel();
   if (n == 0) return;
   const float s = static_cast<float>(scalar);
@@ -184,6 +186,7 @@ void MulScalarKernelRocm(Queue& q, Tensor& out, const Tensor& x, double scalar) 
 }
 
 void SoftCapKernelRocm(Queue& q, Tensor& out, const Tensor& x, double cap) {
+  EnsureQueueDevice(q);
   const int64_t n = x.Numel();
   if (n == 0) return;
   const float c = static_cast<float>(cap);
@@ -219,6 +222,7 @@ __global__ void AddMixBcastK(To* out, const Ta* a, const Tb* b, int64_t rows,
 }
 
 void AddKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+  EnsureQueueDevice(q);
   hipStream_t st = AsStream(q);
   const int64_t n_elem = a.Numel();
   if (n_elem == 0) return;
@@ -261,6 +265,7 @@ void AddKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
 }
 
 void GeluAndMulKernelRocm(Queue& q, Tensor& out, const Tensor& x) {
+  EnsureQueueDevice(q);
   const int64_t d = x.shape[1] / 2, n = x.shape[0] * d;
   if (n == 0) return;
   hipStream_t st = AsStream(q);
@@ -294,6 +299,7 @@ void GeluMulSeparateRocm(Queue& q, void* out, const void* gate, const void* up, 
 }
 
 void SiluAndMulKernelRocm(Queue& q, Tensor& out, const Tensor& x) {
+  EnsureQueueDevice(q);
   const int64_t d = x.shape[1] / 2, n = x.shape[0] * d;
   if (n == 0) return;
   hipStream_t st = AsStream(q);
@@ -312,6 +318,7 @@ void SiluAndMulKernelRocm(Queue& q, Tensor& out, const Tensor& x) {
 
 void RopeCosSinCacheKernelRocm(Queue& q, Tensor& cos_sin, const Tensor& pos,
                                const RopeArgs& args) {
+  EnsureQueueDevice(q);
   const int64_t t = cos_sin.shape[0], half = args.rotary_dim / 2, n = t * half;
   if (n == 0) return;
   hipStream_t st = AsStream(q);
@@ -329,6 +336,7 @@ void RopeCosSinCacheKernelRocm(Queue& q, Tensor& cos_sin, const Tensor& pos,
 }
 
 void GreedyArgmaxKernelRocm(Queue& q, Tensor& out, const Tensor& logits) {
+  EnsureQueueDevice(q);
   const int64_t rows = logits.shape[0], cols = logits.shape[1];
   if (rows == 0) return;
   VT_CHECK(out.dtype == DType::kI64 || out.dtype == DType::kI32,
@@ -370,6 +378,7 @@ __global__ void CastF32K(float* out, const __hip_bfloat16* in, int64_t n, int64_
 }
 
 void CastBf16KernelRocm(Queue& q, Tensor& out, const Tensor& in) {
+  EnsureQueueDevice(q);
   const int64_t n = out.Numel();
   if (n == 0) return;
   const int64_t rows = in.shape[0];
@@ -380,6 +389,7 @@ void CastBf16KernelRocm(Queue& q, Tensor& out, const Tensor& in) {
 }
 
 void CastF32KernelRocm(Queue& q, Tensor& out, const Tensor& in) {
+  EnsureQueueDevice(q);
   const int64_t n = out.Numel();
   if (n == 0) return;
   const int64_t rows = in.shape[0];
@@ -417,6 +427,7 @@ __global__ void QkvSplitK(T* q_out, T* k_out, T* v_out, const T* qkv, int64_t t,
 
 void QkvSplitKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out,
                         const Tensor& qkv) {
+  EnsureQueueDevice(q);
   const int64_t t = qkv.shape[0];
   if (t == 0) return;
   const int64_t q_dim = q_out.Numel() / t, k_dim = k_out.Numel() / t, v_dim = v_out.Numel() / t;
@@ -480,6 +491,7 @@ __global__ void LayerNormRowK(OutT* out, const InT* x, const WT* weight, const W
 
 void LayerNormKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor* weight,
                          const Tensor* bias, const LayerNormArgs& args) {
+  EnsureQueueDevice(q);
   const int64_t d = x.shape[x.rank - 1];
   const int64_t rows = d == 0 ? 0 : x.Numel() / d;
   if (rows == 0 || d == 0) return;
@@ -524,6 +536,7 @@ __global__ void ReluK(T* out, const T* x, int64_t n) {
 }
 
 void ReluKernelRocm(Queue& q, Tensor& out, const Tensor& x) {
+  EnsureQueueDevice(q);
   const int64_t n = x.Numel();
   if (n == 0) return;
   hipStream_t st = AsStream(q);
@@ -572,6 +585,7 @@ __global__ void RopeNeoxK(T* qs, T* ks, const Tid* pos, int64_t hq, int64_t hk, 
 
 void RopeNeoxKernelRocm(Queue& q, Tensor& qs, Tensor& ks, const Tensor& pos,
                         const RopeArgs& args) {
+  EnsureQueueDevice(q);
   const int64_t t = qs.shape[0], hq = qs.shape[1], hk = ks.shape[1], d = qs.shape[2];
   const int64_t half = args.rotary_dim / 2;
   const int64_t n = t * (hq + hk) * half;
@@ -635,6 +649,7 @@ __global__ void RopeFromCacheK(T* qs, T* ks, const Tid* positions, const T* cach
 
 void RopeFromCacheKernelRocm(Queue& q, Tensor& qs, Tensor* ks, const Tensor& positions,
                              const Tensor& cache, const RopeArgs& args) {
+  EnsureQueueDevice(q);
   const int64_t tokens = qs.shape[0];
   const int64_t hq = qs.shape[1];
   const int64_t hk = ks == nullptr ? 0 : ks->shape[1];
@@ -693,6 +708,7 @@ __global__ void ReshapeAndCacheK(const Word* key, const Word* value, Word* key_c
 
 void ReshapeAndCacheKernelRocm(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
                                Tensor& v_cache, const Tensor& slot_mapping) {
+  EnsureQueueDevice(q);
   const int64_t num_slots = slot_mapping.shape[0];
   const int64_t block_size = k_cache.shape[1];
   const int64_t n_elems = k_cache.shape[2] * k_cache.shape[3];
@@ -740,6 +756,7 @@ __global__ void GeluErfK(T* out, const T* x, int64_t n) {
 }
 
 void GeluTanhKernelRocm(Queue& q, Tensor& out, const Tensor& x) {
+  EnsureQueueDevice(q);
   const int64_t n = x.Numel();
   if (n == 0) return;
   hipStream_t st = AsStream(q);
@@ -754,6 +771,7 @@ void GeluTanhKernelRocm(Queue& q, Tensor& out, const Tensor& x) {
 }
 
 void GeluErfKernelRocm(Queue& q, Tensor& out, const Tensor& x) {
+  EnsureQueueDevice(q);
   const int64_t n = x.Numel();
   if (n == 0) return;
   hipStream_t st = AsStream(q);
@@ -765,6 +783,47 @@ void GeluErfKernelRocm(Queue& q, Tensor& out, const Tensor& x) {
   else
     VT_CHECK(false, "rocm gelu_erf dtype");
   Check(hipGetLastError(), "gelu_erf");
+}
+
+// --- sampling logit masks (Hermes allowed_token_ids / bad_words) ------------
+// mask TRUE => exclude (set -inf). Mirrors CPU/CUDA ApplyAllowedTokenIds.
+__global__ void ApplyAllowedTokenIdsK(float* logits, const int8_t* mask, int64_t total) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < total;
+       idx += step)
+    if (mask[idx]) logits[idx] = -INFINITY;
+}
+
+void ApplyAllowedTokenIdsKernelRocm(Queue& q, Tensor& logits, const Tensor& mask) {
+  EnsureQueueDevice(q);
+  const int64_t n = logits.shape[0], v = logits.shape[1];
+  if (n == 0 || v == 0) return;
+  VT_CHECK(logits.dtype == DType::kF32, "rocm apply_allowed_token_ids: logits f32");
+  VT_CHECK(mask.dtype == DType::kI8, "rocm apply_allowed_token_ids: mask i8");
+  const int64_t total = n * v;
+  ApplyAllowedTokenIdsK<<<GridFor(total), kBlock, 0, AsStream(q)>>>(
+      logits.Ptr<float>(), mask.Ptr<int8_t>(), total);
+  Check(hipGetLastError(), "apply_allowed_token_ids");
+}
+
+// Sparse -inf scatter at (rows[k], cols[k]) — bad_words path.
+__global__ void ApplyTokenMaskK(float* logits, const int32_t* rows, const int32_t* cols,
+                                int64_t v, int64_t m) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t k = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; k < m;
+       k += step)
+    logits[static_cast<int64_t>(rows[k]) * v + cols[k]] = -INFINITY;
+}
+
+void ApplyTokenMaskKernelRocm(Queue& q, Tensor& logits, const Tensor& rows,
+                              const Tensor& cols) {
+  EnsureQueueDevice(q);
+  const int64_t v = logits.shape[1], m = rows.shape[0];
+  if (m == 0) return;
+  VT_CHECK(logits.dtype == DType::kF32, "rocm apply_token_mask: logits f32");
+  ApplyTokenMaskK<<<GridFor(m), kBlock, 0, AsStream(q)>>>(
+      logits.Ptr<float>(), rows.Ptr<int32_t>(), cols.Ptr<int32_t>(), v, m);
+  Check(hipGetLastError(), "apply_token_mask");
 }
 
 }  // namespace vt::rocm

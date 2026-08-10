@@ -33,6 +33,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -240,12 +241,66 @@ class RocmBackend final : public Backend {
   // Probed, never inferred from the gfx name.
   bool UnifiedMemory() const override { return unified_memory_; }
 
+  bool DeviceMemoryInfo(size_t* free_bytes, size_t* total_bytes) const override {
+    size_t free_b = 0, tot_b = 0;
+    if (hipSetDevice(device_) != hipSuccess) return false;
+    if (hipMemGetInfo(&free_b, &tot_b) != hipSuccess) return false;
+    if (free_bytes) *free_bytes = free_b;
+    if (total_bytes) *total_bytes = tot_b;
+    return true;
+  }
+
+  // hipGraph capture/replay — same contract as CudaBackend (no malloc/sync in region).
+  // Opt-out: VT_ROCM_GRAPH=0. Default ON so decode drivers can capture when ready.
+  bool SupportsGraphCapture() const override {
+    static const bool on = [] {
+      const char* e = std::getenv("VT_ROCM_GRAPH");
+      if (e && e[0] == '0') return false;
+      return true;
+    }();
+    return on;
+  }
+  void BeginCapture(Queue& q) override {
+    // Global mode: dual-GPU MoE peer launches on a second stream must be in the
+    // same capture (ThreadLocal would drop the expert stream).
+    Check(hipStreamBeginCapture(AsStream(q), hipStreamCaptureModeGlobal),
+          "hipStreamBeginCapture");
+  }
+  void EndCapture(Queue& q) override {
+    hipGraph_t graph = nullptr;
+    Check(hipStreamEndCapture(AsStream(q), &graph), "hipStreamEndCapture");
+    if (exec_ != nullptr) {
+      (void)hipGraphExecDestroy(exec_);
+      exec_ = nullptr;
+    }
+    Check(hipGraphInstantiate(&exec_, graph, nullptr, nullptr, 0), "hipGraphInstantiate");
+    (void)hipGraphDestroy(graph);
+  }
+  void Replay(Queue& q) override {
+    Check(hipGraphLaunch(exec_, AsStream(q)), "hipGraphLaunch");
+  }
+  void* EndCaptureGraph(Queue& q) override {
+    hipGraph_t graph = nullptr;
+    Check(hipStreamEndCapture(AsStream(q), &graph), "hipStreamEndCapture");
+    hipGraphExec_t exec = nullptr;
+    Check(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "hipGraphInstantiate");
+    (void)hipGraphDestroy(graph);
+    return reinterpret_cast<void*>(exec);
+  }
+  void ReplayGraph(Queue& q, void* graph) override {
+    Check(hipGraphLaunch(reinterpret_cast<hipGraphExec_t>(graph), AsStream(q)), "hipGraphLaunch");
+  }
+  void DestroyGraph(void* graph) override {
+    if (graph != nullptr) (void)hipGraphExecDestroy(reinterpret_cast<hipGraphExec_t>(graph));
+  }
+
  private:
   int device_ = 0;
   bool unified_memory_ = false;
   bool managed_alloc_ = false;
   int major_ = 0;
   int minor_ = 0;
+  hipGraphExec_t exec_ = nullptr;
 };
 
 // Registers every visible AMD GPU at its own Device{kROCM, i} slot, mirroring

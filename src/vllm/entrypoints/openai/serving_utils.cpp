@@ -3,12 +3,25 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <string>
 #include <utility>
 
 namespace vllm::entrypoints::openai {
+
+int SsePingIntervalSec() {
+  // Default 15s: under typical agent inactivity timeouts (~120s) and matching
+  // llama.cpp's need to keep undici/proxy idle timers from firing during
+  // multi-minute MoE prefill. <=0 disables (VT_SERVER_SSE_PING_S=0|-1).
+  static const int kInterval = [] {
+    const char* e = std::getenv("VT_SERVER_SSE_PING_S");
+    if (e == nullptr || e[0] == '\0') return 15;
+    return std::atoi(e);
+  }();
+  return kInterval;
+}
 
 namespace {
 

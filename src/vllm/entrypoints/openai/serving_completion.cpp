@@ -2,10 +2,17 @@
 // See serving_completion.h for scope, the return-type design and deferrals.
 #include "vllm/entrypoints/openai/serving_completion.h"
 
+#include <atomic>
+#include <condition_variable>
+#include <exception>
+#include <mutex>
+#include <chrono>
 #include <ctime>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -19,22 +26,58 @@ namespace vllm::entrypoints::openai {
 
 namespace {
 
-// completion_stream_generator (serving.py:278-474) as a blocking pull source.
-// Each next() consumes at most one RequestOutput from this request's collector;
-// other requests are processed independently by AsyncLLM's output handler.
+// completion_stream_generator — deferred add_request + SSE keepalives (see chat).
 class CompletionSseStream final : public SseStream {
  public:
-  CompletionSseStream(v1::AsyncLLM& engine, v1::AsyncRequest request,
-                      std::string response_id, int64_t created,
-                      std::string model, StreamUsageSelection usage)
+  CompletionSseStream(v1::AsyncLLM& engine, std::string engine_request_id,
+                      std::string prompt, SamplingParams params, int priority,
+                      std::string response_id, int64_t created, std::string model,
+                      StreamUsageSelection usage)
       : engine_(engine),
-        request_(std::move(request)),
+        engine_request_id_(std::move(engine_request_id)),
+        prompt_(std::move(prompt)),
+        params_(std::move(params)),
+        priority_(priority),
         response_id_(std::move(response_id)),
         created_(created),
         model_(std::move(model)),
-        usage_(usage) {}
+        usage_(usage) {
+    queue_thread_ = std::thread([this] {
+      try {
+        if (aborted_.load()) {
+          std::lock_guard<std::mutex> lock(queue_mu_);
+          queue_done_ = true;
+          queue_cv_.notify_all();
+          return;
+        }
+        v1::AsyncRequest ar = engine_.add_request(
+            engine_request_id_, prompt_, std::move(params_), priority_);
+        {
+          std::lock_guard<std::mutex> lock(queue_mu_);
+          if (aborted_.load()) {
+            engine_.abort(ar.request_id);
+          } else {
+            request_ = std::move(ar);
+            queued_ = true;
+          }
+          prompt_.clear();
+          prompt_.shrink_to_fit();
+          queue_done_ = true;
+        }
+        queue_cv_.notify_all();
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(queue_mu_);
+        queue_error_ = std::current_exception();
+        queue_done_ = true;
+        queue_cv_.notify_all();
+      }
+    });
+  }
 
-  ~CompletionSseStream() override { abort(); }
+  ~CompletionSseStream() override {
+    abort();
+    if (queue_thread_.joinable()) queue_thread_.join();
+  }
 
   bool next(std::string& chunk) override {
     if (complete_) return false;
@@ -43,8 +86,7 @@ class CompletionSseStream final : public SseStream {
       frame.id = response_id_;
       frame.created = created_;
       frame.model = model_;
-      frame.usage = UsageInfo{prompt_tokens_,
-                              prompt_tokens_ + previous_num_tokens_,
+      frame.usage = UsageInfo{prompt_tokens_, prompt_tokens_ + previous_num_tokens_,
                               previous_num_tokens_};
       chunk = "data: " + nlohmann::json(frame).dump() + "\n\n";
       usage_pending_ = false;
@@ -58,26 +100,50 @@ class CompletionSseStream final : public SseStream {
       return true;
     }
 
+    // Wait for queue with pings (no role frame on completions API).
+    {
+      std::unique_lock<std::mutex> lock(queue_mu_);
+      for (;;) {
+        if (queue_error_) std::rethrow_exception(queue_error_);
+        if (queued_ && request_.has_value()) break;
+        if (queue_done_ && !queued_) {
+          complete_ = true;
+          throw std::runtime_error("completion stream aborted before engine queue");
+        }
+        lock.unlock();
+        if (MaybeSsePing(chunk)) return true;
+        lock.lock();
+        queue_cv_.wait_for(lock, std::chrono::milliseconds(50));
+      }
+    }
+
     for (;;) {
-      RequestOutput response = engine_.get_output(request_);
+      if (aborted_.load()) {
+        complete_ = true;
+        return false;
+      }
+      std::optional<RequestOutput> ready =
+          engine_.get_output_nowait(*request_);
+      if (!ready.has_value()) {
+        if (MaybeSsePing(chunk)) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        continue;
+      }
+      RequestOutput response = std::move(*ready);
       prompt_tokens_ = static_cast<int>(response.prompt_token_ids.size());
       if (response.outputs.empty()) {
         if (response.finished) {
           engine_finished_ = true;
-          if (usage_.include_usage) {
-            usage_pending_ = true;
-          } else {
-            done_pending_ = true;
-          }
+          if (usage_.include_usage) usage_pending_ = true;
+          else done_pending_ = true;
+          return next(chunk);
         }
-        if (usage_pending_ || done_pending_) return next(chunk);
+        if (MaybeSsePing(chunk)) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         continue;
       }
-
       const CompletionOutput& output = response.outputs.front();
       const std::string delta_text = SanitizeUtf8(output.text);
-      // completion/serving.py:368-374 chunked-prefill hold-back. Preserve a
-      // terminal empty chunk so clients still observe finish_reason.
       if (delta_text.empty() && output.token_ids.empty() &&
           previous_num_tokens_ == 0 && !response.finished) {
         continue;
@@ -100,28 +166,59 @@ class CompletionSseStream final : public SseStream {
                                 previous_num_tokens_};
       }
       chunk = "data: " + nlohmann::json(frame).dump() + "\n\n";
-
       if (response.finished) {
         engine_finished_ = true;
-        if (usage_.include_usage) {
-          usage_pending_ = true;
-        } else {
-          done_pending_ = true;
-        }
+        if (usage_.include_usage) usage_pending_ = true;
+        else done_pending_ = true;
       }
       return true;
     }
   }
 
   void abort() override {
-    if (complete_ || engine_finished_ || aborted_) return;
-    aborted_ = true;
-    engine_.abort(request_.request_id);
+    if (complete_ || engine_finished_ || aborted_.exchange(true)) return;
+    std::lock_guard<std::mutex> lock(queue_mu_);
+    if (queued_ && request_.has_value()) {
+      engine_.abort(request_->request_id);
+    }
   }
 
  private:
+  bool MaybeSsePing(std::string& chunk) {
+    const int interval = SsePingIntervalSec();
+    if (interval <= 0) return false;
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::seconds>(now - last_ping_)
+            .count() < interval) {
+      return false;
+    }
+    last_ping_ = now;
+    CompletionResponseStreamChoice choice;
+    choice.index = 0;
+    choice.text = "";
+    choice.finish_reason = std::nullopt;
+    CompletionStreamResponse frame;
+    frame.id = response_id_;
+    frame.created = created_;
+    frame.model = model_;
+    frame.choices.push_back(std::move(choice));
+    chunk = std::string(kSsePingFrame) + "data: " + nlohmann::json(frame).dump() +
+            "\n\n";
+    return true;
+  }
+
   v1::AsyncLLM& engine_;
-  v1::AsyncRequest request_;
+  std::string engine_request_id_;
+  std::string prompt_;
+  SamplingParams params_;
+  int priority_ = 0;
+  std::optional<v1::AsyncRequest> request_;
+  std::thread queue_thread_;
+  std::mutex queue_mu_;
+  std::condition_variable queue_cv_;
+  bool queued_ = false;
+  bool queue_done_ = false;
+  std::exception_ptr queue_error_;
   std::string response_id_;
   int64_t created_ = 0;
   std::string model_;
@@ -130,9 +227,10 @@ class CompletionSseStream final : public SseStream {
   int previous_num_tokens_ = 0;
   bool usage_pending_ = false;
   bool done_pending_ = false;
-  bool engine_finished_ = false;
   bool complete_ = false;
-  bool aborted_ = false;
+  bool engine_finished_ = false;
+  std::atomic<bool> aborted_{false};
+  std::chrono::steady_clock::time_point last_ping_{std::chrono::steady_clock::now()};
 };
 
 }  // namespace
@@ -232,19 +330,12 @@ CompletionResult OpenAIServingCompletion::create_completion(
   // W2 production path: enqueue and return immediately with a live pull source.
   // The HTTP provider blocks on this request's collector one chunk at a time.
   if (async_engine_ != nullptr && request.stream) {
-    v1::AsyncRequest async_request = async_engine_->add_request(
-        engine_request_id, request.prompt, std::move(sampling_params),
-        request.priority);
     CompletionResult result;
     result.streaming = true;
-    try {
-      result.sse_stream = std::make_shared<CompletionSseStream>(
-          *async_engine_, async_request, request_id, created_time, model_name,
-          usage);
-    } catch (...) {
-      async_engine_->abort(async_request.request_id);
-      throw;
-    }
+    result.sse_stream = std::make_shared<CompletionSseStream>(
+        *async_engine_, engine_request_id, request.prompt,
+        std::move(sampling_params), request.priority, request_id, created_time,
+        model_name, usage);
     return result;
   }
 

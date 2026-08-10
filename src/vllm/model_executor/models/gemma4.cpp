@@ -33,6 +33,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -53,6 +54,12 @@
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/fused_ops.h"
+#if defined(VLLM_CPP_HIP)
+#ifndef __HIP_PLATFORM_AMD__
+#define __HIP_PLATFORM_AMD__
+#endif
+#include <hip/hip_runtime.h>
+#endif
 
 namespace vllm {
 namespace {
@@ -197,7 +204,7 @@ void CopyRow(Dev d, void* dst, const void* src, size_t bytes) {
 // One Gemma-4 self-attention block. `Dh` is this layer's head_dim (256/512).
 // `kv` is the cache to attend (this layer's for non-shared, the target layer's
 // for YOCO-shared). `rope_full` selects the proportional cache path.
-DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
+void Gemma4AttnBlock(Dev d, DBuf& o_out, const Gemma4LayerWeights& w, const Gemma4Layout& g,
                      const Tensor& dhn, const StepInputs& si,
                      const CommonAttentionMetadata& meta, const PagedKvCache& kv,
                      int64_t T, int64_t Dh, bool rope_full,
@@ -333,15 +340,15 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
 
   Tensor o_in = Reshape(attn.t(), {T, Hq * Dh});
   Tensor wo = ResidentWeight(d, w.attn.o_proj);
-  DBuf o(d, DType::kBF16, {T, H});  // returned — not TLS
-  vt::MatmulBT(d.q, o.t(), o_in, wo);
-  return o;
+  VT_CHECK(o_out.t().shape[0] == T && o_out.t().shape[1] == H, "gemma4 attn o_out shape");
+  vt::MatmulBT(d.q, o_out.t(), o_in, wo);
 }
 
 // GeGLU MLP (gemma4.py::Gemma4MLP).
-DBuf Gemma4MlpBlock(Dev d, const Gemma4MlpWeights& w, int64_t H, int64_t I,
+void Gemma4MlpBlock(Dev d, DBuf& down_out, const Gemma4MlpWeights& w, int64_t H, int64_t I,
                     const Tensor& dh2, int64_t T) {
   // Dense GeGLU: TLS reuse of large gate_up [T,2I] + act [T,I] across layers.
+  // down_out is caller-owned (layer TLS) so hipGraph capture keeps stable pointers.
   Tensor wgu = ResidentWeight(d, w.gate_up_proj);
   struct MlpTls {
     int dev = -1;
@@ -361,9 +368,8 @@ DBuf Gemma4MlpBlock(Dev d, const Gemma4MlpWeights& w, int64_t H, int64_t I,
   vt::MatmulBT(d.q, gu.t(), dh2, wgu);
   vt::GeluAndMul(d.q, act.t(), gu.t());
   Tensor wd = ResidentWeight(d, w.down_proj);
-  DBuf down(d, DType::kBF16, {T, H});
-  vt::MatmulBT(d.q, down.t(), act.t(), wd);
-  return down;
+  VT_CHECK(down_out.t().shape[0] == T && down_out.t().shape[1] == H, "gemma4 mlp out shape");
+  vt::MatmulBT(d.q, down_out.t(), act.t(), wd);
 }
 
 void GatherRows(Dev d, void* dst, const Tensor& src, const std::vector<int32_t>& idx,
@@ -373,6 +379,334 @@ void GatherRows(Dev d, void* dst, const Tensor& src, const std::vector<int32_t>&
   const auto* sp = static_cast<const char*>(src.data);
   for (size_t s = 0; s < idx.size(); ++s)
     d.b.Copy(d.q, dp + s * rb, sp + static_cast<size_t>(idx[s]) * rb, rb);
+}
+
+// --- Decode-graph prep: Layers + Logits as separate steps -------------------
+// Embed/PLE stay in ForwardBody (host token ids / optional mm embeds). The layer
+// stack and lm_head are factored so a future Gemma4DecodeGraph can:
+//   EmbedInto(persistent hidden) → capture(ForwardGemma4Layers) → Logits
+// Behavior is intentionally identical to the previous monolithic loop.
+
+void ForwardGemma4Layers(Dev d, DBuf& hidden, const Gemma4Layout& g,
+                         const Gemma4Weights& weights, const HfConfig& /*config*/,
+                         const CommonAttentionMetadata& attn_meta,
+                         const std::vector<PagedKvCache>& attn_kv, StepInputs& si,
+                         DBuf& ones_sliding, DBuf& ones_full, DBuf& prop_cache,
+                         DBuf& ple_by_layer, int64_t T, int64_t H, int64_t I, int64_t L,
+                         int64_t ple) {
+  const float eps = 1e-6f;
+  const vt::RmsNormArgs plain{eps, false};
+  const size_t ple_row_bytes = static_cast<size_t>(ple) * sizeof(uint16_t);
+  const size_t th_bytes = static_cast<size_t>(T) * static_cast<size_t>(H) * sizeof(uint16_t);
+
+  struct LayerTls {
+    int dev = -1;
+    int64_t T = 0, H = 0, I = 0, ple = 0;
+    std::optional<DBuf> dhn, attn_o, mlp_o, h1, dh2, h2, moe_in;
+    std::optional<DBuf> gate_lin, ple_l, gated, contrib;
+  };
+  static thread_local LayerTls lt;
+  if (lt.dev != d.q.device.index || lt.T != T || lt.H != H || lt.I != I || lt.ple != ple) {
+    auto mk = [&](int64_t a, int64_t b) {
+      return DBuf(d, DType::kBF16, std::vector<int64_t>{a, b});
+    };
+    lt.dhn.emplace(mk(T, H));
+    lt.attn_o.emplace(mk(T, H));
+    lt.mlp_o.emplace(mk(T, H));
+    lt.h1.emplace(mk(T, H));
+    lt.dh2.emplace(mk(T, H));
+    lt.h2.emplace(mk(T, H));
+    lt.moe_in.emplace(mk(T, H));
+    lt.contrib.emplace(mk(T, H));
+    if (ple > 0) {
+      lt.gate_lin.emplace(mk(T, ple));
+      lt.ple_l.emplace(mk(T, ple));
+      lt.gated.emplace(mk(T, ple));
+    } else {
+      lt.gate_lin.reset();
+      lt.ple_l.reset();
+      lt.gated.reset();
+    }
+    lt.dev = d.q.device.index;
+    lt.T = T;
+    lt.H = H;
+    lt.I = I;
+    lt.ple = ple;
+  }
+  DBuf& dhn = *lt.dhn;
+  DBuf& attn_o = *lt.attn_o;
+  DBuf& mlp_o = *lt.mlp_o;
+  DBuf& h1 = *lt.h1;
+  DBuf& dh2 = *lt.dh2;
+  DBuf& h2 = *lt.h2;
+  DBuf& moe_in = *lt.moe_in;
+  DBuf& contrib = *lt.contrib;
+
+  for (int64_t l = 0; l < L; ++l) {
+    const Gemma4LayerWeights& w = weights.layers[static_cast<size_t>(l)];
+    const int64_t Dh = w.head_dim;
+    const bool full = w.is_full_attention;
+    const Tensor ones_dh = full ? ones_full.t() : ones_sliding.t();
+    std::optional<int64_t> window;
+    if (!full) window = g.sliding_window;
+
+    const int64_t kv_idx = w.is_kv_shared ? w.kv_target_layer : l;
+    VT_CHECK(kv_idx >= 0 && kv_idx < L, "gemma4: bad kv target layer");
+    const PagedKvCache& kv = attn_kv[static_cast<size_t>(kv_idx)];
+
+    Tensor w_in = ResidentWeight(d, w.input_layernorm, {H});
+    vt::RmsNorm(d.q, dhn.t(), hidden.t(), w_in, plain);
+
+    static const int layer_trace = [] {
+      const char* e = std::getenv("VT_GEMMA4_LAYER_TRACE");
+      if (e && e[0] == '2') return 2;
+      if (e && e[0] == '1') return 1;
+      const char* p = std::getenv("VT_GEMMA4_PROFILE");
+      return (p && p[0] == '1') ? 1 : 0;
+    }();
+    using clock = std::chrono::steady_clock;
+    const bool layer_prof = layer_trace >= 1;
+    const bool layer_hb = layer_trace >= 2;
+    if (layer_hb) {
+      std::fprintf(stderr,
+                   "INFO gemma4-layer begin l=%lld/%lld T=%lld full=%d moe=%d kv=%lld\n",
+                   static_cast<long long>(l), static_cast<long long>(L),
+                   static_cast<long long>(T), full ? 1 : 0, w.moe.enabled ? 1 : 0,
+                   static_cast<long long>(kv_idx));
+      std::fflush(stderr);
+    }
+    const auto t0 = layer_prof ? clock::now() : clock::time_point{};
+
+    Gemma4AttnBlock(d, attn_o, w, g, dhn.t(), si, attn_meta, kv, T, Dh, full,
+                    ones_dh, full ? &prop_cache.t() : nullptr, window,
+                    g.rope_theta_sliding);
+
+    Tensor w_pa = ResidentWeight(d, w.post_attention_layernorm, {H});
+    vt::RmsNormPlusAdd(d.q, h1.t(), attn_o.t(), w_pa, hidden.t(), plain);
+
+    if (layer_prof) d.b.Synchronize(d.q);
+    const auto t1 = layer_prof ? clock::now() : clock::time_point{};
+    if (layer_hb) {
+      const double ms =
+          std::chrono::duration<double, std::milli>(t1 - t0).count();
+      std::fprintf(stderr, "INFO gemma4-layer attn-done l=%lld ms=%.2f\n",
+                   static_cast<long long>(l), ms);
+      std::fflush(stderr);
+    }
+
+    Tensor w_pf = ResidentWeight(d, w.pre_feedforward_layernorm, {H});
+        if (w.moe.enabled) {
+    #if defined(VLLM_CPP_HIP)
+          // MLP ∥ MoE: both only read h1. Side stream runs MLP; main runs MoE; join
+          // before DualRmsNorm. hipBLAS handle is TLS single-thread — launch MLP fully
+          // on side first (async), then MoE on main (concurrent GPU). Opt out:
+          // VT_GEMMA4_MLP_MOE_PARALLEL=0.
+          static const bool kPar = [] {
+            const char* e = std::getenv("VT_GEMMA4_MLP_MOE_PARALLEL");
+            // Lab A/B 2026-08-10: wall decode flat vs serial (~51.2); keep opt-in.
+            return e && e[0] == '1';
+          }();
+          struct SideTls {
+            int dev = -1;
+            Queue q{};
+            hipEvent_t ev_h1 = nullptr;
+            hipEvent_t ev_mlp = nullptr;
+            bool live = false;
+          };
+          static thread_local SideTls st;
+          const int dev = d.q.device.index;
+          const bool can_par = kPar && d.q.device.type == vt::DeviceType::kROCM && dev >= 0 &&
+                               d.q.handle != nullptr;
+          if (can_par) {
+            if (st.dev != dev || !st.live) {
+              if (st.live) {
+                if (st.ev_h1) (void)hipEventDestroy(st.ev_h1);
+                if (st.ev_mlp) (void)hipEventDestroy(st.ev_mlp);
+                vt::DestroyQueue(st.q);
+                st = SideTls{};
+              }
+              (void)hipSetDevice(dev);
+              st.q = vt::CreateQueue(d.q.device);
+              (void)hipEventCreateWithFlags(&st.ev_h1, hipEventDisableTiming);
+              (void)hipEventCreateWithFlags(&st.ev_mlp, hipEventDisableTiming);
+              st.dev = dev;
+              st.live = true;
+            }
+            auto* main_st = static_cast<hipStream_t>(d.q.handle);
+            auto* side_st = static_cast<hipStream_t>(st.q.handle);
+            (void)hipEventRecord(st.ev_h1, main_st);
+            (void)hipStreamWaitEvent(side_st, st.ev_h1, 0);
+
+            Dev d_mlp = d;
+            d_mlp.q = st.q;
+            vt::RmsNorm(d_mlp.q, dh2.t(), h1.t(), w_pf, plain);
+            Gemma4MlpBlock(d_mlp, mlp_o, w.mlp, H, I, dh2.t(), T);
+            (void)hipEventRecord(st.ev_mlp, side_st);
+
+            Tensor w_pf2 = ResidentWeight(d, w.moe.pre_feedforward_layernorm_2, {H});
+            vt::RmsNorm(d.q, moe_in.t(), h1.t(), w_pf2, plain);
+            Gemma4MoeScratch moe_out =
+                RunGemma4Moe(d.q, w.moe, /*router_in=*/h1.t(), /*expert_in=*/moe_in.t(), T, H, eps);
+            (void)hipStreamWaitEvent(main_st, st.ev_mlp, 0);
+
+            Tensor w_p1 = ResidentWeight(d, w.moe.post_feedforward_layernorm_1, {H});
+            Tensor w_p2 = ResidentWeight(d, w.moe.post_feedforward_layernorm_2, {H});
+            Tensor w_pff = ResidentWeight(d, w.post_feedforward_layernorm, {H});
+            vt::DualRmsNormPlusRes(d.q, h2.t(), mlp_o.t(), w_p1, moe_out.tensor, w_p2, w_pff, h1.t(),
+                                   plain);
+          } else
+    #endif
+          {
+            vt::RmsNorm(d.q, dh2.t(), h1.t(), w_pf, plain);
+            Gemma4MlpBlock(d, mlp_o, w.mlp, H, I, dh2.t(), T);
+
+            if (layer_prof) d.b.Synchronize(d.q);
+            const auto t2 = layer_prof ? clock::now() : clock::time_point{};
+
+            Tensor w_pf2 = ResidentWeight(d, w.moe.pre_feedforward_layernorm_2, {H});
+            vt::RmsNorm(d.q, moe_in.t(), h1.t(), w_pf2, plain);
+            Gemma4MoeScratch moe_out =
+                RunGemma4Moe(d.q, w.moe, /*router_in=*/h1.t(), /*expert_in=*/moe_in.t(), T, H, eps);
+            Tensor w_p1 = ResidentWeight(d, w.moe.post_feedforward_layernorm_1, {H});
+            Tensor w_p2 = ResidentWeight(d, w.moe.post_feedforward_layernorm_2, {H});
+            Tensor w_pff = ResidentWeight(d, w.post_feedforward_layernorm, {H});
+            // moe_out is TLS-stable for T=1 (graph-safe pointer).
+            vt::DualRmsNormPlusRes(d.q, h2.t(), mlp_o.t(), w_p1, moe_out.tensor, w_p2, w_pff, h1.t(),
+                                   plain);
+            if (layer_prof) {
+              (void)t2;
+            }
+          }
+        } else {
+          vt::RmsNorm(d.q, dh2.t(), h1.t(), w_pf, plain);
+          Gemma4MlpBlock(d, mlp_o, w.mlp, H, I, dh2.t(), T);
+          Tensor w_pff = ResidentWeight(d, w.post_feedforward_layernorm, {H});
+          vt::RmsNormPlusAdd(d.q, h2.t(), mlp_o.t(), w_pff, h1.t(), plain);
+        }
+
+        if (layer_prof) {
+          d.b.Synchronize(d.q);
+          const auto t3 = clock::now();
+          // t1 is attn boundary; mlp/moe split not separated when parallel.
+          if (layer_hb) {
+            const double ff_ms =
+                std::chrono::duration<double, std::milli>(t3 - t1).count();
+            std::fprintf(stderr, "INFO gemma4-layer end l=%lld ff_ms=%.2f (mlp||moe possible)\n",
+                         static_cast<long long>(l), ff_ms);
+            std::fflush(stderr);
+          }
+          static std::atomic<uint64_t> n{0}, us_attn{0}, us_ff{0};
+          auto us = [](auto a, auto b) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+          };
+          us_attn.fetch_add(static_cast<uint64_t>(us(t0, t1)), std::memory_order_relaxed);
+          us_ff.fetch_add(static_cast<uint64_t>(us(t1, t3)), std::memory_order_relaxed);
+          const uint64_t c = n.fetch_add(1, std::memory_order_relaxed) + 1;
+          if (c == 32 || c % 128 == 0) {
+            std::fprintf(stderr,
+                         "gemma4 layer profile: calls=%llu attn_us=%.1f ff_us=%.1f "
+                         "(attn%%=%.0f ff%%=%.0f)\n",
+                         static_cast<unsigned long long>(c),
+                         static_cast<double>(us_attn.load()) / c,
+                         static_cast<double>(us_ff.load()) / c,
+                         100.0 * us_attn.load() / (us_attn.load() + us_ff.load() + 1),
+                         100.0 * us_ff.load() / (us_attn.load() + us_ff.load() + 1));
+          }
+        } else if (false) {
+          // keep old profile symbols out — replaced above
+        }
+
+        if (ple > 0) {
+      Tensor wg = ResidentWeight(d, w.per_layer_input_gate, {ple, H});
+      DBuf& gate_lin = *lt.gate_lin;
+      DBuf& ple_l = *lt.ple_l;
+      DBuf& gated = *lt.gated;
+      vt::MatmulBT(d.q, gate_lin.t(), h2.t(), wg);
+      const size_t layer_bytes = static_cast<size_t>(T) * ple_row_bytes;
+      const char* src = static_cast<const char*>(ple_by_layer.ptr()) +
+                        static_cast<size_t>(l) * layer_bytes;
+      d.b.Copy(d.q, ple_l.ptr(), src, layer_bytes);
+      vt::GeluMulSeparate(d.q, gated.ptr(), gate_lin.ptr(), ple_l.ptr(), T * ple,
+                                    DType::kBF16);
+
+      Tensor wp = ResidentWeight(d, w.per_layer_projection, {H, ple});
+      vt::MatmulBT(d.q, contrib.t(), gated.t(), wp);
+      Tensor w_pln = ResidentWeight(d, w.post_per_layer_input_norm, {H});
+      vt::RmsNorm(d.q, contrib.t(), contrib.t(), w_pln, plain);
+      vt::Add(d.q, h2.t(), h2.t(), contrib.t());
+    }
+
+    if (!w.layer_scalar.Empty()) {
+      const double scalar = static_cast<double>(ReadBf16Scalar(w.layer_scalar));
+      vt::MulScalar(d.q, h2.t(), h2.t(), scalar);
+    }
+
+    d.b.Copy(d.q, hidden.ptr(), h2.ptr(), th_bytes);
+  }
+}
+
+// If logits_out non-null and shaped [n_out,vocab] f32, write there (graph-stable).
+DBuf ForwardGemma4Logits(Dev d, DBuf& hidden, const Gemma4Weights& weights,
+                         const Gemma4Layout& g, const HfConfig& /*config*/,
+                         const std::vector<int32_t>& logits_indices, int64_t T, int64_t H,
+                         int64_t vocab, DBuf* logits_out = nullptr) {
+  const float eps = 1e-6f;
+  const vt::RmsNormArgs plain{eps, false};
+  Tensor w_fn = ResidentWeight(d, weights.final_norm, {H});
+  // TLS dnorm for graph stability when T fixed
+  struct NormTls {
+    int dev = -1;
+    int64_t T = 0, H = 0;
+    std::optional<DBuf> n;
+  };
+  static thread_local NormTls nt;
+  if (nt.dev != d.q.device.index || nt.T != T || nt.H != H || !nt.n) {
+    nt.n.emplace(d, DType::kBF16, std::vector<int64_t>{T, H});
+    nt.dev = d.q.device.index;
+    nt.T = T;
+    nt.H = H;
+  }
+  DBuf& dnorm = *nt.n;
+  vt::RmsNorm(d.q, dnorm.t(), hidden.t(), w_fn, plain);
+
+  const bool tied = weights.tie_word_embeddings || weights.lm_head.Empty();
+  Tensor lm = tied ? ResidentWeight(d, weights.embed_tokens, {vocab, H})
+                   : ResidentWeight(d, weights.lm_head);
+
+  const bool do_gather = !logits_indices.empty() &&
+                         static_cast<int64_t>(logits_indices.size()) < T;
+  Tensor src = dnorm.t();
+  DBuf dgather(d, DType::kBF16,
+               do_gather ? std::vector<int64_t>{
+                               static_cast<int64_t>(logits_indices.size()), H}
+                         : std::vector<int64_t>{1, 1});
+  if (do_gather) {
+    GatherRows(d, dgather.ptr(), dnorm.t(), logits_indices, H);
+    src = dgather.t();
+  }
+  const int64_t n_out = src.shape[0];
+  if (logits_out != nullptr) {
+    VT_CHECK(logits_out->t().shape[0] == n_out && logits_out->t().shape[1] == vocab,
+             "gemma4 logits_out shape");
+    if (tied)
+      vt::MatmulBT(d.q, logits_out->t(), src, lm);
+    else
+      vt::Matmul(d.q, logits_out->t(), src, lm);
+    if (g.final_logit_softcap > 0.0f)
+      vt::SoftCap(d.q, logits_out->t(), logits_out->t(), g.final_logit_softcap);
+    // Return a non-owning move-friendly empty: caller holds logits_out.
+    // Use a dummy 1x1 that won't be used — callers with logits_out ignore return.
+    return DBuf(d, DType::kF32, std::vector<int64_t>{1, 1});
+  }
+  DBuf logits(d, DType::kF32, {n_out, vocab});
+  if (tied)
+    vt::MatmulBT(d.q, logits.t(), src, lm);
+  else
+    vt::Matmul(d.q, logits.t(), src, lm);
+
+  if (g.final_logit_softcap > 0.0f)
+    vt::SoftCap(d.q, logits.t(), logits.t(), g.final_logit_softcap);
+  return logits;
 }
 
 // CLAIM-GEMMA4-MM-E2E: `inputs_embeds_override` (host bf16 [T*H]) and
@@ -508,196 +842,10 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   d.b.Copy(d.q, hidden.ptr(), tok.ptr(),
            static_cast<size_t>(T) * static_cast<size_t>(H) * sizeof(uint16_t));
 
-  const size_t ple_row_bytes = static_cast<size_t>(ple) * sizeof(uint16_t);
-
-  // Decode/prefill layer scratch reused across L (pool thrash was real on 30L MoE).
-  struct LayerTls {
-    int dev = -1;
-    int64_t T = 0, H = 0, I = 0, ple = 0;
-    std::optional<DBuf> dhn, attn_n, h1, dh2, h2, moe_in, n1, n2, sum, n3, mlp_n;
-    std::optional<DBuf> gate_lin, ple_l, gated, contrib;
-  };
-  static thread_local LayerTls lt;
-  if (lt.dev != d.q.device.index || lt.T != T || lt.H != H || lt.I != I || lt.ple != ple) {
-    auto mk = [&](int64_t a, int64_t b) {
-      return DBuf(d, DType::kBF16, std::vector<int64_t>{a, b});
-    };
-    lt.dhn.emplace(mk(T, H));
-    lt.attn_n.emplace(mk(T, H));
-    lt.h1.emplace(mk(T, H));
-    lt.dh2.emplace(mk(T, H));
-    lt.h2.emplace(mk(T, H));
-    lt.moe_in.emplace(mk(T, H));
-    lt.n1.emplace(mk(T, H));
-    lt.n2.emplace(mk(T, H));
-    lt.sum.emplace(mk(T, H));
-    lt.n3.emplace(mk(T, H));
-    lt.mlp_n.emplace(mk(T, H));
-    lt.contrib.emplace(mk(T, H));
-    if (ple > 0) {
-      lt.gate_lin.emplace(mk(T, ple));
-      lt.ple_l.emplace(mk(T, ple));
-      lt.gated.emplace(mk(T, ple));
-    } else {
-      lt.gate_lin.reset();
-      lt.ple_l.reset();
-      lt.gated.reset();
-    }
-    lt.dev = d.q.device.index;
-    lt.T = T;
-    lt.H = H;
-    lt.I = I;
-    lt.ple = ple;
-  }
-  DBuf& dhn = *lt.dhn;
-  DBuf& h1 = *lt.h1;
-  DBuf& dh2 = *lt.dh2;
-  DBuf& h2 = *lt.h2;
-  DBuf& moe_in = *lt.moe_in;
-  const size_t th_bytes = static_cast<size_t>(T) * static_cast<size_t>(H) * sizeof(uint16_t);
-  DBuf& contrib = *lt.contrib;
-
-  for (int64_t l = 0; l < L; ++l) {
-    const Gemma4LayerWeights& w = weights.layers[static_cast<size_t>(l)];
-    const int64_t Dh = w.head_dim;
-    const bool full = w.is_full_attention;
-    const Tensor ones_dh = full ? ones_full.t() : ones_sliding.t();
-    std::optional<int64_t> window;
-    if (!full) window = g.sliding_window;
-
-    const int64_t kv_idx = w.is_kv_shared ? w.kv_target_layer : l;
-    VT_CHECK(kv_idx >= 0 && kv_idx < L, "gemma4: bad kv target layer");
-    const PagedKvCache& kv = attn_kv[static_cast<size_t>(kv_idx)];
-
-    Tensor w_in = ResidentWeight(d, w.input_layernorm, {H});
-    vt::RmsNorm(d.q, dhn.t(), hidden.t(), w_in, plain);
-
-    static const bool layer_prof = [] {
-      const char* e = std::getenv("VT_GEMMA4_PROFILE");
-      return e && e[0] == '1';
-    }();
-    using clock = std::chrono::steady_clock;
-    const auto t0 = layer_prof ? clock::now() : clock::time_point{};
-
-    DBuf attn = Gemma4AttnBlock(d, w, g, dhn.t(), si, attn_meta, kv, T, Dh, full,
-                                ones_dh, full ? &prop_cache.t() : nullptr, window,
-                                g.rope_theta_sliding);
-
-    Tensor w_pa = ResidentWeight(d, w.post_attention_layernorm, {H});
-    // h1 = rmsnorm(attn) + hidden  (one kernel)
-    vt::RmsNormPlusAdd(d.q, h1.t(), attn.t(), w_pa, hidden.t(), plain);
-
-    if (layer_prof) d.b.Synchronize(d.q);
-    const auto t1 = layer_prof ? clock::now() : clock::time_point{};
-
-    Tensor w_pf = ResidentWeight(d, w.pre_feedforward_layernorm, {H});
-    vt::RmsNorm(d.q, dh2.t(), h1.t(), w_pf, plain);
-    DBuf mlp = Gemma4MlpBlock(d, w.mlp, H, I, dh2.t(), T);
-
-    if (layer_prof) d.b.Synchronize(d.q);
-    const auto t2 = layer_prof ? clock::now() : clock::time_point{};
-
-    if (w.moe.enabled) {
-      Tensor w_pf2 = ResidentWeight(d, w.moe.pre_feedforward_layernorm_2, {H});
-      vt::RmsNorm(d.q, moe_in.t(), h1.t(), w_pf2, plain);
-      Gemma4MoeScratch moe_out =
-          RunGemma4Moe(d.q, w.moe, /*router_in=*/h1.t(), /*expert_in=*/moe_in.t(), T, H, eps);
-      Tensor w_p1 = ResidentWeight(d, w.moe.post_feedforward_layernorm_1, {H});
-      Tensor w_p2 = ResidentWeight(d, w.moe.post_feedforward_layernorm_2, {H});
-      Tensor w_pff = ResidentWeight(d, w.post_feedforward_layernorm, {H});
-      // h2 = rmsnorm(rmsnorm(mlp)+rmsnorm(moe), w_pff) + h1  — one fused kernel
-      vt::DualRmsNormPlusRes(d.q, h2.t(), mlp.t(), w_p1, moe_out.tensor, w_p2, w_pff,
-                                       h1.t(), plain);
-    } else {
-      Tensor w_pff = ResidentWeight(d, w.post_feedforward_layernorm, {H});
-      vt::RmsNormPlusAdd(d.q, h2.t(), mlp.t(), w_pff, h1.t(), plain);
-    }
-
-    if (layer_prof) {
-      d.b.Synchronize(d.q);
-      const auto t3 = clock::now();
-      static std::atomic<uint64_t> n{0}, us_attn{0}, us_mlp{0}, us_moe{0};
-      auto us = [](auto a, auto b) {
-        return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
-      };
-      us_attn.fetch_add(static_cast<uint64_t>(us(t0, t1)), std::memory_order_relaxed);
-      us_mlp.fetch_add(static_cast<uint64_t>(us(t1, t2)), std::memory_order_relaxed);
-      us_moe.fetch_add(static_cast<uint64_t>(us(t2, t3)), std::memory_order_relaxed);
-      const uint64_t c = n.fetch_add(1, std::memory_order_relaxed) + 1;
-      if (c == 32 || c % 128 == 0) {
-        std::fprintf(stderr,
-                     "gemma4 layer profile: calls=%llu attn_us=%.1f mlp_us=%.1f moe_us=%.1f "
-                     "(attn%%=%.0f mlp%%=%.0f moe%%=%.0f)\n",
-                     static_cast<unsigned long long>(c),
-                     static_cast<double>(us_attn.load()) / c,
-                     static_cast<double>(us_mlp.load()) / c,
-                     static_cast<double>(us_moe.load()) / c,
-                     100.0 * us_attn.load() / (us_attn.load() + us_mlp.load() + us_moe.load() + 1),
-                     100.0 * us_mlp.load() / (us_attn.load() + us_mlp.load() + us_moe.load() + 1),
-                     100.0 * us_moe.load() / (us_attn.load() + us_mlp.load() + us_moe.load() + 1));
-      }
-    }
-
-    if (ple > 0) {
-      Tensor wg = ResidentWeight(d, w.per_layer_input_gate, {ple, H});
-      DBuf& gate_lin = *lt.gate_lin;
-      DBuf& ple_l = *lt.ple_l;
-      DBuf& gated = *lt.gated;
-      vt::MatmulBT(d.q, gate_lin.t(), h2.t(), wg);
-      // Contiguous [T,ple] slice for this layer from [L,T,ple] layout.
-      const size_t layer_bytes = static_cast<size_t>(T) * ple_row_bytes;
-      const char* src = static_cast<const char*>(ple_by_layer.ptr()) +
-                        static_cast<size_t>(l) * layer_bytes;
-      d.b.Copy(d.q, ple_l.ptr(), src, layer_bytes);
-      vt::GeluMulSeparate(d.q, gated.ptr(), gate_lin.ptr(), ple_l.ptr(), T * ple,
-                                    DType::kBF16);
-
-      Tensor wp = ResidentWeight(d, w.per_layer_projection, {H, ple});
-      vt::MatmulBT(d.q, contrib.t(), gated.t(), wp);
-      Tensor w_pln = ResidentWeight(d, w.post_per_layer_input_norm, {H});
-      vt::RmsNorm(d.q, contrib.t(), contrib.t(), w_pln, plain);
-      vt::Add(d.q, h2.t(), h2.t(), contrib.t());
-    }
-
-    if (!w.layer_scalar.Empty()) {
-      const double scalar = static_cast<double>(ReadBf16Scalar(w.layer_scalar));
-      vt::MulScalar(d.q, h2.t(), h2.t(), scalar);
-    }
-
-    d.b.Copy(d.q, hidden.ptr(), h2.ptr(), th_bytes);
-  }
-
-  // Final norm (plain RMSNorm, standalone — residual is None in vLLM).
-  Tensor w_fn = ResidentWeight(d, weights.final_norm, {H});
-  DBuf dnorm(d, DType::kBF16, {T, H});
-  vt::RmsNorm(d.q, dnorm.t(), hidden.t(), w_fn, plain);
-
-  // Tied lm_head + final logit soft-cap.
-  const bool tied = weights.tie_word_embeddings || weights.lm_head.Empty();
-  Tensor lm = tied ? ResidentWeight(d, weights.embed_tokens, {vocab, H})
-                   : ResidentWeight(d, weights.lm_head);
-
-  const bool do_gather = !logits_indices.empty() &&
-                         static_cast<int64_t>(logits_indices.size()) < T;
-  Tensor src = dnorm.t();
-  DBuf dgather(d, DType::kBF16,
-               do_gather ? std::vector<int64_t>{
-                               static_cast<int64_t>(logits_indices.size()), H}
-                         : std::vector<int64_t>{1, 1});
-  if (do_gather) {
-    GatherRows(d, dgather.ptr(), dnorm.t(), logits_indices, H);
-    src = dgather.t();
-  }
-  const int64_t n_out = src.shape[0];
-  DBuf logits(d, DType::kF32, {n_out, vocab});
-  if (tied)
-    vt::MatmulBT(d.q, logits.t(), src, lm);
-  else
-    vt::Matmul(d.q, logits.t(), src, lm);
-
-  if (g.final_logit_softcap > 0.0f)
-    vt::SoftCap(d.q, logits.t(), logits.t(), g.final_logit_softcap);
-  return logits;
+  // Layers (capturable region for future decode graph) then logits.
+  ForwardGemma4Layers(d, hidden, g, weights, config, attn_meta, attn_kv, si, ones_sliding,
+                      ones_full, prop_cache, ple_by_layer, T, H, I, L, ple);
+  return ForwardGemma4Logits(d, hidden, weights, g, config, logits_indices, T, H, vocab);
 }
 
 ForwardLogits WrapDeviceLogits(Dev d, DBuf&& dlogits, int64_t rows, int64_t vocab) {
@@ -758,6 +906,331 @@ std::vector<float> Gemma4Model::ForwardMm(
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
   return logits;
+}
+
+
+// ─── Gemma4DecodeGraph (opt-in pure-decode hipGraph) ─────────────────────────
+namespace {
+
+bool FrameworkCudaGraphOff() {
+  const char* e = std::getenv("VLLM_CPP_CUDAGRAPH");
+  return e != nullptr && e[0] == '0';
+}
+
+void HostCopyInPlace(std::vector<int32_t>& dst, const std::vector<int32_t>& src) {
+  if (dst.size() != src.size()) dst = src;
+  else if (!src.empty()) std::memcpy(dst.data(), src.data(), src.size() * sizeof(int32_t));
+}
+
+template <typename T>
+void CopyInPlace(std::vector<T>& dst, const std::vector<T>& src) {
+  if (dst.size() != src.size()) dst = src;
+  else if (!src.empty()) std::copy(src.begin(), src.end(), dst.begin());
+}
+
+void RefreshHostAttnMeta(CommonAttentionMetadata& dst, const CommonAttentionMetadata& am) {
+  CopyInPlace(dst.slot_mapping, am.slot_mapping);
+  CopyInPlace(dst.block_table_tensor, am.block_table_tensor);
+  CopyInPlace(dst.seq_lens, am.seq_lens);
+  CopyInPlace(dst.query_start_loc, am.query_start_loc);
+  dst.num_reqs = am.num_reqs;
+  dst.num_actual_tokens = am.num_actual_tokens;
+  dst.max_query_len = am.max_query_len;
+  dst.max_seq_len = am.max_seq_len;
+  dst.block_table_num_cols = am.block_table_num_cols;
+  dst.causal = am.causal;
+}
+
+// Host sources MUST be process-persistent (captured H2D bakes addresses).
+void RefreshStepInputsInPlace(Dev d, StepInputs& s, const std::vector<int32_t>& positions,
+                              const CommonAttentionMetadata& am, const HfConfig& cfg) {
+  const int64_t T = static_cast<int64_t>(positions.size());
+  VT_CHECK(s.positions.t().shape[0] == T, "gemma4 graph: T mismatch");
+  d.b.Copy(d.q, s.positions.ptr(), positions.data(),
+           static_cast<size_t>(T) * sizeof(int32_t));
+  d.b.Copy(d.q, s.slot_mapping.ptr(), am.slot_mapping.data(),
+           static_cast<size_t>(T) * sizeof(int64_t));
+  d.b.Copy(d.q, s.seq_lens.ptr(), am.seq_lens.data(),
+           static_cast<size_t>(am.num_reqs) * sizeof(int32_t));
+  d.b.Copy(d.q, s.query_start_loc.ptr(), am.query_start_loc.data(),
+           static_cast<size_t>(am.num_reqs + 1) * sizeof(int32_t));
+  const size_t bt_bytes = static_cast<size_t>(am.num_reqs) *
+                          static_cast<size_t>(am.block_table_num_cols) * sizeof(int32_t);
+  d.b.Copy(d.q, s.block_table.ptr(), am.block_table_tensor.data(), bt_bytes);
+  const int rot = static_cast<int>(cfg.rotary_dim);
+  if (rot > 0) {
+    vt::RopeCosSinCache(d.q, s.cos_sin.t(), s.positions.t(), MakeRopeArgs(cfg));
+    if (RopeCacheEnabled()) vt::CastBf16(d.q, s.cos_sin_bf16.t(), s.cos_sin.t());
+  }
+}
+
+}  // namespace
+
+struct Gemma4DecodeGraph::Impl {
+  const Gemma4Weights& weights;
+  HfConfig config;
+  vt::Queue queue;
+  Gemma4Layout layout{};
+  bool enabled = false;
+  bool failed = false;
+  int warm_steps = 0;  // eager decode steps before first capture
+  bool captured = false;
+  void* graph = nullptr;
+  int64_t replays = 0;
+  static constexpr int kWarmBeforeCapture = 4;
+  int fa_cols = -1;
+  int64_t prop_cap = 0;
+
+  std::vector<int32_t> h_tok, h_pos;
+  CommonAttentionMetadata h_attn;  // persistent host meta (graph-safe H2D sources)
+  // Persistent device
+  std::optional<DBuf> hidden, logits, ones_sliding, ones_full, prop_cache, ple_by_layer;
+  std::optional<DBuf> d_tok;  // embed ids — stable, not pool-steal after capture
+  std::optional<StepInputs> si;
+
+  Impl(const Gemma4Weights& w, const HfConfig& c, vt::Queue q)
+      : weights(w), config(c), queue(q) {
+    layout = MakeLayout(config);
+    enabled = !FrameworkCudaGraphOff() &&
+              vt::GetBackend(queue.device.type).SupportsGraphCapture();
+  }
+  ~Impl() {
+    if (graph) {
+      try {
+        vt::GetBackend(queue.device.type).DestroyGraph(graph);
+      } catch (...) {
+      }
+      graph = nullptr;
+    }
+  }
+};
+
+Gemma4DecodeGraph::Gemma4DecodeGraph(const Gemma4Weights& weights, const HfConfig& config,
+                                     vt::Queue queue)
+    : impl_(std::make_unique<Impl>(weights, config, queue)) {}
+Gemma4DecodeGraph::~Gemma4DecodeGraph() = default;
+bool Gemma4DecodeGraph::captured() const { return impl_ && impl_->captured; }
+int64_t Gemma4DecodeGraph::replay_count() const { return impl_ ? impl_->replays : 0; }
+
+bool Gemma4DecodeGraphEnabled() {
+  const char* e = std::getenv("VLLM_CPP_GEMMA4_DECODE_GRAPH");
+  return e != nullptr && e[0] == '1';  // default OFF until lab A/B green
+}
+
+ForwardLogits Gemma4DecodeGraph::Step(const std::vector<int32_t>& token_ids,
+                                      const std::vector<int32_t>& positions,
+                                      const CommonAttentionMetadata& attn_meta,
+                                      const std::vector<PagedKvCache>& attn_kv) {
+  Impl& I = *impl_;
+  Dev d{vt::GetBackend(I.queue.device.type), I.queue};
+  Backend& b = vt::GetBackend(I.queue.device.type);
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  const int64_t H = I.layout.hidden;
+  const int64_t L = I.layout.num_layers;
+  const int64_t ple = I.layout.ple_dim;
+  const int64_t vocab = I.config.vocab_size;
+  const int64_t Inter = I.config.intermediate_size;
+  const std::vector<int32_t> kNoGather;
+
+  // Only pure single-token decode for v1 graph.
+  // Dual-GPU peer + hipGraph: capture can succeed but replay page-faults on peer
+  // memory (lab 2026-08-09). Refuse graph when experts are off compute device.
+  if (!I.failed) {
+    const int cdev = I.queue.device.index;
+    for (const auto& layer : I.weights.layers) {
+      if (layer.moe.enabled && layer.moe.experts.fp8_native_resident &&
+          layer.moe.experts.dev_id >= 0 && layer.moe.experts.dev_id != cdev) {
+        I.failed = true;
+        static bool once = false;
+        if (!once) {
+          std::fprintf(stderr,
+                       "[Gemma4DecodeGraph] peer MoE (gpu %d vs compute %d) — graph off "
+                       "(replay page-fault; need single-dev or graph-safe peer)\n",
+                       layer.moe.experts.dev_id, cdev);
+          once = true;
+        }
+        break;
+      }
+    }
+  }
+  if (!I.enabled || I.failed || T != 1 || positions.size() != 1) {
+    DBuf lg = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, I.weights, I.config,
+                          kNoGather);
+    return WrapDeviceLogits(d, std::move(lg), lg.t().shape[0], vocab);
+  }
+
+  HostCopyInPlace(I.h_tok, token_ids);
+  HostCopyInPlace(I.h_pos, positions);
+  RefreshHostAttnMeta(I.h_attn, attn_meta);
+  const int cols = I.h_attn.block_table_num_cols;
+  if (I.fa_cols != -1 && I.fa_cols != cols) {
+    // block table width change invalidates captured memcpy geometry
+    if (I.graph) {
+      b.DestroyGraph(I.graph);
+      I.graph = nullptr;
+    }
+    I.captured = false;
+    I.warm_steps = 0;
+  }
+  I.fa_cols = cols;
+
+  // Ensure persistent device buffers
+  if (!I.hidden) {
+    I.hidden.emplace(d, DType::kBF16, std::vector<int64_t>{T, H});
+    I.logits.emplace(d, DType::kF32, std::vector<int64_t>{T, vocab});
+    std::vector<uint16_t> one_s(static_cast<size_t>(I.layout.head_dim_sliding),
+                                vt::F32ToBF16(1.f));
+    std::vector<uint16_t> one_f(static_cast<size_t>(I.layout.head_dim_full),
+                                vt::F32ToBF16(1.f));
+    I.ones_sliding.emplace(d, DType::kBF16, std::vector<int64_t>{I.layout.head_dim_sliding},
+                           one_s.data());
+    I.ones_full.emplace(d, DType::kBF16, std::vector<int64_t>{I.layout.head_dim_full},
+                        one_f.data());
+    const int64_t max_pos_cap =
+        std::max<int64_t>(I.config.max_position_embeddings > 0
+                              ? I.config.max_position_embeddings
+                              : 65536,
+                          65536);
+    I.prop_cache = BuildProportionalRopeCache(d, I.layout, I.layout.head_dim_full, max_pos_cap);
+    I.prop_cap = max_pos_cap;
+    I.ple_by_layer.emplace(d, DType::kBF16,
+                           ple > 0 ? std::vector<int64_t>{L, T, ple}
+                                   : std::vector<int64_t>{1, 1, 1});
+    I.si = BuildStepInputs(d, I.h_pos, I.h_attn, I.config);
+    I.d_tok.emplace(d, DType::kI32, std::vector<int64_t>{T});
+  }
+
+  // max_pos beyond prop cache → eager
+  int64_t max_pos = 0;
+  for (int32_t p : positions) max_pos = std::max<int64_t>(max_pos, p);
+  if (max_pos > I.prop_cap) {
+    DBuf lg = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, I.weights, I.config,
+                          kNoGather);
+    return WrapDeviceLogits(d, std::move(lg), lg.t().shape[0], vocab);
+  }
+
+  // --- Outside graph: embed + PLE + refresh SI ---
+  {
+    Tensor dtab = ResidentWeight(d, I.weights.embed_tokens, {vocab, H});
+    d.b.Copy(d.q, I.d_tok->ptr(), I.h_tok.data(),
+             static_cast<size_t>(T) * sizeof(int32_t));
+    vt::Embedding(d.q, I.hidden->t(), dtab, I.d_tok->t());
+    const float nsqrt = std::sqrt(static_cast<float>(H));
+    const double normalizer =
+        static_cast<double>(vt::BF16ToF32(vt::F32ToBF16(nsqrt)));
+    vt::MulScalar(d.q, I.hidden->t(), I.hidden->t(), normalizer);
+  }
+  if (ple > 0) {
+    // Full PLE precompute into ple_by_layer (same as ForwardBody) — outside graph.
+    const int64_t LP = L * ple;
+    const float eps = 1e-6f;
+    const vt::RmsNormArgs plain{eps, false};
+    DBuf ple_emb(d, DType::kBF16, {T, LP});
+    {
+      Tensor dtab = ResidentWeight(d, I.weights.embed_tokens_per_layer, {vocab, LP});
+      vt::Embedding(d.q, ple_emb.t(), dtab, I.d_tok->t());
+    }
+    vt::MulScalar(d.q, ple_emb.t(), ple_emb.t(),
+                  static_cast<double>(I.layout.embed_scale_ple));
+    DBuf ple_proj(d, DType::kBF16, {T, LP});
+    Tensor wproj = ResidentWeight(d, I.weights.per_layer_model_projection, {LP, H});
+    vt::MatmulBT(d.q, ple_proj.t(), I.hidden->t(), wproj);
+    vt::MulScalar(d.q, ple_proj.t(), ple_proj.t(), I.layout.proj_scale);
+    Tensor proj2 = Reshape(ple_proj.t(), {T * L, ple});
+    Tensor wpn = ResidentWeight(d, I.weights.per_layer_projection_norm, {ple});
+    vt::RmsNorm(d.q, proj2, proj2, wpn, plain);
+    DBuf ple_input(d, DType::kBF16, {T, L, ple});
+    vt::Add(d.q, ple_input.t(), Reshape(ple_proj.t(), {T, L, ple}),
+            Reshape(ple_emb.t(), {T, L, ple}));
+    vt::MulScalar(d.q, ple_input.t(), ple_input.t(), I.layout.input_scale);
+    const size_t row = static_cast<size_t>(ple) * sizeof(uint16_t);
+    const auto* src = static_cast<const char*>(ple_input.ptr());
+    auto* dst = static_cast<char*>(I.ple_by_layer->ptr());
+    for (int64_t ti = 0; ti < T; ++ti) {
+      for (int64_t li = 0; li < L; ++li) {
+        const size_t s_off =
+            (static_cast<size_t>(ti) * static_cast<size_t>(L) + static_cast<size_t>(li)) * row;
+        const size_t d_off =
+            (static_cast<size_t>(li) * static_cast<size_t>(T) + static_cast<size_t>(ti)) * row;
+        CopyRow(d, dst + d_off, src + s_off, row);
+      }
+    }
+  }
+  RefreshStepInputsInPlace(d, *I.si, I.h_pos, I.h_attn, I.config);
+
+  auto run_layers_logits = [&]() {
+    ForwardGemma4Layers(d, *I.hidden, I.layout, I.weights, I.config, I.h_attn, attn_kv, *I.si,
+                        *I.ones_sliding, *I.ones_full, *I.prop_cache, *I.ple_by_layer, T, H,
+                        Inter, L, ple);
+    (void)ForwardGemma4Logits(d, *I.hidden, I.weights, I.layout, I.config, kNoGather, T, H,
+                              vocab, &*I.logits);
+  };
+
+  auto view_logits = [&]() -> ForwardLogits {
+    ForwardLogits fl;
+    fl.rows = T;
+    fl.vocab = vocab;
+    fl.device_tensor = I.logits->t();
+    // Non-owning: logits buffer owned by graph impl for process lifetime of Step calls.
+    fl.device_storage = std::shared_ptr<void>(I.logits->ptr(), [](void*) {});
+    return fl;
+  };
+
+  if (I.captured && I.graph) {
+    try {
+      b.ReplayGraph(I.queue, I.graph);
+      ++I.replays;
+      return view_logits();
+    } catch (const std::exception& ex) {
+      std::fprintf(stderr, "[Gemma4DecodeGraph] replay failed: %s — disabling\n", ex.what());
+      I.failed = true;
+      I.captured = false;
+    }
+  }
+
+  if (I.warm_steps >= I.kWarmBeforeCapture && !I.captured && !I.failed) {
+    try {
+      b.BeginCapture(I.queue);
+      run_layers_logits();
+      I.graph = b.EndCaptureGraph(I.queue);
+      I.captured = true;
+      std::fprintf(stderr, "[Gemma4DecodeGraph] captured S=1 pure-decode graph\n");
+      b.ReplayGraph(I.queue, I.graph);
+      I.replays = 1;
+      return view_logits();
+    } catch (const std::exception& ex) {
+      std::fprintf(stderr, "[Gemma4DecodeGraph] capture failed: %s — eager forever\n",
+                   ex.what());
+      I.failed = true;
+      if (I.graph) {
+        try {
+          b.DestroyGraph(I.graph);
+        } catch (...) {
+        }
+        I.graph = nullptr;
+      }
+      // fall through to eager result of a fresh run
+      run_layers_logits();
+      return view_logits();
+    }
+  }
+
+  // Eager decode steps: warm TLS / weights before capture.
+  run_layers_logits();
+  ++I.warm_steps;
+  return view_logits();
+}
+
+std::optional<ForwardLogits> Gemma4DecodeGraphForward(
+    std::unique_ptr<Gemma4DecodeGraph>& graph, const Gemma4Weights& weights,
+    const ModelForwardInput& input) {
+  if (!Gemma4DecodeGraphEnabled() || !input.pure_decode ||
+      !platforms::GetPlatform(input.queue.device.type).support_static_graph_mode()) {
+    return std::nullopt;
+  }
+  if (input.token_ids.size() != 1) return std::nullopt;
+  if (!graph) graph = std::make_unique<Gemma4DecodeGraph>(weights, input.config, input.queue);
+  return graph->Step(input.token_ids, input.positions, input.attn_meta, input.attn_kv);
 }
 
 }  // namespace vllm

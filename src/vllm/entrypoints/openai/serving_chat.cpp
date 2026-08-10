@@ -2,14 +2,20 @@
 // See serving_chat.h for scope, the chat-prompt seam and deferrals.
 #include "vllm/entrypoints/openai/serving_chat.h"
 
+#include <atomic>
 #include <chrono>
+#include <mutex>
+#include <exception>
+#include <condition_variable>
 #include <ctime>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -315,12 +321,19 @@ ShapedChatMessage ShapeChatMessageEngine(
 namespace {
 
 // chat_completion_stream_generator (serving.py:404-802) as W2's live,
-// pull-based SSE source. Continuous usage waits for and buffers the first
-// result so the role frame carries a native prompt-token count; subsequent
-// calls block only on this request's collector.
+// pull-based SSE source.
+//
+// Keepalive design (Hermes / llama.cpp parity):
+// 1) Return the HTTP SSE stream BEFORE engine add_request (tokenization can
+//    take seconds on giant system prompts). Role frame goes out on first next().
+// 2) add_request runs on a background thread so the httplib worker can emit
+//    role + SSE pings during tokenize/queue and long prefill.
+// 3) Each ping is ":\n\n" (proxy/TCP) + empty OpenAI data chunk (Hermes only
+//    resets last_chunk_time on real data: frames, not SSE comments).
 class ChatSseStream final : public SseStream {
  public:
-  ChatSseStream(v1::AsyncLLM& engine, v1::AsyncRequest async_request,
+  ChatSseStream(v1::AsyncLLM& engine, std::string engine_request_id,
+                std::string prompt, SamplingParams params, int priority,
                 std::string response_id, int64_t created, std::string model,
                 ChatCompletionRequest request,
                 std::unique_ptr<ToolParser> parser,
@@ -328,7 +341,10 @@ class ChatSseStream final : public SseStream {
                 std::unique_ptr<ReasoningParser> reasoning_parser,
                 bool named_tool_choice, StreamUsageSelection usage)
       : engine_(engine),
-        async_request_(std::move(async_request)),
+        engine_request_id_(std::move(engine_request_id)),
+        prompt_(std::move(prompt)),
+        params_(std::move(params)),
+        priority_(priority),
         response_id_(std::move(response_id)),
         created_(created),
         model_(std::move(model)),
@@ -337,28 +353,21 @@ class ChatSseStream final : public SseStream {
         engine_parser_(std::move(engine_parser)),
         reasoning_parser_(std::move(reasoning_parser)),
         named_tool_choice_(named_tool_choice),
-        usage_(usage) {}
+        usage_(usage) {
+    // Overlap tokenize+enqueue with the client receiving headers/role.
+    StartQueueThread();
+  }
 
-  ~ChatSseStream() override { abort(); }
+  ~ChatSseStream() override {
+    abort();
+    JoinQueueThread();
+  }
 
   bool next(std::string& chunk) override {
     if (complete_) return false;
     if (role_pending_) {
-      // Upstream emits the role frame on the first engine result. We only need
-      // to buffer that result when continuous usage requires its native prompt
-      // count; the default path retains its immediately available role frame.
-      if (usage_.include_continuous_usage) {
-        for (;;) {
-          RequestOutput response = engine_.get_output(async_request_);
-          prompt_tokens_ =
-              static_cast<int>(response.prompt_token_ids.size());
-          if (!response.outputs.empty() || response.finished) {
-            buffered_response_ = std::move(response);
-            break;
-          }
-        }
-      }
       role_pending_ = false;
+      last_ping_ = std::chrono::steady_clock::now();
       ChatCompletionResponseStreamChoice choice;
       choice.index = 0;
       choice.delta.role = kAssistantRole;
@@ -369,9 +378,6 @@ class ChatSseStream final : public SseStream {
       frame.created = created_;
       frame.model = model_;
       frame.choices.push_back(std::move(choice));
-      if (usage_.include_continuous_usage) {
-        frame.usage = UsageInfo{prompt_tokens_, prompt_tokens_, 0};
-      }
       chunk = "data: " + nlohmann::json(frame).dump() + "\n\n";
       return true;
     }
@@ -395,13 +401,29 @@ class ChatSseStream final : public SseStream {
       return true;
     }
 
+    // Wait for background add_request while emitting keepalives.
+    if (!EnsureQueued(chunk)) {
+      return true;  // ping chunk
+    }
+
     for (;;) {
+      if (aborted_.load()) {
+        complete_ = true;
+        return false;
+      }
       RequestOutput response;
       if (buffered_response_.has_value()) {
         response = std::move(*buffered_response_);
         buffered_response_.reset();
       } else {
-        response = engine_.get_output(async_request_);
+        std::optional<RequestOutput> ready =
+            engine_.get_output_nowait(*async_request_);
+        if (!ready.has_value()) {
+          if (MaybeSsePing(chunk)) return true;
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          continue;
+        }
+        response = std::move(*ready);
       }
       prompt_tokens_ = static_cast<int>(response.prompt_token_ids.size());
       if (response.outputs.empty()) {
@@ -414,6 +436,8 @@ class ChatSseStream final : public SseStream {
           }
           return next(chunk);
         }
+        if (MaybeSsePing(chunk)) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         continue;
       }
 
@@ -425,7 +449,8 @@ class ChatSseStream final : public SseStream {
       }
       previous_num_tokens_ += static_cast<int>(output.token_ids.size());
       const std::string current_text = previous_text_ + delta_text;
-      const bool finished = output.finish_reason.has_value() || response.finished;
+      const bool finished =
+          output.finish_reason.has_value() || response.finished;
       if (GetRequestLogConfig().debug_stages) {
         const auto now = std::chrono::steady_clock::now();
         if (previous_num_tokens_ <= 1 || finished ||
@@ -493,14 +518,117 @@ class ChatSseStream final : public SseStream {
   }
 
   void abort() override {
-    if (complete_ || engine_finished_ || aborted_) return;
-    aborted_ = true;
-    engine_.abort(async_request_.request_id);
+    if (complete_ || engine_finished_ || aborted_.exchange(true)) return;
+    // If queue finished, abort the engine id; if still queueing, the queue
+    // thread checks aborted_ and aborts after add_request returns.
+    std::lock_guard<std::mutex> lock(queue_mu_);
+    if (queued_ && async_request_.has_value()) {
+      engine_.abort(async_request_->request_id);
+    }
   }
 
  private:
+  void StartQueueThread() {
+    queue_thread_ = std::thread([this] {
+      try {
+        if (aborted_.load()) {
+          std::lock_guard<std::mutex> lock(queue_mu_);
+          queue_done_ = true;
+          queue_cv_.notify_all();
+          return;
+        }
+        v1::AsyncRequest ar = engine_.add_request(
+            engine_request_id_, prompt_, std::move(params_), priority_);
+        {
+          std::lock_guard<std::mutex> lock(queue_mu_);
+          if (aborted_.load()) {
+            engine_.abort(ar.request_id);
+          } else {
+            async_request_ = std::move(ar);
+            queued_ = true;
+          }
+          // Drop prompt copy once enqueued.
+          prompt_.clear();
+          prompt_.shrink_to_fit();
+          queue_done_ = true;
+        }
+        if (GetRequestLogConfig().debug_stages) {
+          ChatDbg(response_id_, "stage=async_queued");
+        }
+        queue_cv_.notify_all();
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(queue_mu_);
+        queue_error_ = std::current_exception();
+        queue_done_ = true;
+        queue_cv_.notify_all();
+      }
+    });
+  }
+
+  void JoinQueueThread() {
+    if (queue_thread_.joinable()) queue_thread_.join();
+  }
+
+  // true => async_request_ ready; false => filled chunk with keepalive ping
+  bool EnsureQueued(std::string& chunk) {
+    std::unique_lock<std::mutex> lock(queue_mu_);
+    for (;;) {
+      if (queue_error_) {
+        std::rethrow_exception(queue_error_);
+      }
+      if (queued_ && async_request_.has_value()) {
+        return true;
+      }
+      if (queue_done_ && !queued_) {
+        // aborted during queue with no request, or empty failure path
+        complete_ = true;
+        throw std::runtime_error("stream aborted before engine queue");
+      }
+      lock.unlock();
+      if (MaybeSsePing(chunk)) return false;
+      lock.lock();
+      queue_cv_.wait_for(lock, std::chrono::milliseconds(50));
+    }
+  }
+
+  bool MaybeSsePing(std::string& chunk) {
+    const int interval = SsePingIntervalSec();
+    if (interval <= 0) return false;
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::seconds>(now - last_ping_)
+            .count() < interval) {
+      return false;
+    }
+    last_ping_ = now;
+    ChatCompletionResponseStreamChoice choice;
+    choice.index = 0;
+    choice.delta = DeltaMessage{};
+    choice.finish_reason = std::nullopt;
+    ChatCompletionStreamResponse frame;
+    frame.id = response_id_;
+    frame.created = created_;
+    frame.model = model_;
+    frame.choices.push_back(std::move(choice));
+    chunk = std::string(kSsePingFrame) + "data: " + nlohmann::json(frame).dump() +
+            "\n\n";
+    if (GetRequestLogConfig().debug_stages) {
+      ChatDbg(response_id_, "stage=sse_ping prefill_wait=1");
+    }
+    return true;
+  }
+
   v1::AsyncLLM& engine_;
-  v1::AsyncRequest async_request_;
+  std::string engine_request_id_;
+  std::string prompt_;
+  SamplingParams params_;
+  int priority_ = 0;
+  std::optional<v1::AsyncRequest> async_request_;
+  std::thread queue_thread_;
+  std::mutex queue_mu_;
+  std::condition_variable queue_cv_;
+  bool queued_ = false;
+  bool queue_done_ = false;
+  std::exception_ptr queue_error_;
   std::string response_id_;
   int64_t created_ = 0;
   std::string model_;
@@ -517,11 +645,12 @@ class ChatSseStream final : public SseStream {
   bool done_pending_ = false;
   bool complete_ = false;
   bool engine_finished_ = false;
-  bool aborted_ = false;
+  std::atomic<bool> aborted_{false};
   bool tools_streamed_ = false;
   int previous_num_tokens_ = 0;
   std::string previous_text_;
   std::chrono::steady_clock::time_point last_dbg_{std::chrono::steady_clock::now()};
+  std::chrono::steady_clock::time_point last_ping_{std::chrono::steady_clock::now()};
 };
 
 }  // namespace
@@ -748,6 +877,9 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   const bool named_tool_choice = IsNamedToolChoice(request);
 
   SamplingParams sampling_params = request.to_sampling_params();
+  // Operator ceiling for *positive* oversized max_tokens only.
+  // Non-positive / missing is UNSET (protocol.cpp -> max_model_len - seq_len);
+  // do NOT map -1 onto this cap (main 2d2bdd04 / SERVE-MAXTOKENS-UNSET).
   if (kMaxNewTokensCap > 0) {
     const int before = sampling_params.max_tokens.value_or(kMaxNewTokensCap);
     if (before > kMaxNewTokensCap) {
@@ -775,21 +907,17 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
     ChatDbg(request_id, "stage=stream_begin engine=" +
                             std::string(async_engine_ != nullptr ? "async" : "sync"));
     if (async_engine_ != nullptr) {
-      v1::AsyncRequest async_request = async_engine_->add_request(
-          engine_request_id, prompt, std::move(sampling_params),
-          request.priority);
-      ChatDbg(request_id, "stage=async_queued");
+      // Do NOT block the HTTP worker on tokenize/add_request — ChatSseStream
+      // queues on a background thread and emits role + SSE pings immediately.
+      ChatDbg(request_id, "stage=stream_return deferred_queue=1");
       ChatCompletionResult result;
       result.streaming = true;
-      try {
-        result.sse_stream = std::make_shared<ChatSseStream>(
-            *async_engine_, async_request, request_id, created_time, model_name,
-            request, std::move(parser), std::move(engine_parser),
-            std::move(reasoning_parser), named_tool_choice, usage);
-      } catch (...) {
-        async_engine_->abort(async_request.request_id);
-        throw;
-      }
+      result.sse_stream = std::make_shared<ChatSseStream>(
+          *async_engine_, engine_request_id, std::move(prompt),
+          std::move(sampling_params), request.priority, request_id,
+          created_time, model_name, request, std::move(parser),
+          std::move(engine_parser), std::move(reasoning_parser),
+          named_tool_choice, usage);
       return result;
     }
 
@@ -945,7 +1073,7 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   // With mm inputs, drive the engine mm overload (placeholder-expanded prompt +
   // mm_features); otherwise the text-only string overload byte-identically. The
   // mm forward on the GPU worker consumes the mm_features (MM-SERVE-E2E).
-  ChatDbg(request_id, "stage=generate_blocking begin (prefill+decode; long prompts stall here)");
+  ChatDbg(request_id, "stage=generate_blocking begin (prefill+decode; long prompts slowdown here)");
   const RequestOutput final_res =
       mm_inputs.has_value()
           ? (async_engine_ != nullptr
