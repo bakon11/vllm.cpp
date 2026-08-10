@@ -108,9 +108,13 @@ set(MLX_ROOT "" CACHE PATH "Root of an MLX install (include/ + lib/) for VLLM_CP
 #                 sm_120 board exists on this hardware. See backend-matrix.md
 #                 BACKEND-CUDA-SM120 for exactly what is and is not proven.
 #   120a;121a     same-family FAT binary; builds clean and carries both SASS
-#                 targets. NOTE: incompatible with -DVLLM_CPP_TRITON=ON, because a
-#                 vendored AOT cubin is single-arch (TritonAOT.cmake explains and
-#                 diagnoses this); the portable CUDA kernels cover the fat build.
+#                 targets. VLLM_CPP_TRITON=ON is FINE here (and is the default):
+#                 a vendored AOT cubin is single-arch, but the W2 builder embeds
+#                 EVERY vendored tree and picks one by exact SM at runtime, so
+#                 sm_120a — which has no tree — simply uses the portable CUDA
+#                 kernels. This is what the shipped ten-SM release archive and
+#                 the cuda-fat-gencode CI job build. The single-arch FATAL_ERROR
+#                 in TritonAOT.cmake guards the MAINTAINER regen flow only.
 #   90a           Hopper (H100/H200) — a DIFFERENT family. Single-arch only, and
 #                 PORTABLE-KERNELS-ONLY: all five accelerated features resolve
 #                 DISABLED (we have no Hopper wgmma/TMA kernel body, so no
@@ -362,6 +366,45 @@ elseif(VLLM_CPP_HIP)
   # in the RmsNorm reduction is exactly the kind of drift that budget is meant to
   # catch rather than absorb.
   add_compile_options($<$<COMPILE_LANGUAGE:HIP>:-ffp-contract=off>)
+  # Floor HIP DEVICE code at -O1 when nothing else sets an optimisation level.
+  #
+  # This is not a performance preference, it is a correctness workaround for the
+  # ROCm runtime (issue #132, VikashLoomba, 4x gfx1100 / ROCm 7.14). The
+  # documented first build — `cmake -S . -B build-hip -DVLLM_CPP_HIP=ON`, no
+  # CMAKE_BUILD_TYPE — passes no -O at all, so hipcc compiles at -O0. At -O0 all
+  # eight RmsNorm specialisations come out with AMDHSA metadata
+  # `.uses_dynamic_stack: true` plus `hidden_hostcall_buffer` / `hidden_heap_v1`,
+  # even though the kernel performs no hostcall. That makes CLR create a hostcall
+  # buffer and start a listener thread on the first launch.
+  #
+  # CLR's listener startup/termination handshake is racy (the shared state is
+  # `volatile`, not atomic, and the upstream source still carries its own
+  # `FIXME_lmoriche: fix termination handshake`): under host CPU saturation a
+  # delayed listener can overwrite the `kExit` written by terminate(), and DSO
+  # finalisation then spins forever waiting for a thread that has already exited.
+  # The symptom is `test_backend_cross_device` hanging AFTER printing
+  # `Status: SUCCESS!` — 11/11 cases, 39/39 assertions, then no exit.
+  #
+  # The report's controlled A/B, relinking the same library with ONLY
+  # rocm_rmsnorm.hip.o changed, on a 48-thread host:
+  #   -O0 object (dynamic stack, hidden hostcall + heap): 14/20 teardown timeouts
+  #   -O1 object (no dynamic stack, no hostcall/heap):    20/20 clean exits
+  # The same finaliser loop also reproduces in a standalone raw-HIP program that
+  # links neither vllm.cpp nor doctest, so the defect is CLR's, not the harness'.
+  # The definitive fix belongs upstream in CLR; this keeps our documented build
+  # off the path that triggers it.
+  #
+  # Deliberately yields to any explicit choice: if the developer set a build type
+  # or put an -O in CMAKE_HIP_FLAGS, that wins and nothing is added here.
+  string(TOUPPER "${CMAKE_BUILD_TYPE}" _vllm_hip_build_type)
+  if((_vllm_hip_build_type STREQUAL "" OR _vllm_hip_build_type STREQUAL "DEBUG")
+     AND NOT "${CMAKE_HIP_FLAGS}" MATCHES "(^| )-O")
+    add_compile_options($<$<COMPILE_LANGUAGE:HIP>:-O1>)
+    message(STATUS
+      "HIP device code floored at -O1: -O0 marks kernels as dynamic-stack users "
+      "and trips the ROCm CLR hostcall-listener teardown deadlock (issue #132)")
+  endif()
+  unset(_vllm_hip_build_type)
   set(VLLM_CPP_HIP ON)
 else()
   set(VLLM_CPP_HIP OFF)
@@ -472,8 +515,22 @@ if(VLLM_CPP_CUDA)
      AND NOT EXISTS "${VLLM_CPP_CUTLASS_DIR}/include/cutlass/cutlass.h"
      AND VLLM_CPP_CUTLASS_FETCH)
     include(FetchContent)
+    # SOURCE_SUBDIR names a directory that does not exist IN CUTLASS ON PURPOSE.
+    # That is the documented way to tell FetchContent "populate, but do not
+    # add_subdirectory": we consume CUTLASS as HEADERS ONLY — every consumer
+    # below `-isystem`s ${VLLM_CPP_CUTLASS_DIR}/include and nothing in this tree
+    # links a CUTLASS CMake target — so configuring CUTLASS's own build system
+    # buys nothing and can only fail.
+    #
+    # And it does fail. Building for sm_80 with CUDA 13 dies inside CUTLASS's
+    # tools/library with duplicate sm_100f flags, which forced the A100 reporter
+    # to add -DCUTLASS_ENABLE_TOOLS=OFF by hand before they could get to the
+    # actual bugs (issue #193). Not configuring those targets at all is both the
+    # narrower fix and the faster configure: the tools/library/examples/tests
+    # trees are the bulk of what add_subdirectory would walk.
     FetchContent_Declare(cutlass GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
-      GIT_TAG v4.5.0 GIT_SHALLOW ON)
+      GIT_TAG v4.5.0 GIT_SHALLOW ON
+      SOURCE_SUBDIR vllm-cpp-consumes-cutlass-headers-only)
     FetchContent_MakeAvailable(cutlass)
     set(VLLM_CPP_CUTLASS_DIR "${cutlass_SOURCE_DIR}")
   endif()
@@ -598,7 +655,8 @@ endif()
 include(cmake/CompilerWarnings.cmake)
 # Triton AOT kernels (cubins embedded in C launchers, CUDA-only), VENDORED
 # per-arch under src/vt/cuda/triton_aot_vendored/. Defines the gated option
-# VLLM_CPP_TRITON (default OFF; consumes the vendored artifacts — NO Python) +
+# VLLM_CPP_TRITON (default COMPUTED: ON for a CUDA build whose vendored trees are
+# present, OFF otherwise; consumes the vendored artifacts — NO Python) +
 # the maintainer knob VLLM_CPP_TRITON_REGEN (regenerates them with Python+Triton;
 # scripts/regen-triton-aot.sh) + add_triton_kernel()/triton_aot_finalize(); with
 # the option OFF this include is inert (no sources added). Wired below under
@@ -637,6 +695,8 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_weights.cpp
   src/vllm/model_executor/models/qwen3.cpp
   src/vllm/model_executor/models/qwen3_dflash.cpp
+  src/vllm/model_executor/models/qwen3_dspark.cpp
+  src/vllm/model_executor/models/qwen3_dspark_weights.cpp
   src/vllm/model_executor/models/qwen3_dflash_gguf.cpp
   src/vllm/model_executor/models/qwen3_dflash_weights.cpp
   src/vllm/model_executor/models/qwen3_moe_registry.cpp
@@ -799,6 +859,7 @@ add_library(vllm STATIC
   src/vllm/v1/worker/gpu/spec_decode/autoregressive/prepare_prefill_inputs.cpp
   src/vllm/v1/worker/gpu/spec_decode/mtp/speculator.cpp
   src/vllm/v1/worker/gpu/spec_decode/dflash/speculator.cpp
+  src/vllm/v1/worker/gpu/spec_decode/dspark/speculator.cpp
   src/vllm/v1/kv_cache_interface.cpp
   src/vllm/v1/kv_cache_spec_registry.cpp
   src/vllm/v1/core/kv_cache_utils.cpp
@@ -1249,9 +1310,9 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_gemma4_experts.hip
     src/vt/rocm/rocm_gemma4_fused_experts.hip
     src/vt/rocm/rocm_gemma4_expert_geglu.hip
+    src/vt/rocm/rocm_sample.hip
     src/vt/rocm/rocm_fp8_channel_gemv.hip
     src/vt/rocm/rocm_moe_router.hip
-    src/vt/rocm/rocm_sample.hip
     src/vt/rocm/rocm_ops.hip)
   if(VLLM_CPP_HIP_ARCHITECTURES)
     set_source_files_properties(
@@ -1264,9 +1325,9 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_gemma4_experts.hip
       src/vt/rocm/rocm_gemma4_fused_experts.hip
       src/vt/rocm/rocm_gemma4_expert_geglu.hip
+    src/vt/rocm/rocm_sample.hip
       src/vt/rocm/rocm_fp8_channel_gemv.hip
       src/vt/rocm/rocm_moe_router.hip
-      src/vt/rocm/rocm_sample.hip
       src/vt/rocm/rocm_ops.hip
       PROPERTIES HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")
   endif()
@@ -1562,7 +1623,8 @@ if(VLLM_CPP_CUDA)
         "$<$<COMPILE_LANGUAGE:CUDA>:-static-global-template-stub=false;--expt-relaxed-constexpr;-diag-suppress=20280;-isystem;${_MARLIN_ROOT}>")
   endif()
 
-  # ── SANCTIONED Triton AOT fast-path: GDN delta_h (VLLM_CPP_TRITON, default OFF)
+  # ── SANCTIONED Triton AOT fast-path: GDN delta_h (VLLM_CPP_TRITON, default ON
+  # for a CUDA build) ─────────────────────────────────────────────────────────
   # The FLA chunk_delta_h state-recurrence kernel as an embedded cubin in libvllm
   # (VENDORED per-arch — the build needs no Python; VLLM_CPP_TRITON_REGEN=ON is
   # the maintainer regen); runtime dispatch (behind VT_GDN_DELTAH_TRITON) is in
