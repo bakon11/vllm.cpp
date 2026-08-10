@@ -513,7 +513,10 @@ __global__ void PagedAttnDecodeGqaBf16(__hip_bfloat16* out, const __hip_bfloat16
     const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
     const int64_t off = j % block_size;
     float k_reg[kEpl];
+    float v_reg[kEpl];
+    // Issue K+V loads before QK score so V miss can hide under softmax arith.
     LoadRowEplBf16<kEpl>(k_cache, blk * kc_blk + off * kc_pg + g * kc_hd, lane, k_reg);
+    LoadRowEplBf16<kEpl>(v_cache, blk * vc_blk + off * vc_pg + g * vc_hd, lane, v_reg);
 
     float s_h[QG];
 #pragma unroll
@@ -526,8 +529,6 @@ __global__ void PagedAttnDecodeGqaBf16(__hip_bfloat16* out, const __hip_bfloat16
       s_h[hh] = Softcap(__shfl(dot, 0) * scale, softcap);
     }
 
-    float v_reg[kEpl];
-    LoadRowEplBf16<kEpl>(v_cache, blk * vc_blk + off * vc_pg + g * vc_hd, lane, v_reg);
 #pragma unroll
     for (int hh = 0; hh < QG; ++hh) {
       const float m_new = fmaxf(m[hh], s_h[hh]);
@@ -579,6 +580,279 @@ __global__ void PagedAttnDecodeGqaBf16(__hip_bfloat16* out, const __hip_bfloat16
   }
 }
 
+// =============================================================================
+// SGLang flash-decode steal (RDNA4 patch 086): multi-CTA KV splits.
+// DecodeGqa alone: grid=(T, Hkv, z_groups) with only NWARPS=8 K-parallelism inside
+// one CTA. Full layers (Hkv=2, z=4 → 8 CTAs) under-fill 64 CUs at long ctx.
+// Stage1: grid=(T, Hkv, z_groups * num_splits) — each CTA online-softmax on a
+// KV slice, writes unnormalized mid_o/m/l. Stage2: reduce splits → bf16 out.
+// Env: VT_ATTN_DECODE_KV_SPLITS (0=off default, N=force splits on full-attn decode).
+// =============================================================================
+template <int QG, int EPL = 8, int NWARPS = kDecWarps>
+__global__ void PagedAttnDecodeGqaSplit1Bf16(float* mid_o, float* mid_m, float* mid_l,
+                                             const __hip_bfloat16* query,
+                                             const __hip_bfloat16* k_cache,
+                                             const __hip_bfloat16* v_cache,
+                                             const int32_t* block_table, const int32_t* seq_lens,
+                                             const int32_t* query_start_loc, int64_t num_reqs,
+                                             int64_t hq, int64_t num_kv_heads, int64_t d,
+                                             int64_t block_size, int64_t bt_row, int64_t bt_col,
+                                             int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
+                                             int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
+                                             float scale, float softcap, bool causal,
+                                             int window_left, int window_right, int num_splits,
+                                             int z_groups) {
+  constexpr int kEpl = EPL;
+  constexpr int d_expect = kEpl * 32;
+  const int64_t t = blockIdx.x;
+  const int64_t g = blockIdx.y;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  if (g >= num_kv_heads || d != d_expect || num_splits <= 0 || z_groups <= 0) return;
+
+  const int split = static_cast<int>(blockIdx.z) / z_groups;
+  const int ztile = static_cast<int>(blockIdx.z) % z_groups;
+  if (split >= num_splits) return;
+
+  int64_t r = -1, q0 = 0, q1 = 0;
+  if (num_reqs == 1) {
+    r = 0;
+    q0 = query_start_loc[0];
+    q1 = query_start_loc[1];
+    if (t < q0 || t >= q1) return;
+  } else {
+    for (int64_t rr = 0; rr < num_reqs; ++rr) {
+      const int64_t a = query_start_loc[rr], b = query_start_loc[rr + 1];
+      if (t >= a && t < b) {
+        r = rr;
+        q0 = a;
+        q1 = b;
+        break;
+      }
+    }
+    if (r < 0) return;
+  }
+
+  const int64_t query_len = q1 - q0;
+  const int64_t seqlen = seq_lens[r];
+  const int64_t context = seqlen - query_len;
+  const int64_t p = context + (t - q0);
+  int64_t jmin = 0;
+  if (window_left >= 0) {
+    jmin = p - window_left;
+    if (jmin < 0) jmin = 0;
+  }
+  int64_t jmax = causal ? p : (seqlen - 1);
+  if (window_right >= 0) {
+    const int64_t jr = p + window_right;
+    if (jr < jmax) jmax = jr;
+  }
+  if (jmax > seqlen - 1) jmax = seqlen - 1;
+
+  const int64_t qg_total = hq / num_kv_heads;
+  const int64_t h0 = g * qg_total + static_cast<int64_t>(ztile) * QG;
+  if (h0 + QG > (g + 1) * qg_total) return;
+
+  // KV slice for this split (SGLang kv_len_per_split).
+  int64_t js = jmin, je = jmax;
+  if (jmax >= jmin) {
+    const int64_t nkeys = jmax - jmin + 1;
+    const int64_t chunk = (nkeys + num_splits - 1) / num_splits;
+    js = jmin + static_cast<int64_t>(split) * chunk;
+    je = js + chunk - 1;
+    if (je > jmax) je = jmax;
+  }
+
+  float q_reg[QG][kEpl];
+#pragma unroll
+  for (int hh = 0; hh < QG; ++hh)
+    LoadRowEplBf16<kEpl>(query, (t * hq + (h0 + hh)) * d, lane, q_reg[hh]);
+
+  float m[QG], lsum[QG];
+  float o_reg[QG][kEpl];
+#pragma unroll
+  for (int hh = 0; hh < QG; ++hh) {
+    m[hh] = -INFINITY;
+    lsum[hh] = 0.f;
+#pragma unroll
+    for (int i = 0; i < kEpl; ++i) o_reg[hh][i] = 0.f;
+  }
+
+  if (js <= je) {
+    for (int64_t j = js + warp; j <= je; j += NWARPS) {
+      const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
+      const int64_t off = j % block_size;
+      float k_reg[kEpl];
+      float v_reg[kEpl];
+      LoadRowEplBf16<kEpl>(k_cache, blk * kc_blk + off * kc_pg + g * kc_hd, lane, k_reg);
+      LoadRowEplBf16<kEpl>(v_cache, blk * vc_blk + off * vc_pg + g * vc_hd, lane, v_reg);
+
+      float s_h[QG];
+#pragma unroll
+      for (int hh = 0; hh < QG; ++hh) {
+        float dot = 0.f;
+#pragma unroll
+        for (int i = 0; i < kEpl; ++i) dot += q_reg[hh][i] * k_reg[i];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) dot += __shfl_down(dot, o);
+        s_h[hh] = Softcap(__shfl(dot, 0) * scale, softcap);
+      }
+
+#pragma unroll
+      for (int hh = 0; hh < QG; ++hh) {
+        const float m_new = fmaxf(m[hh], s_h[hh]);
+        const float corr = FastExp(m[hh] - m_new);
+        const float pw = FastExp(s_h[hh] - m_new);
+#pragma unroll
+        for (int i = 0; i < kEpl; ++i) o_reg[hh][i] = o_reg[hh][i] * corr + pw * v_reg[i];
+        lsum[hh] = lsum[hh] * corr + pw;
+        m[hh] = m_new;
+      }
+    }
+  }
+
+  extern __shared__ float smem_gqa_s1[];
+  // Dynamic smem = o only (NWARPS*QG*d). m/l in static smem so QG=4 NWARPS=8 d=512
+  // fits exactly 64KB (o) + 256B static — lab gfx1201 rejects >64KB dynamic.
+  float* o_sh = smem_gqa_s1;
+  __shared__ float m_sh_st[NWARPS * QG];
+  __shared__ float l_sh_st[NWARPS * QG];
+  float* m_sh = m_sh_st;
+  float* l_sh = l_sh_st;
+#pragma unroll
+  for (int hh = 0; hh < QG; ++hh) {
+    float* dst = o_sh + (static_cast<size_t>(warp) * QG + hh) * d + lane * kEpl;
+#pragma unroll
+    for (int i = 0; i < kEpl; ++i) dst[i] = o_reg[hh][i];
+    if (lane == 0) {
+      m_sh[warp * QG + hh] = m[hh];
+      l_sh[warp * QG + hh] = lsum[hh];
+    }
+  }
+  __syncthreads();
+
+  // Warp-reduce → mid (unnormalized o, m, l). Index: [t, h, split, ...]
+  for (int hh = warp; hh < QG; hh += NWARPS) {
+    float gm = -INFINITY;
+#pragma unroll
+    for (int w = 0; w < NWARPS; ++w) gm = fmaxf(gm, m_sh[w * QG + hh]);
+    float gl = 0.f;
+    float acc[kEpl];
+#pragma unroll
+    for (int i = 0; i < kEpl; ++i) acc[i] = 0.f;
+    // Empty split: all warps m=-inf → FastExp(-inf--inf)=NaN. Keep zeros.
+    if (isfinite(gm)) {
+#pragma unroll
+      for (int w = 0; w < NWARPS; ++w) {
+        const float sc = FastExp(m_sh[w * QG + hh] - gm);
+        gl += l_sh[w * QG + hh] * sc;
+        const float* src = o_sh + (static_cast<size_t>(w) * QG + hh) * d + lane * kEpl;
+#pragma unroll
+        for (int i = 0; i < kEpl; ++i) acc[i] += sc * src[i];
+      }
+    }
+    const int64_t h = h0 + hh;
+    const int64_t base = ((t * hq + h) * num_splits + split);
+    if (lane == 0) {
+      mid_m[base] = gm;
+      mid_l[base] = gl;
+    }
+    float* o_dst = mid_o + base * d + lane * kEpl;
+#pragma unroll
+    for (int i = 0; i < kEpl; ++i) o_dst[i] = acc[i];
+  }
+}
+
+// Stage2: reduce num_splits partial (o,m,l) → normalized bf16 out. grid=(total_q, hq).
+template <int EPL>
+__global__ void PagedAttnDecodeGqaSplit2Bf16(__hip_bfloat16* out, const float* mid_o,
+                                             const float* mid_m, const float* mid_l, int64_t hq,
+                                             int64_t d, int num_splits) {
+  constexpr int kEpl = EPL;
+  const int64_t t = blockIdx.x;
+  const int64_t h = blockIdx.y;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  if (h >= hq || num_splits <= 0) return;
+
+  float gm = -INFINITY;
+  for (int s = 0; s < num_splits; ++s) {
+    const int64_t base = (t * hq + h) * num_splits + s;
+    gm = fmaxf(gm, mid_m[base]);
+  }
+  float gl = 0.f;
+  float acc[kEpl];
+#pragma unroll
+  for (int i = 0; i < kEpl; ++i) acc[i] = 0.f;
+  // All-empty → keep zeros (avoid FastExp(-inf - -inf) NaN).
+  if (isfinite(gm)) {
+    for (int s = 0; s < num_splits; ++s) {
+      const int64_t base = (t * hq + h) * num_splits + s;
+      const float sc = FastExp(mid_m[base] - gm);
+      gl += mid_l[base] * sc;
+      const float* src = mid_o + base * d + lane * kEpl;
+#pragma unroll
+      for (int i = 0; i < kEpl; ++i) acc[i] += sc * src[i];
+    }
+  }
+  const float inv = (gl > 0.f) ? (1.f / gl) : 0.f;
+#pragma unroll
+  for (int i = 0; i < kEpl; ++i) acc[i] *= inv;
+  StoreRowEplBf16<kEpl>(out, (t * hq + h) * d, lane, acc);
+}
+
+struct DecodeSplitKvWorkspace {
+  float* o = nullptr;
+  float* m = nullptr;
+  float* l = nullptr;
+  size_t cap_o = 0;
+  size_t cap_ml = 0;
+};
+
+static DecodeSplitKvWorkspace& SplitKvWs() {
+  static DecodeSplitKvWorkspace ws;
+  return ws;
+}
+
+static bool EnsureDecodeSplitKvWs(int device_index, size_t n_o, size_t n_ml) {
+  auto& ws = SplitKvWs();
+  // Only touch hipSetDevice when (re)allocating — never leave device sticky for MoE.
+  const bool need_o = n_o > ws.cap_o;
+  const bool need_ml = n_ml > ws.cap_ml;
+  if (!need_o && !need_ml) return ws.o && ws.m && ws.l;
+
+  int prev = 0;
+  if (hipGetDevice(&prev) != hipSuccess) return false;
+  if (hipSetDevice(device_index) != hipSuccess) return false;
+  bool ok = true;
+  if (need_o) {
+    if (ws.o) (void)hipFree(ws.o);
+    ws.o = nullptr;
+    ws.cap_o = 0;
+    if (hipMalloc(reinterpret_cast<void**>(&ws.o), n_o * sizeof(float)) != hipSuccess) {
+      ws.o = nullptr;
+      ok = false;
+    } else {
+      ws.cap_o = n_o;
+    }
+  }
+  if (ok && need_ml) {
+    if (ws.m) (void)hipFree(ws.m);
+    if (ws.l) (void)hipFree(ws.l);
+    ws.m = ws.l = nullptr;
+    ws.cap_ml = 0;
+    if (hipMalloc(reinterpret_cast<void**>(&ws.m), n_ml * sizeof(float)) != hipSuccess ||
+        hipMalloc(reinterpret_cast<void**>(&ws.l), n_ml * sizeof(float)) != hipSuccess) {
+      if (ws.m) (void)hipFree(ws.m);
+      if (ws.l) (void)hipFree(ws.l);
+      ws.m = ws.l = nullptr;
+      ok = false;
+    } else {
+      ws.cap_ml = n_ml;
+    }
+  }
+  (void)hipSetDevice(prev);
+  return ok && ws.o && ws.m && ws.l;
+}
 
 // SGLang-style flash prefill GQA (steal base 2026-08-10):
 //   BLOCK_M queries × BLOCK_N keys, Q+K tiles in smem, online softmax.
@@ -1859,28 +2133,259 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
       }
       flash_fallback:
       // DecodeGqa QG=2: sliding z=1; global qg=8 → z=4 head tiles (same kernel/regs).
+      // SGLang-style KV splits (VT_ATTN_DECODE_KV_SPLITS): multi-CTA flash-decode for
+      // full-attn long ctx. Sliding (window_left>=0) stays unsplit.
+      //   0       = off (DecodeGqa only)
+      //   N>1     = fixed split count (capped 32)
+      //   -1/auto = seqlen heuristic (RDNA4 CU fill; uses host max_seq_len)
+      // VT_ATTN_DECODE_FULL_WINDOW=W: decode-only local window on full layers
+      // (SGLang force-decode-window steal). Prefill unchanged. Quality tradeoff.
+      static const int decode_kv_splits_env = [] {
+        const char* e = std::getenv("VT_ATTN_DECODE_KV_SPLITS");
+        if (!e || !e[0]) return 0;
+        if (e[0] == 'a' || e[0] == 'A') return -1;  // auto
+        int v = std::atoi(e);
+        if (v < -1) v = -1;
+        if (v > 64) v = 64;
+        return v;
+      }();
+      static const int decode_full_window = [] {
+        const char* e = std::getenv("VT_ATTN_DECODE_FULL_WINDOW");
+        if (!e || !e[0]) return 0;
+        int v = std::atoi(e);
+        return v > 0 ? v : 0;
+      }();
+      // Prefer host max_seq_len for auto splits.
+      static int split_seqlen_cache = 2048;
+      int wl = window_left;
+      int wr = window_right;
+      const bool orig_full_layer = (window_left < 0);
+      // Decode-only clamp of full-attn layers (window_left was <0).
+      if (decode_full_window > 0 && orig_full_layer && total_q == num_reqs &&
+          query.dtype == DType::kBF16) {
+        wl = decode_full_window - 1;  // same convention as sliding_window-1
+        wr = 0;
+        static bool once = false;
+        if (!once) {
+          std::fprintf(stderr,
+                       "INFO decode_full_window=%d applied (wl=%d) max_seq_len=%d qg=%lld d=%lld\n",
+                       decode_full_window, wl, args.max_seq_len, static_cast<long long>(qg),
+                       static_cast<long long>(d));
+          once = true;
+        }
+      }
       const int nwarps = kDecWarps;
+      // Full-attn split path: optional more K-warps per split CTA (VT_ATTN_DECODE_SPLIT_WARPS).
+      static const int split_warps_env = [] {
+        const char* e = std::getenv("VT_ATTN_DECODE_SPLIT_WARPS");
+        if (!e || !e[0]) return 8;
+        int v = std::atoi(e);
+        return (v == 16) ? 16 : 8;
+      }();
+      // Full-attn QG tile: default 4 @ d=512 (qg=8 → z=2) amortizes KV over 2× Q heads
+      // vs QG=2/z=4. Smem: o only = NWARPS*QG*d*4; QG=4 NWARPS=8 d=512 → 64KB.
+      // VT_ATTN_DECODE_FULL_QG=2 forces legacy tile.
+      static const int full_qg_env = [] {
+        const char* e = std::getenv("VT_ATTN_DECODE_FULL_QG");
+        // Default 2: QG=4/z=2 A/B flat vs QG=2 @ short–30k (2026-08-10); opt-in 4.
+        if (!e || !e[0]) return 2;
+        int v = std::atoi(e);
+        if (v == 2 || v == 4 || v == 8) return v;
+        return 2;
+      }();
+      const int split_nwarps = [&] {
+        // d=512 + NWARPS=16 → o smem NWARPS*QG*d too fat even at QG=2 (64KB+).
+        if (split_warps_env == 16 && d <= 256) return 16;
+        return 8;
+      }();
+      // QG for this launch (sliding keeps 2 via z_groups=1 path below).
+      const int launch_qg = [&] {
+        if (d == 512 && qg == 8 && full_qg_env > 0) {
+          // only exact divisors of qg
+          if (qg % full_qg_env == 0) return full_qg_env;
+        }
+        return 2;
+      }();
       const size_t smem =
           sizeof(float) *
           (static_cast<size_t>(nwarps) * 2 * static_cast<size_t>(d) +
            2 * static_cast<size_t>(nwarps) * 2);
-      const unsigned z_groups = (qg == 8 && d == 512) ? 4u : 1u;
-      dim3 grid(static_cast<unsigned>(total_q), static_cast<unsigned>(num_kv_heads), z_groups);
+      // Split1: dynamic = o_sh only (m/l static in kernel).
+      const size_t smem_split = sizeof(float) * static_cast<size_t>(split_nwarps) *
+                                static_cast<size_t>(launch_qg) * static_cast<size_t>(d);
+      const unsigned z_groups = static_cast<unsigned>(qg / launch_qg);
       dim3 block(static_cast<unsigned>(nwarps * 32));
+      dim3 block_split(static_cast<unsigned>(split_nwarps * 32));
+      // Full layers only (orig_full). Keep splits even when decode-window clamps wl —
+      // otherwise 8 CTAs under-fill CUs on the windowed range (measured flat @23k).
+      const bool want_split =
+          decode_kv_splits_env != 0 && orig_full_layer && total_q == num_reqs &&
+          query.dtype == DType::kBF16;
+      if (want_split) {
+        if (args.max_seq_len > 0) {
+          split_seqlen_cache = args.max_seq_len;
+        }
+        int nsplit = decode_kv_splits_env;
+        if (nsplit < 0) {
+          // Port of CUDA MLA ComputeNumKvSplits + occupancy fill idea:
+          //   ideal = next_pow2(max(1, max_seq_len/512))
+          //   grid CTAs = total_q * Hkv * z_groups * nsplit ≈ 8*nsplit @ Gemma-4 full
+          //   target ≥ ~2 * 64 CUs → nsplit ≥ 16 for batch-1; grow with depth.
+          const int sl = split_seqlen_cache > 0 ? split_seqlen_cache : 2048;
+          const int sm_count = 64;  // gfx1201 R9700
+          const int ctas_per_split = std::max(
+              1, static_cast<int>(num_reqs) * static_cast<int>(num_kv_heads) *
+                     static_cast<int>(z_groups));
+          int ideal = 1;
+          const int work = sl / 512;
+          const int target = work > 1 ? work : 1;
+          while (ideal < target) ideal <<= 1;
+          const int max_by_sm = std::max(1, (sm_count * 2) / ctas_per_split);
+          nsplit = ideal < max_by_sm ? ideal : max_by_sm;
+          // Occupancy floor: fill CUs even when seq is mid-length (batch-1).
+          const int fill = std::max(1, (sm_count * 2) / ctas_per_split);
+          if (nsplit < fill && sl >= 1024) nsplit = fill < 64 ? fill : 64;
+          if (nsplit < 4) nsplit = 4;
+          // Cap 32 on dual-R9700 lab: 64-split mid buffers + 40k+ KV have OOMed
+          // GPU0 under HEADROOM_GB=8 + resident experts. Raise after pre-reserve.
+          if (nsplit > 32) nsplit = 32;
+          if (sl < 512 && nsplit > 4) nsplit = 4;
+        }
+        if (nsplit < 2) nsplit = 2;
+        if (nsplit > 32) nsplit = 32;  // hard lab cap (fixed N too)
+        {
+          static bool once_qg = false;
+          if (!once_qg && launch_qg != 2) {
+            std::fprintf(stderr,
+                         "INFO decode full_qg=%d z_groups=%u nwarps=%d smem_o=%zu (d=%lld qg=%lld)\n",
+                         launch_qg, z_groups, split_nwarps, smem_split,
+                         static_cast<long long>(d), static_cast<long long>(qg));
+            once_qg = true;
+          }
+        }
+        const size_t n_ml =
+            static_cast<size_t>(total_q) * static_cast<size_t>(hq) * static_cast<size_t>(nsplit);
+        const size_t n_o = n_ml * static_cast<size_t>(d);
+        if (EnsureDecodeSplitKvWs(q.device.index, n_o, n_ml)) {
+          auto& ws = SplitKvWs();
+          dim3 grid1(static_cast<unsigned>(total_q), static_cast<unsigned>(num_kv_heads),
+                     z_groups * static_cast<unsigned>(nsplit));
+          if (d == 256) {
+            if (split_nwarps == 16) {
+              PagedAttnDecodeGqaSplit1Bf16<2, 8, 16><<<grid1, block_split, smem_split, st>>>(
+                  ws.o, ws.m, ws.l, query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
+                  v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+                  query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
+                  bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+                  args.logits_soft_cap, args.causal, wl, wr, nsplit,
+                  static_cast<int>(z_groups));
+            } else {
+              PagedAttnDecodeGqaSplit1Bf16<2, 8, 8><<<grid1, block_split, smem_split, st>>>(
+                  ws.o, ws.m, ws.l, query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
+                  v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+                  query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
+                  bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+                  args.logits_soft_cap, args.causal, wl, wr, nsplit,
+                  static_cast<int>(z_groups));
+            }
+          } else if (launch_qg == 4) {
+            // d=512 full: QG=4 amortizes K/V across 4 Q heads (z_groups=2).
+            // NWARPS=4 keeps o smem at 32KB (8 warps × QG4 × d512 = 64KB + static m/l
+            // → HSA INVALID_ALLOCATION on gfx1201 lab 2026-08-10).
+            constexpr int kQg4Warps = 4;
+            const size_t smem_qg4 =
+                sizeof(float) * static_cast<size_t>(kQg4Warps) * 4u * static_cast<size_t>(d);
+            dim3 block_qg4(static_cast<unsigned>(kQg4Warps * 32));
+            PagedAttnDecodeGqaSplit1Bf16<4, 16, kQg4Warps><<<grid1, block_qg4, smem_qg4, st>>>(
+                ws.o, ws.m, ws.l, query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
+                v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+                query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
+                bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+                args.logits_soft_cap, args.causal, wl, wr, nsplit, static_cast<int>(z_groups));
+          } else {
+            if (split_nwarps == 16) {
+              PagedAttnDecodeGqaSplit1Bf16<2, 16, 16><<<grid1, block_split, smem_split, st>>>(
+                  ws.o, ws.m, ws.l, query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
+                  v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+                  query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
+                  bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+                  args.logits_soft_cap, args.causal, wl, wr, nsplit,
+                  static_cast<int>(z_groups));
+            } else {
+              PagedAttnDecodeGqaSplit1Bf16<2, 16, 8><<<grid1, block_split, smem_split, st>>>(
+                  ws.o, ws.m, ws.l, query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
+                  v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+                  query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
+                  bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+                  args.logits_soft_cap, args.causal, wl, wr, nsplit,
+                  static_cast<int>(z_groups));
+            }
+          }
+          Check(hipGetLastError(), "paged_attention decode_gqa_split1 launch");
+          dim3 grid2(static_cast<unsigned>(total_q), static_cast<unsigned>(hq));
+          if (d == 256) {
+            PagedAttnDecodeGqaSplit2Bf16<8><<<grid2, 32, 0, st>>>(
+                out.Ptr<__hip_bfloat16>(), ws.o, ws.m, ws.l, hq, d, nsplit);
+          } else {
+            PagedAttnDecodeGqaSplit2Bf16<16><<<grid2, 32, 0, st>>>(
+                out.Ptr<__hip_bfloat16>(), ws.o, ws.m, ws.l, hq, d, nsplit);
+          }
+          Check(hipGetLastError(), "paged_attention decode_gqa_split2 launch");
+          return;
+        }
+        // workspace alloc failed → fall through to unsplit DecodeGqa
+      }
+      // Unsplit DecodeGqa (sliding layers always; full if split workspace failed).
+      // Sliding window=1024: optional more K-warps via VT_ATTN_DECODE_SLIDE_WARPS=16.
+      // Always QG=2 tiles here — z must be qg/2, NOT split-path launch_qg z_groups.
+      static const int slide_warps_env = [] {
+        const char* e = std::getenv("VT_ATTN_DECODE_SLIDE_WARPS");
+        if (!e || !e[0]) return 8;
+        int v = std::atoi(e);
+        if (v == 16) return 16;
+        return 8;
+      }();
+      const bool pure_sliding = (window_left >= 0);  // model sliding layer (not full-window clamp)
+      const int launch_warps = (pure_sliding && slide_warps_env == 16) ? 16 : 8;
+      const size_t smem_u =
+          sizeof(float) *
+          (static_cast<size_t>(launch_warps) * 2 * static_cast<size_t>(d) +
+           2 * static_cast<size_t>(launch_warps) * 2);
+      dim3 block_u(static_cast<unsigned>(launch_warps * 32));
+      const unsigned z_unsplit = static_cast<unsigned>(std::max<int64_t>(1, qg / 2));
+      dim3 grid(static_cast<unsigned>(total_q), static_cast<unsigned>(num_kv_heads), z_unsplit);
       if (d == 256) {
-        PagedAttnDecodeGqaBf16<2, 8, 8><<<grid, block, smem, st>>>(
-            out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
-            v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
-            query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
-            bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale, args.logits_soft_cap,
-            args.causal, window_left, window_right);
+        if (launch_warps == 16) {
+          PagedAttnDecodeGqaBf16<2, 8, 16><<<grid, block_u, smem_u, st>>>(
+              out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
+              v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+              query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
+              bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale, args.logits_soft_cap,
+              args.causal, wl, wr);
+        } else {
+          PagedAttnDecodeGqaBf16<2, 8, 8><<<grid, block_u, smem_u, st>>>(
+              out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
+              v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+              query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
+              bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale, args.logits_soft_cap,
+              args.causal, wl, wr);
+        }
       } else {
-        PagedAttnDecodeGqaBf16<2, 16, 8><<<grid, block, smem, st>>>(
-            out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
-            v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
-            query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
-            bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale, args.logits_soft_cap,
-            args.causal, window_left, window_right);
+        if (launch_warps == 16) {
+          PagedAttnDecodeGqaBf16<2, 16, 16><<<grid, block_u, smem_u, st>>>(
+              out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
+              v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+              query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
+              bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale, args.logits_soft_cap,
+              args.causal, wl, wr);
+        } else {
+          PagedAttnDecodeGqaBf16<2, 16, 8><<<grid, block_u, smem_u, st>>>(
+              out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
+              v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+              query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
+              bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale, args.logits_soft_cap,
+              args.causal, wl, wr);
+        }
       }
       Check(hipGetLastError(), "paged_attention decode_gqa launch");
       return;

@@ -164,18 +164,40 @@ Gemma4Layout MakeLayout(const HfConfig& cfg) {
 // identity; angle denominator is Dh (not rotary_dim). Layout matches
 // RopeCosSinCache: cos_sin[t, i]=cos, cos_sin[t, Dh/2 + i]=sin, over Dh pairs...
 // stored as [P, Dh] with first Dh/2 = cos, second Dh/2 = sin. Double angle -> f32.
-DBuf BuildProportionalRopeCache(Dev d, const Gemma4Layout& g, int64_t Dh,
-                                int64_t max_pos) {
+//
+// CRITICAL (decode long-ctx): the old eager path rebuilt 0..max_pos on the host
+// and H2D'd it EVERY token. At seq=23k / Dh=512 that is ~23MB of trig+upload per
+// tok and dominated step-profile fwd (~50ms). Grow-only cache: rebuild only when
+// max_pos exceeds capacity (prefill jump) with headroom so decode is a no-op.
+void EnsureProportionalRopeCache(Dev d, const Gemma4Layout& g, int64_t Dh,
+                                 int64_t max_pos, std::optional<DBuf>& slot,
+                                 int64_t& cap_pos, int64_t& geom_Dh,
+                                 double& geom_base, double& geom_partial) {
   const int64_t pairs = Dh / 2;
   const int64_t rope_angles =
       static_cast<int64_t>(g.rope_partial_full * static_cast<double>(Dh)) / 2;
   const double base = g.rope_theta_full;
+  const double partial = g.rope_partial_full;
+
+  const bool same_geom = slot.has_value() && geom_Dh == Dh && geom_base == base &&
+                         geom_partial == partial && cap_pos >= 0;
+  if (same_geom && max_pos <= cap_pos) return;
+
+  int64_t build_to = max_pos;
+  if (same_geom && max_pos > cap_pos) {
+    const int64_t grow = std::max<int64_t>(2048, cap_pos / 4);
+    build_to = max_pos + grow;
+  } else {
+    build_to = max_pos + (max_pos >= 4096 ? 2048 : 512);
+  }
+
   std::vector<double> inv_freq(static_cast<size_t>(pairs), 0.0);
   for (int64_t j = 0; j < rope_angles && j < pairs; ++j) {
     const double exponent = static_cast<double>(2 * j) / static_cast<double>(Dh);
     inv_freq[static_cast<size_t>(j)] = 1.0 / std::pow(base, exponent);
   }
-  const int64_t P = max_pos + 1;
+
+  const int64_t P = build_to + 1;
   std::vector<uint16_t> host(static_cast<size_t>(P) * static_cast<size_t>(Dh));
   // NOTE: cache dtype bf16 to match the bf16 q/k it rotates (RopeFromCache wants
   // q/k/cache same dtype). vLLM keeps f32 cos/sin — a named bf16-rounding nuance.
@@ -190,9 +212,14 @@ DBuf BuildProportionalRopeCache(Dev d, const Gemma4Layout& g, int64_t Dh,
            static_cast<size_t>(pairs + i)] = vt::F32ToBF16(s);
     }
   }
-  DBuf cache(d, DType::kBF16, {P, Dh}, host.data());
-  return cache;
+  slot.emplace(d, DType::kBF16, std::vector<int64_t>{P, Dh}, host.data());
+  cap_pos = build_to;
+  geom_Dh = Dh;
+  geom_base = base;
+  geom_partial = partial;
 }
+
+// (by-value BuildProportionalRopeCache removed — all call sites use Ensure*)
 
 // Copy a strided source-row block into a contiguous destination sub-block. Used
 // to assemble the [T, 2*ple] GeluAndMul input from the fresh gate GEMM (dense)
@@ -584,65 +611,90 @@ void ForwardGemma4Layers(Dev d, DBuf& hidden, const Gemma4Layout& g,
           vt::RmsNormPlusAdd(d.q, h2.t(), mlp_o.t(), w_pff, h1.t(), plain);
         }
 
+        // FF done. Optional early sync boundary for ff_us; final dump after PLE.
+        clock::time_point t_ff{};
         if (layer_prof) {
           d.b.Synchronize(d.q);
-          const auto t3 = clock::now();
-          // t1 is attn boundary; mlp/moe split not separated when parallel.
+          t_ff = clock::now();
           if (layer_hb) {
             const double ff_ms =
-                std::chrono::duration<double, std::milli>(t3 - t1).count();
+                std::chrono::duration<double, std::milli>(t_ff - t1).count();
             std::fprintf(stderr, "INFO gemma4-layer end l=%lld ff_ms=%.2f (mlp||moe possible)\n",
                          static_cast<long long>(l), ff_ms);
             std::fflush(stderr);
           }
-          static std::atomic<uint64_t> n{0}, us_attn{0}, us_ff{0};
-          auto us = [](auto a, auto b) {
-            return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
-          };
-          us_attn.fetch_add(static_cast<uint64_t>(us(t0, t1)), std::memory_order_relaxed);
-          us_ff.fetch_add(static_cast<uint64_t>(us(t1, t3)), std::memory_order_relaxed);
-          const uint64_t c = n.fetch_add(1, std::memory_order_relaxed) + 1;
-          if (c == 32 || c % 128 == 0) {
-            std::fprintf(stderr,
-                         "gemma4 layer profile: calls=%llu attn_us=%.1f ff_us=%.1f "
-                         "(attn%%=%.0f ff%%=%.0f)\n",
-                         static_cast<unsigned long long>(c),
-                         static_cast<double>(us_attn.load()) / c,
-                         static_cast<double>(us_ff.load()) / c,
-                         100.0 * us_attn.load() / (us_attn.load() + us_ff.load() + 1),
-                         100.0 * us_ff.load() / (us_attn.load() + us_ff.load() + 1));
-          }
-        } else if (false) {
-          // keep old profile symbols out — replaced above
         }
 
         if (ple > 0) {
-      Tensor wg = ResidentWeight(d, w.per_layer_input_gate, {ple, H});
-      DBuf& gate_lin = *lt.gate_lin;
-      DBuf& ple_l = *lt.ple_l;
-      DBuf& gated = *lt.gated;
-      vt::MatmulBT(d.q, gate_lin.t(), h2.t(), wg);
-      const size_t layer_bytes = static_cast<size_t>(T) * ple_row_bytes;
-      const char* src = static_cast<const char*>(ple_by_layer.ptr()) +
-                        static_cast<size_t>(l) * layer_bytes;
-      d.b.Copy(d.q, ple_l.ptr(), src, layer_bytes);
-      vt::GeluMulSeparate(d.q, gated.ptr(), gate_lin.ptr(), ple_l.ptr(), T * ple,
-                                    DType::kBF16);
+          Tensor wg = ResidentWeight(d, w.per_layer_input_gate, {ple, H});
+          DBuf& gate_lin = *lt.gate_lin;
+          DBuf& ple_l = *lt.ple_l;
+          DBuf& gated = *lt.gated;
+          vt::MatmulBT(d.q, gate_lin.t(), h2.t(), wg);
+          const size_t layer_bytes = static_cast<size_t>(T) * ple_row_bytes;
+          const char* src = static_cast<const char*>(ple_by_layer.ptr()) +
+                            static_cast<size_t>(l) * layer_bytes;
+          d.b.Copy(d.q, ple_l.ptr(), src, layer_bytes);
+          vt::GeluMulSeparate(d.q, gated.ptr(), gate_lin.ptr(), ple_l.ptr(), T * ple,
+                              DType::kBF16);
 
-      Tensor wp = ResidentWeight(d, w.per_layer_projection, {H, ple});
-      vt::MatmulBT(d.q, contrib.t(), gated.t(), wp);
-      Tensor w_pln = ResidentWeight(d, w.post_per_layer_input_norm, {H});
-      vt::RmsNorm(d.q, contrib.t(), contrib.t(), w_pln, plain);
-      vt::Add(d.q, h2.t(), h2.t(), contrib.t());
-    }
+          Tensor wp = ResidentWeight(d, w.per_layer_projection, {H, ple});
+          vt::MatmulBT(d.q, contrib.t(), gated.t(), wp);
+          Tensor w_pln = ResidentWeight(d, w.post_per_layer_input_norm, {H});
+          vt::RmsNorm(d.q, contrib.t(), contrib.t(), w_pln, plain);
+          vt::Add(d.q, h2.t(), h2.t(), contrib.t());
+        }
 
-    if (!w.layer_scalar.Empty()) {
-      const double scalar = static_cast<double>(ReadBf16Scalar(w.layer_scalar));
-      vt::MulScalar(d.q, h2.t(), h2.t(), scalar);
-    }
+        if (!w.layer_scalar.Empty()) {
+          const double scalar = static_cast<double>(ReadBf16Scalar(w.layer_scalar));
+          vt::MulScalar(d.q, h2.t(), h2.t(), scalar);
+        }
 
-    d.b.Copy(d.q, hidden.ptr(), h2.ptr(), th_bytes);
-  }
+        d.b.Copy(d.q, hidden.ptr(), h2.ptr(), th_bytes);
+
+        // Pure-decode only (T==1). Includes PLE+scalar+hidden copy in ple_us.
+        if (layer_prof && T == 1) {
+          d.b.Synchronize(d.q);
+          const auto t_end = clock::now();
+          static std::atomic<uint64_t> n{0}, us_attn{0}, us_ff{0}, us_ple{0};
+          static std::atomic<uint64_t> n_full{0}, us_attn_full{0};
+          static std::atomic<uint64_t> n_slide{0}, us_attn_slide{0};
+          auto us = [](auto a, auto b) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+          };
+          const auto a_us = static_cast<uint64_t>(us(t0, t1));
+          const auto f_us = static_cast<uint64_t>(us(t1, t_ff));
+          const auto p_us = static_cast<uint64_t>(us(t_ff, t_end));
+          us_attn.fetch_add(a_us, std::memory_order_relaxed);
+          us_ff.fetch_add(f_us, std::memory_order_relaxed);
+          us_ple.fetch_add(p_us, std::memory_order_relaxed);
+          const uint64_t c = n.fetch_add(1, std::memory_order_relaxed) + 1;
+          if (full) {
+            us_attn_full.fetch_add(a_us, std::memory_order_relaxed);
+            n_full.fetch_add(1, std::memory_order_relaxed);
+          } else {
+            us_attn_slide.fetch_add(a_us, std::memory_order_relaxed);
+            n_slide.fetch_add(1, std::memory_order_relaxed);
+          }
+          if (c == 30 || c == 240 || c % 960 == 0) {
+            const double ta = static_cast<double>(us_attn.load());
+            const double tf = static_cast<double>(us_ff.load());
+            const double tp = static_cast<double>(us_ple.load());
+            const double tot = ta + tf + tp + 1.0;
+            const double nf = static_cast<double>(std::max<uint64_t>(1, n_full.load()));
+            const double ns = static_cast<double>(std::max<uint64_t>(1, n_slide.load()));
+            std::fprintf(stderr,
+                         "gemma4 decode-T1 profile: layer_calls=%llu attn_us=%.1f ff_us=%.1f "
+                         "ple_us=%.1f (attn%%=%.0f ff%%=%.0f ple%%=%.0f) full_attn_us=%.1f "
+                         "slide_attn_us=%.1f est_ms/tok=%.1f\n",
+                         static_cast<unsigned long long>(c), ta / c, tf / c, tp / c,
+                         100.0 * ta / tot, 100.0 * tf / tot, 100.0 * tp / tot,
+                         us_attn_full.load() / nf, us_attn_slide.load() / ns,
+                         (ta + tf + tp) / c * 30.0 / 1000.0);
+            std::fflush(stderr);
+          }
+        }
+  }  // layers
 }
 
 // If logits_out non-null and shaped [n_out,vocab] f32, write there (graph-stable).
@@ -752,17 +804,41 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
            "gemma4 mm: ple_token_ids length != T");
 
   // Ones weights for the weight-less V-norm (identity scale), per head_dim.
-  auto make_ones = [&](int64_t Dh) {
-    std::vector<uint16_t> h(static_cast<size_t>(Dh), vt::F32ToBF16(1.0f));
-    return DBuf(d, DType::kBF16, {Dh}, h.data());
+  // TLS: was H2D every decode token (tiny but free to kill).
+  struct OnesTls {
+    int dev = -1;
+    int64_t dh_s = 0, dh_f = 0;
+    std::optional<DBuf> sliding, full;
   };
-  DBuf ones_sliding = make_ones(g.head_dim_sliding);
-  DBuf ones_full = make_ones(g.head_dim_full);
+  static thread_local OnesTls ones_tls;
+  const int dev_i = d.q.device.index;
+  if (ones_tls.dev != dev_i || ones_tls.dh_s != g.head_dim_sliding ||
+      ones_tls.dh_f != g.head_dim_full || !ones_tls.sliding || !ones_tls.full) {
+    auto make_ones = [&](int64_t Dh) {
+      std::vector<uint16_t> h(static_cast<size_t>(Dh), vt::F32ToBF16(1.0f));
+      return DBuf(d, DType::kBF16, {Dh}, h.data());
+    };
+    ones_tls.sliding.emplace(make_ones(g.head_dim_sliding));
+    ones_tls.full.emplace(make_ones(g.head_dim_full));
+    ones_tls.dev = dev_i;
+    ones_tls.dh_s = g.head_dim_sliding;
+    ones_tls.dh_f = g.head_dim_full;
+  }
+  DBuf& ones_sliding = *ones_tls.sliding;
+  DBuf& ones_full = *ones_tls.full;
 
   // Proportional RoPE cache for full-attention layers (shared across them).
+  // Grow-only TLS slot — MUST NOT rebuild 0..max_pos every decode token.
   int64_t max_pos = 0;
   for (int32_t p : positions) max_pos = std::max<int64_t>(max_pos, p);
-  DBuf prop_cache = BuildProportionalRopeCache(d, g, g.head_dim_full, max_pos);
+  static thread_local std::optional<DBuf> prop_slot;
+  static thread_local int64_t prop_cap = -1;
+  static thread_local int64_t prop_geom_Dh = -1;
+  static thread_local double prop_geom_base = 0.0;
+  static thread_local double prop_geom_partial = 0.0;
+  EnsureProportionalRopeCache(d, g, g.head_dim_full, max_pos, prop_slot, prop_cap,
+                              prop_geom_Dh, prop_geom_base, prop_geom_partial);
+  DBuf& prop_cache = *prop_slot;
 
   // --- Token embedding * sqrt(hidden) (bf16). Also the PLE-projection input. ---
   // mm seam: when inputs_embeds_override is set the hidden stream STARTS from the
@@ -1091,8 +1167,10 @@ ForwardLogits Gemma4DecodeGraph::Step(const std::vector<int32_t>& token_ids,
                               ? I.config.max_position_embeddings
                               : 65536,
                           65536);
-    I.prop_cache = BuildProportionalRopeCache(d, I.layout, I.layout.head_dim_full, max_pos_cap);
-    I.prop_cap = max_pos_cap;
+    int64_t gDh = -1;
+    double gBase = 0.0, gPartial = 0.0;
+    EnsureProportionalRopeCache(d, I.layout, I.layout.head_dim_full, max_pos_cap,
+                                I.prop_cache, I.prop_cap, gDh, gBase, gPartial);
     I.ple_by_layer.emplace(d, DType::kBF16,
                            ple > 0 ? std::vector<int64_t>{L, T, ple}
                                    : std::vector<int64_t>{1, 1, 1});

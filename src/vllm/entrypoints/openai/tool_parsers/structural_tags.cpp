@@ -310,6 +310,18 @@ std::optional<nlohmann::json> ToolChoiceStructuralTagSpecFor(
 void ApplyToolChoiceStructuredOutput(const std::string& tool_parser_name,
                                      const ChatCompletionRequest& request,
                                      SamplingParams& sampling_params) {
+  // Native structural-tag grammars for 40–55 Hermes tools cost tens of seconds to
+  // compile and can collapse long-ctx decode to ~2 tok/s (lab 2026-08-10 on
+  // Gemma-4 FP8 dual-R9700). llama.cpp / vLLM-py / SGLang stay snappy with the
+  // same Hermes agent because they don't take this path (or use faster xgrammar).
+  // Default OFF: free-form generation + HermesToolParser still extracts calls.
+  // VT_TOOL_STRUCTURAL_TAGS=1 re-enables (required/named/auto as before).
+  static const bool enable = [] {
+    const char* e = std::getenv("VT_TOOL_STRUCTURAL_TAGS");
+    return e && e[0] == '1';
+  }();
+  if (!enable) return;
+
   const std::optional<nlohmann::json> spec =
       ToolChoiceStructuralTagSpecFor(tool_parser_name, request);
   if (!spec.has_value()) return;

@@ -125,6 +125,12 @@ portable/reference path. In normal operation leave them unset.
 | `VT_ATTN_PREFILL_FLASH_SHAREDK` | on | ROCm Gemma-4 prefill: scoreless SharedK flash path (prod default). `0` forces DecodeGqa baseline for A/B |
 | `VT_ATTN_PREFILL_FLASH_WMMA` | off | Lab-only ROCm flash WMMA QK path; leave off for prod |
 | `VT_ATTN_PREFILL_SHAREDK_WMMA` | on | ROCm SharedK fused with rocWMMA QK on sliding d=256 (and global-Q d=512). `0` forces scalar SharedK |
+| `VT_ATTN_DECODE_KV_SPLITS` | `0` | ROCm decode full-attn only: SGLang multi-CTA KV splits. `0`=off. `N`=fixed (lab cap 32). `auto`/`-1`=host max_seq_len pow2+CU-fill. Lab recipe `16` |
+| `VT_ATTN_DECODE_SLIDE_WARPS` | `8` | Sliding DecodeGqa K-warps (`8` or `16`). Lab recipe `16` (~+6–10% @23–30k) |
+| `VT_GEMMA4_FP8_HW_CVT` | `1` | ROCm ExpertGeGLU decode: gfx1201 OCP `__builtin_amdgcn_cvt_f32_fp8` dequant (no LDS LUT). Lab KEEP ~+8% @9–30k. `0` = shared LUT fallback |
+| `VT_ATTN_DECODE_SPLIT_WARPS` | `8` | Full-attn Split1 K-warps. `16` only valid for `d<=256`; d=512 LDS OOB — clamped to 8 |
+| `VT_ATTN_DECODE_FULL_WINDOW` | off | Decode-only local window on full layers. A/B @23k+splits flat — keep off |
+| `VT_STEP_PROFILE` | off | Lab: stderr prep/fwd/sample µs on pure-decode steps (syncs queue; slows e2e) |
 | `VT_GEMMA4_PREFILL_PEER_ACT` | on | Prefill MoE: run ExpertGeGLU on the expert GPU and peer activations only (not full weight PeerCopy). `0` restores weight PeerCopy |
 | `VT_SERVER_SSE_PING_S` | `15` | Seconds between stream keepalives while silent (long prefill). SSE comment `:` plus empty OpenAI `data:` chunk. `<=0` disables |
 | `VT_VULKAN_INFLIGHT` | 2 | How many command-buffer submissions may be in flight at once. At 1 a flush submits and BLOCKS on its fence, so all host recording is serialized against an idle GPU; at 2 the flush returns and the next token records while the previous one runs, worth a MEASURED -1.41 ms/token on 27B (5/5 paired legs). Each slot owns a disjoint descriptor-ring slice, so raising this raises descriptor memory |

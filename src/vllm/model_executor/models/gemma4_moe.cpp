@@ -782,6 +782,19 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
           ex.fp8_sdn_base, static_cast<const int32_t*>(ri.ptr()),
           static_cast<const float*>(rw.ptr()), top_k, static_cast<int>(I), static_cast<int>(H));
     }
+    if (!ok) {
+      static std::atomic<uint64_t> n_fail{0};
+      const uint64_t nf = n_fail.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (nf <= 8 || nf % 64 == 0) {
+        std::fprintf(stderr,
+                     "gemma4 moe: T=1 indexed FAIL n=%llu same=%d peer=%d edev=%d cdev=%d "
+                     "gu_base=%p top_k=%d I=%lld H=%lld\n",
+                     static_cast<unsigned long long>(nf), fp8_res_same ? 1 : 0,
+                     fp8_res_peer ? 1 : 0, ex.dev_id, compute_dev, ex.fp8_gu_base, top_k,
+                     static_cast<long long>(I), static_cast<long long>(H));
+        std::fflush(stderr);
+      }
+    }
     if (ok) {
       const auto t_router1 = profile ? clock::now() : clock::time_point{};
       Gemma4MoeScratch r;

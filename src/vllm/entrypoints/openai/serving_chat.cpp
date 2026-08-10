@@ -451,14 +451,33 @@ class ChatSseStream final : public SseStream {
       const std::string current_text = previous_text_ + delta_text;
       const bool finished =
           output.finish_reason.has_value() || response.finished;
+      const auto now = std::chrono::steady_clock::now();
+      if (!gen_started_) {
+        gen_started_ = true;
+        gen_start_ = now;
+        if (GetRequestLogConfig().debug_stages) {
+          ChatDbg(response_id_,
+                  "stage=decode_begin prompt_tok=" +
+                      std::to_string(prompt_tokens_) +
+                      " first_gen_tok=" + std::to_string(previous_num_tokens_));
+        }
+      }
       if (GetRequestLogConfig().debug_stages) {
-        const auto now = std::chrono::steady_clock::now();
         if (previous_num_tokens_ <= 1 || finished ||
             std::chrono::duration_cast<std::chrono::milliseconds>(now - last_dbg_)
                     .count() >= 1000) {
+          const double gen_s =
+              std::chrono::duration<double>(now - gen_start_).count();
+          // Avoid tok_s=0 spam on the same tick as decode_begin.
+          std::string rate;
+          if (gen_s > 0.05) {
+            const double tok_s =
+                static_cast<double>(previous_num_tokens_) / gen_s;
+            rate = " tok_s=" + std::to_string(tok_s);
+          }
           ChatDbg(response_id_,
                   "stage=async_sse prompt_tok=" + std::to_string(prompt_tokens_) +
-                      " gen_tok=" + std::to_string(previous_num_tokens_) +
+                      " gen_tok=" + std::to_string(previous_num_tokens_) + rate +
                       " finished=" + std::string(finished ? "1" : "0"));
           last_dbg_ = now;
         }
@@ -649,6 +668,8 @@ class ChatSseStream final : public SseStream {
   bool tools_streamed_ = false;
   int previous_num_tokens_ = 0;
   std::string previous_text_;
+  bool gen_started_ = false;
+  std::chrono::steady_clock::time_point gen_start_{};
   std::chrono::steady_clock::time_point last_dbg_{std::chrono::steady_clock::now()};
   std::chrono::steady_clock::time_point last_ping_{std::chrono::steady_clock::now()};
 };

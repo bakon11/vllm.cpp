@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -570,6 +571,20 @@ bool RunGemma4Fp8TopKIndexedOnExpertDevice(vt::Queue& compute_q, int expert_dev,
   hipStream_t cst = static_cast<hipStream_t>(compute_q.handle);
   vt::Device edev{vt::DeviceType::kROCM, expert_dev};
 
+  auto fail = [&](const char* step, hipError_t err = hipSuccess) -> bool {
+    static std::atomic<uint64_t> n{0};
+    const uint64_t c = n.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (c <= 12 || c % 64 == 0) {
+      std::fprintf(stderr,
+                   "gemma4 peer-indexed FAIL step=%s n=%llu err=%s cdev=%d edev=%d G=%d H=%d\n",
+                   step, static_cast<unsigned long long>(c),
+                   err == hipSuccess ? "(bool)" : hipGetErrorString(err), compute_dev, expert_dev,
+                   G, H);
+      std::fflush(stderr);
+    }
+    return false;
+  };
+
   if (tls.edev != expert_dev || tls.cdev != compute_dev || tls.H != H || tls.Gcap < G || !tls.x) {
     if (tls.x) {
       Check(hipSetDevice(tls.edev >= 0 ? tls.edev : expert_dev), "free");
@@ -594,14 +609,16 @@ bool RunGemma4Fp8TopKIndexedOnExpertDevice(vt::Queue& compute_q, int expert_dev,
       tls.ev_e = nullptr;
     }
     Check(hipSetDevice(expert_dev), "idx alloc");
-    if (hipMalloc(&tls.x, hb) != hipSuccess) return false;
+    if (hipMalloc(&tls.x, hb) != hipSuccess) return fail("malloc_x", hipGetLastError());
     if (hipMalloc(&tls.y, hb) != hipSuccess) {
       (void)hipFree(tls.x);
       tls.x = nullptr;
-      return false;
+      return fail("malloc_y", hipGetLastError());
     }
-    if (hipMalloc(&tls.idx, sizeof(int32_t) * 8) != hipSuccess) return false;
-    if (hipMalloc(&tls.wts, sizeof(float) * 8) != hipSuccess) return false;
+    if (hipMalloc(&tls.idx, sizeof(int32_t) * 8) != hipSuccess)
+      return fail("malloc_idx", hipGetLastError());
+    if (hipMalloc(&tls.wts, sizeof(float) * 8) != hipSuccess)
+      return fail("malloc_wts", hipGetLastError());
     tls.eq = vt::CreateQueue(edev);
     tls.eq_live = true;
     Check(hipSetDevice(compute_dev), "ev");
@@ -616,30 +633,58 @@ bool RunGemma4Fp8TopKIndexedOnExpertDevice(vt::Queue& compute_q, int expert_dev,
     tls.cdev = compute_dev;
     tls.H = H;
     tls.Gcap = 8;
+    Check(hipSetDevice(compute_dev), "idx alloc restore");
   }
 
   hipStream_t est = static_cast<hipStream_t>(tls.eq.handle);
   // Steady-state: no hipSetDevice between stream ops (graph-prep + less driver tax).
-  if (hipEventRecord(tls.ev_c, cst) != hipSuccess) return false;
-  if (hipStreamWaitEvent(est, tls.ev_c, 0) != hipSuccess) return false;
+  {
+    const hipError_t e = hipEventRecord(tls.ev_c, cst);
+    if (e != hipSuccess) return fail("ev_c_record", e);
+  }
+  {
+    const hipError_t e = hipStreamWaitEvent(est, tls.ev_c, 0);
+    if (e != hipSuccess) return fail("est_wait_ev_c", e);
+  }
 
-  auto peer = [&](void* dst, const void* src, size_t n) -> bool {
-    return hipMemcpyPeerAsync(dst, expert_dev, const_cast<void*>(src), compute_dev, n, est) ==
-           hipSuccess;
+  auto peer = [&](void* dst, const void* src, size_t n, const char* tag) -> bool {
+    const hipError_t e =
+        hipMemcpyPeerAsync(dst, expert_dev, const_cast<void*>(src), compute_dev, n, est);
+    if (e != hipSuccess) {
+      fail(tag, e);
+      return false;
+    }
+    return true;
   };
-  if (!peer(tls.x, x_compute, hb)) return false;
-  if (!peer(tls.idx, idx_compute, sizeof(int32_t) * static_cast<size_t>(G))) return false;
-  if (!peer(tls.wts, wts_compute, sizeof(float) * static_cast<size_t>(G))) return false;
+  if (!peer(tls.x, x_compute, hb, "peer_x")) return false;
+  if (!peer(tls.idx, idx_compute, sizeof(int32_t) * static_cast<size_t>(G), "peer_idx"))
+    return false;
+  if (!peer(tls.wts, wts_compute, sizeof(float) * static_cast<size_t>(G), "peer_wts")) return false;
 
   if (!vt::ExpertGeGLUFp8TopKIndexed(tls.eq, tls.y, tls.x, gu_base, dn_base, sgu_base, sdn_base,
                                      tls.idx, tls.wts, G, I, H))
-    return false;
+    return fail("expert_geglu");
 
-  if (hipEventRecord(tls.ev_e, est) != hipSuccess) return false;
-  if (hipStreamWaitEvent(cst, tls.ev_e, 0) != hipSuccess) return false;
-  if (hipMemcpyPeerAsync(ysum_compute, compute_dev, tls.y, expert_dev, hb, cst) != hipSuccess)
-    return false;
-  if (hipSetDevice(compute_dev) != hipSuccess) return false;
+  {
+    const hipError_t e = hipEventRecord(tls.ev_e, est);
+    if (e != hipSuccess) return fail("ev_e_record", e);
+  }
+  {
+    const hipError_t e = hipStreamWaitEvent(cst, tls.ev_e, 0);
+    if (e != hipSuccess) return fail("cst_wait_ev_e", e);
+  }
+  {
+    const hipError_t e =
+        hipMemcpyPeerAsync(ysum_compute, compute_dev, tls.y, expert_dev, hb, cst);
+    if (e != hipSuccess) return fail("peer_y", e);
+  }
+  // Required: hipBLAS/kernels after peer MoE assume sticky compute_dev (else
+  // gelu_and_mul invalid resource handle). Peer APIs use explicit ids but TLS
+  // handles do not restore device.
+  {
+    const hipError_t e = hipSetDevice(compute_dev);
+    if (e != hipSuccess) return fail("restore_cdev", e);
+  }
   return true;
 }
 

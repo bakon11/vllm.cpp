@@ -4,8 +4,12 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
+#include <queue>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 #include "vllm/tokenizer/unicode_data.h"
 
@@ -89,22 +93,82 @@ std::string MergeKey(std::string_view left, std::string_view right) {
 }
 
 void BpeMerge(std::vector<std::string>& symbols, const MergeRanks& ranks) {
-  // Repeatedly merge the lowest-ranked adjacent pair; leftmost wins ties
-  // (strict < keeps the first best). O(n^2) scan; pretokens are tiny.
-  while (symbols.size() >= 2) {
-    int32_t best_rank = std::numeric_limits<int32_t>::max();
-    size_t best_i = symbols.size();
-    for (size_t i = 0; i + 1 < symbols.size(); ++i) {
-      const auto it = ranks.find(MergeKey(symbols[i], symbols[i + 1]));
-      if (it != ranks.end() && it->second < best_rank) {
-        best_rank = it->second;
-        best_i = i;
-      }
-    }
-    if (best_i == symbols.size()) break;  // no mergeable pair left
-    symbols[best_i] += symbols[best_i + 1];
-    symbols.erase(symbols.begin() + static_cast<std::ptrdiff_t>(best_i) + 1);
+  // Heap + doubly-linked list BPE. Exact HF semantics (lowest rank, leftmost
+  // on ties via stable index) but O(n log n) instead of the old O(n^2) scan +
+  // vector erase. Required for Gemma-4: metaspace_split=false feeds the whole
+  // prompt as one piece — naive merge was ~60s for 20k tokens / ~2 t/s class
+  // wall on Hermes SOUL+tools tokenize.
+  const size_t n = symbols.size();
+  if (n < 2) return;
+
+  std::vector<int32_t> prev(n), next(n);
+  std::vector<uint8_t> alive(n, 1);
+  for (size_t i = 0; i < n; ++i) {
+    prev[i] = static_cast<int32_t>(i) - 1;
+    next[i] = (i + 1 < n) ? static_cast<int32_t>(i + 1) : -1;
   }
+
+  // min-heap of (rank, left_index). left_index breaks ties leftmost-first.
+  using Node = std::pair<int32_t, int32_t>;  // rank, left_idx
+  std::priority_queue<Node, std::vector<Node>, std::greater<Node>> heap;
+
+  auto consider = [&](int32_t i) {
+    if (i < 0) return;
+    const int32_t j = next[static_cast<size_t>(i)];
+    if (j < 0 || !alive[static_cast<size_t>(i)] ||
+        !alive[static_cast<size_t>(j)]) {
+      return;
+    }
+    const auto it =
+        ranks.find(MergeKey(symbols[static_cast<size_t>(i)],
+                            symbols[static_cast<size_t>(j)]));
+    if (it == ranks.end()) return;
+    heap.emplace(it->second, i);
+  };
+
+  for (size_t i = 0; i + 1 < n; ++i) consider(static_cast<int32_t>(i));
+
+  size_t alive_count = n;
+  while (!heap.empty() && alive_count >= 2) {
+    const auto [rank, i] = heap.top();
+    heap.pop();
+    if (i < 0 || !alive[static_cast<size_t>(i)]) continue;
+    const int32_t j = next[static_cast<size_t>(i)];
+    if (j < 0 || !alive[static_cast<size_t>(j)]) continue;
+    // Stale heap entry: pair rank may have changed after neighbor merges.
+    const auto it =
+        ranks.find(MergeKey(symbols[static_cast<size_t>(i)],
+                            symbols[static_cast<size_t>(j)]));
+    if (it == ranks.end() || it->second != rank) continue;
+
+    // Merge j into i.
+    symbols[static_cast<size_t>(i)] += symbols[static_cast<size_t>(j)];
+    alive[static_cast<size_t>(j)] = 0;
+    --alive_count;
+    const int32_t k = next[static_cast<size_t>(j)];
+    next[static_cast<size_t>(i)] = k;
+    if (k >= 0) prev[static_cast<size_t>(k)] = i;
+
+    // New pairs involving i.
+    consider(prev[static_cast<size_t>(i)]);
+    consider(i);
+  }
+
+  // Compact survivors in order.
+  std::vector<std::string> out;
+  out.reserve(alive_count);
+  int32_t cur = -1;
+  for (size_t t = 0; t < n; ++t) {
+    if (alive[t]) {
+      cur = static_cast<int32_t>(t);
+      break;
+    }
+  }
+  while (cur >= 0) {
+    out.push_back(std::move(symbols[static_cast<size_t>(cur)]));
+    cur = next[static_cast<size_t>(cur)];
+  }
+  symbols.swap(out);
 }
 
 std::vector<std::string> BpeSplit(std::string_view mapped_pretoken,

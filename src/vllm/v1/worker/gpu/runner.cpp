@@ -7,6 +7,7 @@
 #include "vllm/v1/worker/gpu/runner.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -70,6 +71,30 @@ static bool GpuSampleEnabled() {
   }();
   return on;
 }
+
+// Step wall breakdown (lab). VT_STEP_PROFILE=1 → stderr every N pure-decode steps:
+// prep/fwd/sample µs + max_seq. Syncs queue around fwd/sample so GPU work is in
+// the bucket (same methodology as VT_GEMMA4_PROFILE layer timers).
+static bool StepProfileEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_STEP_PROFILE");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
+struct StepProfileTls {
+  using clock = std::chrono::steady_clock;
+  clock::time_point t_exec0{};
+  clock::time_point t_prep_done{};
+  clock::time_point t_fwd_done{};
+  int max_seq = 0;
+  int num_tok = 0;
+  int num_reqs = 0;
+  bool pure_decode = false;
+  bool armed = false;
+};
+static thread_local StepProfileTls g_step_prof;
 
 // Async-scheduling device-input default (ENG-ASYNC-SCHED W3 runner leaf).
 // VT_ASYNC_RUNNER gates the combine_sampled_and_draft_tokens device-input +
@@ -892,6 +917,12 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   //    (gpu_model_runner.py:1786-1881) so _update_states never reads a
   //    device-written buffer and the sync only guards the input staging.
   const bool mirror = async_device_mirror();
+  const bool step_prof = StepProfileEnabled();
+  if (step_prof) {
+    g_step_prof = StepProfileTls{};
+    g_step_prof.t_exec0 = StepProfileTls::clock::now();
+    g_step_prof.armed = true;
+  }
   if (async_forward_in_flight_ && !mirror) {
     vt::GetBackend(queue_.device.type).Synchronize(queue_);
     async_forward_in_flight_ = false;
@@ -1153,6 +1184,9 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // [num_reqs,vocab] logits ON DEVICE and hand them to the sampler with no
   // full-logits D2H. VT_LOGITS_GATHER=0: the host Forward returns full
   // [T,vocab] logits and sample_tokens re-gathers on host (unchanged path).
+  if (g_step_prof.armed) {
+    g_step_prof.t_prep_done = StepProfileTls::clock::now();
+  }
   ModelForwardInput forward_input{
       .token_ids = token_ids,
       .positions = positions,
@@ -1248,6 +1282,20 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   }
 
   ForwardLogits logits = ModelRegistry::Forward(*model_, forward_input);
+
+  if (g_step_prof.armed) {
+    // Include GPU forward tail in fwd bucket (matches layer-profile methodology).
+    vt::GetBackend(queue_.device.type).Synchronize(queue_);
+    g_step_prof.t_fwd_done = StepProfileTls::clock::now();
+    g_step_prof.max_seq = attn_meta.max_seq_len;
+    g_step_prof.num_tok = static_cast<int>(scheduler_output.total_num_scheduled_tokens);
+    g_step_prof.num_reqs = num_reqs;
+    g_step_prof.pure_decode = pure_decode;
+    // prep ends at forward start; stamp if missing (forward path always hits here)
+    if (g_step_prof.t_prep_done.time_since_epoch().count() == 0) {
+      g_step_prof.t_prep_done = g_step_prof.t_fwd_done;
+    }
+  }
 
   // KV-EXTERNAL-CACHE (LMCache): after the forward has written this step's KV,
   // STORE every newly-complete prompt block to the external cache (the worker
@@ -1637,6 +1685,44 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
   // make_sampling_metadata wiring dep). Then Sampler.forward.
   const SamplingMetadata sm = input_batch_.make_sampling_metadata();
   const SamplerOutput sampler_output = sampler_.forward(queue_, logits, sm);
+
+  if (g_step_prof.armed && g_step_prof.pure_decode && g_step_prof.num_tok == g_step_prof.num_reqs) {
+    vt::GetBackend(queue_.device.type).Synchronize(queue_);
+    const auto t_sample_done = StepProfileTls::clock::now();
+    auto us = [](auto a, auto b) {
+      return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+    };
+    const auto prep = us(g_step_prof.t_exec0, g_step_prof.t_prep_done);
+    const auto fwd = us(g_step_prof.t_prep_done, g_step_prof.t_fwd_done);
+    const auto sample = us(g_step_prof.t_fwd_done, t_sample_done);
+    const auto total = us(g_step_prof.t_exec0, t_sample_done);
+    static std::atomic<uint64_t> n{0}, sum_prep{0}, sum_fwd{0}, sum_sample{0}, sum_tot{0};
+    static std::atomic<int> last_max_seq{0};
+    sum_prep.fetch_add(static_cast<uint64_t>(prep), std::memory_order_relaxed);
+    sum_fwd.fetch_add(static_cast<uint64_t>(fwd), std::memory_order_relaxed);
+    sum_sample.fetch_add(static_cast<uint64_t>(sample), std::memory_order_relaxed);
+    sum_tot.fetch_add(static_cast<uint64_t>(total), std::memory_order_relaxed);
+    last_max_seq.store(g_step_prof.max_seq, std::memory_order_relaxed);
+    const uint64_t c = n.fetch_add(1, std::memory_order_relaxed) + 1;
+    // dump first, ~8th, ~32nd pure-decode steps
+    if (c == 1 || c == 8 || c == 32 || c % 64 == 0) {
+      const double inv = 1.0 / static_cast<double>(c);
+      std::fprintf(stderr,
+                   "step profile decode: n=%llu max_seq=%d prep_us=%.0f fwd_us=%.0f "
+                   "sample_us=%.0f total_us=%.0f (prep%%=%.0f fwd%%=%.0f sample%%=%.0f) "
+                   "last_prep=%lld last_fwd=%lld last_sample=%lld\n",
+                   static_cast<unsigned long long>(c), last_max_seq.load(),
+                   sum_prep.load() * inv, sum_fwd.load() * inv, sum_sample.load() * inv,
+                   sum_tot.load() * inv,
+                   100.0 * sum_prep.load() / (sum_tot.load() + 1),
+                   100.0 * sum_fwd.load() / (sum_tot.load() + 1),
+                   100.0 * sum_sample.load() / (sum_tot.load() + 1),
+                   static_cast<long long>(prep), static_cast<long long>(fwd),
+                   static_cast<long long>(sample));
+      std::fflush(stderr);
+    }
+    g_step_prof.armed = false;
+  }
 
   // ModelRunnerOutput.logprobs (gpu_model_runner.py:3842-3851 / outputs.py):
   // the sampler's batch-wide gather_logprobs result (one row per num_logits
