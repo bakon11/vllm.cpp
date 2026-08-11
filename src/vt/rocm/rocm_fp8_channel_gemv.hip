@@ -91,12 +91,14 @@ __device__ inline float BlockSumFast(float v) {
 
 // Dual reduce (gate+up) — half the barriers of two BlockSumFast calls.
 // Lab 2026-08-10: ExpertGeGLU act is MoE hot path after peer-indexed fix.
+// Supports 1–8 warps (TPB 32–256); zero-fills unused warp slots.
 __device__ inline void BlockSumFast2(float& a, float& b) {
   __shared__ float wa[8];
   __shared__ float wb[8];
   const int tid = static_cast<int>(threadIdx.x);
   const int lane = tid & 31;
   const int warp = tid >> 5;
+  const int nwarps = static_cast<int>(blockDim.x) >> 5;
   a = WarpSum(a);
   b = WarpSum(b);
   if (lane == 0) {
@@ -105,8 +107,8 @@ __device__ inline void BlockSumFast2(float& a, float& b) {
   }
   __syncthreads();
   if (warp == 0) {
-    a = (lane < 8) ? wa[lane] : 0.f;
-    b = (lane < 8) ? wb[lane] : 0.f;
+    a = (lane < nwarps) ? wa[lane] : 0.f;
+    b = (lane < nwarps) ? wb[lane] : 0.f;
     a = WarpSum(a);
     b = WarpSum(b);
     if (lane == 0) {
@@ -125,6 +127,7 @@ __device__ inline void BlockSumFast4(float& a, float& b, float& c, float& d) {
   const int tid = static_cast<int>(threadIdx.x);
   const int lane = tid & 31;
   const int warp = tid >> 5;
+  const int nwarps = static_cast<int>(blockDim.x) >> 5;
   a = WarpSum(a);
   b = WarpSum(b);
   c = WarpSum(c);
@@ -137,10 +140,10 @@ __device__ inline void BlockSumFast4(float& a, float& b, float& c, float& d) {
   }
   __syncthreads();
   if (warp == 0) {
-    a = (lane < 8) ? w[0][lane] : 0.f;
-    b = (lane < 8) ? w[1][lane] : 0.f;
-    c = (lane < 8) ? w[2][lane] : 0.f;
-    d = (lane < 8) ? w[3][lane] : 0.f;
+    a = (lane < nwarps) ? w[0][lane] : 0.f;
+    b = (lane < nwarps) ? w[1][lane] : 0.f;
+    c = (lane < nwarps) ? w[2][lane] : 0.f;
+    d = (lane < nwarps) ? w[3][lane] : 0.f;
     a = WarpSum(a);
     b = WarpSum(b);
     c = WarpSum(c);
@@ -734,6 +737,7 @@ __global__ void ExpertFp8ActTopKIndexedKernel(float* __restrict__ act,
 }
 
 // Hardware FP8 convert path — no 1KB LDS LUT (gfx1201 OCP).
+// K-loop strides use blockDim.x (supports VT_GEMMA4_ACT_TPB=128/192/256).
 __global__ void ExpertFp8ActTopKIndexedKernelHw(float* __restrict__ act,
                                                 const float* __restrict__ x_f,
                                                 const uint8_t* __restrict__ gu_base,
@@ -744,6 +748,7 @@ __global__ void ExpertFp8ActTopKIndexedKernelHw(float* __restrict__ act,
   if (i >= I || G <= 0) return;
   __shared__ int sidx[kMaxTopK];
   const int tid = static_cast<int>(threadIdx.x);
+  const int tpb = static_cast<int>(blockDim.x);
   if (tid < G) sidx[tid] = idx[tid];
   __syncthreads();
 
@@ -759,10 +764,10 @@ __global__ void ExpertFp8ActTopKIndexedKernelHw(float* __restrict__ act,
     const uint8_t* urow = gu + static_cast<int64_t>(I + i) * H;
 
     float gate = 0.f, up = 0.f;
-    for (int h = tid * 16; h < H16; h += kBlock * 16) {
+    for (int h = tid * 16; h < H16; h += tpb * 16) {
       AccGateUpVec16Hw(gate, up, x_f, grow, urow, h);
     }
-    for (int h = H16 + tid; h < H; h += kBlock) {
+    for (int h = H16 + tid; h < H; h += tpb) {
       const float xv = x_f[h];
       gate += xv * Fp8E4M3HwFromByte(grow[h]);
       up += xv * Fp8E4M3HwFromByte(urow[h]);
@@ -772,6 +777,139 @@ __global__ void ExpertFp8ActTopKIndexedKernelHw(float* __restrict__ act,
       const float sgate = __bfloat162float(sg[i]);
       const float sup = __bfloat162float(sg[I + i]);
       act[static_cast<int64_t>(g) * I + i] = gelu_tanh(sgate * gate) * (sup * up);
+    }
+  }
+}
+
+// Warp-per-expert HW act (lab 2026-08-11).
+// Geometry: H=2816 → only 176 of 256 threads work in *KernelHw (h=tid*16, stride 4096).
+// G experts were serial → wall = G × GEMV. Here: CTA = G warps (G≤8), each warp one expert;
+// all 32*G threads busy; 2816/4/32 = 22 float4 steps/lane exactly. Env: VT_GEMMA4_ACT_WARPG=1.
+__global__ void ExpertFp8ActTopKIndexedKernelHwWarpG(float* __restrict__ act,
+                                                     const float* __restrict__ x_f,
+                                                     const uint8_t* __restrict__ gu_base,
+                                                     const __hip_bfloat16* __restrict__ sgu_base,
+                                                     const int32_t* __restrict__ idx, int G, int I,
+                                                     int H) {
+  const int i = static_cast<int>(blockIdx.x);
+  if (i >= I || G <= 0) return;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  __shared__ int sidx[kMaxTopK];
+  if (tid < G) sidx[tid] = idx[tid];
+  __syncthreads();
+  if (warp >= G) return;
+
+  const int g = warp;
+  const int e = sidx[g];
+  const size_t gu_one = static_cast<size_t>(2) * static_cast<size_t>(I) * static_cast<size_t>(H);
+  const size_t sgu_one = static_cast<size_t>(2) * static_cast<size_t>(I);
+  const uint8_t* gu = gu_base + static_cast<size_t>(e) * gu_one;
+  const __hip_bfloat16* sg = sgu_base + static_cast<size_t>(e) * sgu_one;
+  const uint8_t* grow = gu + static_cast<int64_t>(i) * H;
+  const uint8_t* urow = gu + static_cast<int64_t>(I + i) * H;
+
+  float gate = 0.f, up = 0.f;
+  // Prefer aligned float4 path when H is multiple of 128 (32 lanes × 4).
+  const int H4 = H & ~3;
+  const int n_vec = H4 / 128;  // full rounds where every lane has a float4
+  // Round t: base = lane*4 + t*128 covers [0, n_vec*128).
+  for (int t = 0; t < n_vec; ++t) {
+    const int base = lane * 4 + t * 128;
+    const float4 xv = *reinterpret_cast<const float4*>(x_f + base);
+    const uint32_t gw = *reinterpret_cast<const uint32_t*>(grow + base);
+    const uint32_t uw = *reinterpret_cast<const uint32_t*>(urow + base);
+    float g0, g1, g2, g3, u0, u1, u2, u3;
+    Fp8E4M3HwFromU32(gw, g0, g1, g2, g3);
+    Fp8E4M3HwFromU32(uw, u0, u1, u2, u3);
+    gate += xv.x * g0 + xv.y * g1 + xv.z * g2 + xv.w * g3;
+    up += xv.x * u0 + xv.y * u1 + xv.z * u2 + xv.w * u3;
+  }
+  // Tail: remaining float4s with base >= n_vec*128, assigned by lane if in range.
+  for (int base = n_vec * 128 + lane * 4; base < H4; base += 128) {
+    const float4 xv = *reinterpret_cast<const float4*>(x_f + base);
+    const uint32_t gw = *reinterpret_cast<const uint32_t*>(grow + base);
+    const uint32_t uw = *reinterpret_cast<const uint32_t*>(urow + base);
+    float g0, g1, g2, g3, u0, u1, u2, u3;
+    Fp8E4M3HwFromU32(gw, g0, g1, g2, g3);
+    Fp8E4M3HwFromU32(uw, u0, u1, u2, u3);
+    gate += xv.x * g0 + xv.y * g1 + xv.z * g2 + xv.w * g3;
+    up += xv.x * u0 + xv.y * u1 + xv.z * u2 + xv.w * u3;
+  }
+  for (int h = H4 + lane; h < H; h += 32) {
+    const float xv = x_f[h];
+    gate += xv * Fp8E4M3HwFromByte(grow[h]);
+    up += xv * Fp8E4M3HwFromByte(urow[h]);
+  }
+  gate = WarpSum(gate);
+  up = WarpSum(up);
+  if (lane == 0) {
+    const float sgate = __bfloat162float(sg[i]);
+    const float sup = __bfloat162float(sg[I + i]);
+    act[static_cast<int64_t>(g) * I + i] = gelu_tanh(sgate * gate) * (sup * up);
+  }
+}
+
+// HW + 2-I pack: half launches, dual-issue dots, x_f L2 reuse across two intermediate rows.
+// Prior I2 was LUT-only and flat; HW path may differ. Env uses ACT_I_PACK=2 + HW.
+__global__ void ExpertFp8ActTopKIndexedKernelHwI2(float* __restrict__ act,
+                                                  const float* __restrict__ x_f,
+                                                  const uint8_t* __restrict__ gu_base,
+                                                  const __hip_bfloat16* __restrict__ sgu_base,
+                                                  const int32_t* __restrict__ idx, int G, int I,
+                                                  int H) {
+  const int i0 = static_cast<int>(blockIdx.x) * 2;
+  if (i0 >= I || G <= 0) return;
+  const int i1 = i0 + 1;
+  const bool has1 = i1 < I;
+  __shared__ int sidx[kMaxTopK];
+  const int tid = static_cast<int>(threadIdx.x);
+  const int tpb = static_cast<int>(blockDim.x);
+  if (tid < G) sidx[tid] = idx[tid];
+  __syncthreads();
+
+  const size_t gu_one = static_cast<size_t>(2) * static_cast<size_t>(I) * static_cast<size_t>(H);
+  const size_t sgu_one = static_cast<size_t>(2) * static_cast<size_t>(I);
+  const int H16 = H & ~15;
+
+  for (int g = 0; g < G; ++g) {
+    const int e = sidx[g];
+    const uint8_t* gu = gu_base + static_cast<size_t>(e) * gu_one;
+    const __hip_bfloat16* sg = sgu_base + static_cast<size_t>(e) * sgu_one;
+    const uint8_t* grow0 = gu + static_cast<int64_t>(i0) * H;
+    const uint8_t* urow0 = gu + static_cast<int64_t>(I + i0) * H;
+    const uint8_t* grow1 = has1 ? gu + static_cast<int64_t>(i1) * H : grow0;
+    const uint8_t* urow1 = has1 ? gu + static_cast<int64_t>(I + i1) * H : urow0;
+
+    float g0 = 0.f, u0 = 0.f, g1 = 0.f, u1 = 0.f;
+    for (int h = tid * 16; h < H16; h += tpb * 16) {
+      AccGateUpVec16Hw(g0, u0, x_f, grow0, urow0, h);
+      if (has1) AccGateUpVec16Hw(g1, u1, x_f, grow1, urow1, h);
+    }
+    for (int h = H16 + tid; h < H; h += tpb) {
+      const float xv = x_f[h];
+      g0 += xv * Fp8E4M3HwFromByte(grow0[h]);
+      u0 += xv * Fp8E4M3HwFromByte(urow0[h]);
+      if (has1) {
+        g1 += xv * Fp8E4M3HwFromByte(grow1[h]);
+        u1 += xv * Fp8E4M3HwFromByte(urow1[h]);
+      }
+    }
+    if (has1) {
+      BlockSumFast4(g0, u0, g1, u1);
+    } else {
+      BlockSumFast2(g0, u0);
+    }
+    if (tid == 0) {
+      const float sg0 = __bfloat162float(sg[i0]);
+      const float su0 = __bfloat162float(sg[I + i0]);
+      act[static_cast<int64_t>(g) * I + i0] = gelu_tanh(sg0 * g0) * (su0 * u0);
+      if (has1) {
+        const float sg1 = __bfloat162float(sg[i1]);
+        const float su1 = __bfloat162float(sg[I + i1]);
+        act[static_cast<int64_t>(g) * I + i1] = gelu_tanh(sg1 * g1) * (su1 * u1);
+      }
     }
   }
 }
@@ -1190,11 +1328,28 @@ bool ExpertGeGLUFp8TopKIndexedRocm(Queue& q, void* ysum, const void* x, const vo
     if (e && e[0] == '1') return 1;
     return 0;
   }();
+  // VT_GEMMA4_ACT_WARPG=1 → one warp per top-k expert (parallel G, full lane fill).
+  static const int act_warpg = [] {
+    const char* e = std::getenv("VT_GEMMA4_ACT_WARPG");
+    if (e && e[0] == '1') return 1;
+    return 0;
+  }();
+  // VT_GEMMA4_ACT_TPB: threads/block for HW act (default 256). 128 fills H=2816 better
+  // (256 leaves ~80 idle lanes: tid*16 >= 2816).
+  static const int act_tpb = [] {
+    const char* e = std::getenv("VT_GEMMA4_ACT_TPB");
+    if (!e || !e[0]) return 256;
+    const int v = std::atoi(e);
+    if (v == 128 || v == 192 || v == 256) return v;
+    return 256;
+  }();
   static bool once_pack = false;
   if (!once_pack) {
     once_pack = true;
-    std::fprintf(stderr, "INFO ExpertGeGLU act_i_pack=%d fp8_hw_cvt=%d expert_wmma=%d\n", act_pack,
-                 hw_cvt, expert_wmma);
+    std::fprintf(stderr,
+                 "INFO ExpertGeGLU act_i_pack=%d fp8_hw_cvt=%d expert_wmma=%d act_warpg=%d "
+                 "act_tpb=%d\n",
+                 act_pack, hw_cvt, expert_wmma, act_warpg, act_tpb);
     std::fflush(stderr);
   }
 
@@ -1206,6 +1361,8 @@ bool ExpertGeGLUFp8TopKIndexedRocm(Queue& q, void* ysum, const void* x, const vo
   // empty-stub on non-gfx12 device objects.
   const bool wmma_ok =
       expert_wmma && hw_cvt && (I % kWmma == 0) && (H % kWmma == 0) && (I / kWmma) > 0;
+  // Warp-G needs G warps in one CTA (G≤8 → ≤256 threads) and HW cvt.
+  const bool warpg_ok = act_warpg && hw_cvt && G > 0 && G <= 8 && !wmma_ok;
 
   if (wmma_ok) {
     // Quantize x_f → x_f8 + sx, WMMA act, HW down.
@@ -1225,9 +1382,28 @@ bool ExpertGeGLUFp8TopKIndexedRocm(Queue& q, void* ysum, const void* x, const vo
     ExpertFp8DownTopKIndexedKernelHw<<<grid_dn, kBlock, 0, st>>>(
         static_cast<__hip_bfloat16*>(ysum), tls.d_act, static_cast<const uint8_t*>(dn_base),
         static_cast<const __hip_bfloat16*>(sdn_base), idx_dev, wts_dev, G, I, H);
+  } else if (warpg_ok) {
+    dim3 grid_act(static_cast<unsigned>(I));
+    const int tpb = G * 32;
+    ExpertFp8ActTopKIndexedKernelHwWarpG<<<grid_act, tpb, 0, st>>>(
+        tls.d_act, tls.d_xf, static_cast<const uint8_t*>(gu_base),
+        static_cast<const __hip_bfloat16*>(sgu_base), idx_dev, G, I, H);
+    const int grid_dn = (H + kBlock - 1) / kBlock;
+    ExpertFp8DownTopKIndexedKernelHw<<<grid_dn, kBlock, 0, st>>>(
+        static_cast<__hip_bfloat16*>(ysum), tls.d_act, static_cast<const uint8_t*>(dn_base),
+        static_cast<const __hip_bfloat16*>(sdn_base), idx_dev, wts_dev, G, I, H);
+  } else if (hw_cvt && act_pack == 2) {
+    const unsigned ng = static_cast<unsigned>((I + 1) / 2);
+    ExpertFp8ActTopKIndexedKernelHwI2<<<ng, act_tpb, 0, st>>>(
+        tls.d_act, tls.d_xf, static_cast<const uint8_t*>(gu_base),
+        static_cast<const __hip_bfloat16*>(sgu_base), idx_dev, G, I, H);
+    const int grid_dn = (H + kBlock - 1) / kBlock;
+    ExpertFp8DownTopKIndexedKernelHw<<<grid_dn, kBlock, 0, st>>>(
+        static_cast<__hip_bfloat16*>(ysum), tls.d_act, static_cast<const uint8_t*>(dn_base),
+        static_cast<const __hip_bfloat16*>(sdn_base), idx_dev, wts_dev, G, I, H);
   } else if (hw_cvt) {
     dim3 grid_act(static_cast<unsigned>(I));
-    ExpertFp8ActTopKIndexedKernelHw<<<grid_act, kBlock, 0, st>>>(
+    ExpertFp8ActTopKIndexedKernelHw<<<grid_act, act_tpb, 0, st>>>(
         tls.d_act, tls.d_xf, static_cast<const uint8_t*>(gu_base),
         static_cast<const __hip_bfloat16*>(sgu_base), idx_dev, G, I, H);
     const int grid_dn = (H + kBlock - 1) / kBlock;
