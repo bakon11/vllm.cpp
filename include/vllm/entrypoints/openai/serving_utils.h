@@ -41,6 +41,14 @@ std::string SanitizeUtf8(const std::string& s);
 int SsePingIntervalSec();
 inline constexpr const char kSsePingFrame[] = ":\n\n";
 
+// Shared chat + completion framing after a timed collector wait.
+// - ready set  -> move into `out`, return true  (caller emits a data frame)
+// - ready empty -> set `chunk` to kSsePingFrame ONLY, return false
+//   (caller emits that standalone comment; never concatenate with data).
+// Used by ChatSseStream / CompletionSseStream WaitOutput.
+bool AssignSseWaitResult(std::optional<vllm::RequestOutput> ready,
+                         vllm::RequestOutput& out, std::string& chunk);
+
 // Ported from: vllm/entrypoints/serve/utils/api_utils.py:276-289
 // (should_include_usage). Force mode enables final and continuous usage;
 // request-level continuous stats never take effect without include_usage.

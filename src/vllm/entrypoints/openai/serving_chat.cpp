@@ -354,12 +354,8 @@ class ChatSseStream final : public SseStream {
     for (;;) {
       auto ready = engine_.get_output_for(
           async_request_, std::chrono::milliseconds(ping_s * 1000));
-      if (ready.has_value()) {
-        out = std::move(*ready);
-        return true;
-      }
-      ping_chunk = kSsePingFrame;
-      return false;
+      // Shared framing with completion: ping is a standalone comment frame.
+      return AssignSseWaitResult(std::move(ready), out, ping_chunk);
     }
   }
 

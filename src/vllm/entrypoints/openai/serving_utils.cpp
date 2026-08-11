@@ -1,6 +1,8 @@
 // vllm.cpp original — see serving_utils.h.
 #include <cstdlib>
+#include <optional>
 #include "vllm/entrypoints/openai/serving_utils.h"
+#include "vllm/outputs.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -235,6 +237,18 @@ std::vector<vllm::CompletionOutput> SelectBestOf(
   return outputs;
 }
 
+
+
+bool AssignSseWaitResult(std::optional<vllm::RequestOutput> ready,
+                         vllm::RequestOutput& out, std::string& chunk) {
+  if (ready.has_value()) {
+    out = std::move(*ready);
+    return true;
+  }
+  // Pure SSE comment — never prefix/suffix a data frame here.
+  chunk = kSsePingFrame;
+  return false;
+}
 
 int SsePingIntervalSec() {
   // Default 15s. <=0 disables. Long MoE prefill needs body bytes so proxies /
