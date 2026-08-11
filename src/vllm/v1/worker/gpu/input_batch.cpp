@@ -99,27 +99,31 @@ const std::vector<int>& InputBatch::RemovedTracker::removed() {
 namespace {
 // Upstream builds MultiGroupBlockTable with per-group max_num_blocks derived
 // from max_model_len; block_sizes / kernel_block_sizes are the caller's groups.
-MultiGroupBlockTable make_block_table(int max_num_reqs, int max_model_len,
-                                      int max_num_batched_tokens,
-                                      std::vector<int> block_sizes,
-                                      std::vector<int> kernel_block_sizes) {
-  return MultiGroupBlockTable(max_num_reqs, max_model_len,
-                              max_num_batched_tokens, std::move(block_sizes),
-                              std::move(kernel_block_sizes));
+// Optional max_num_blocks (e.g. SWA group admission cap) shrinks columns for
+// hybrid SlidingWindow groups — nullopt keeps the historical cdiv(max_model_len).
+MultiGroupBlockTable make_block_table(
+    int max_num_reqs, int max_model_len, int max_num_batched_tokens,
+    std::vector<int> block_sizes, std::vector<int> kernel_block_sizes,
+    std::optional<std::vector<int>> max_num_blocks = std::nullopt) {
+  return MultiGroupBlockTable(max_num_reqs, max_model_len, max_num_batched_tokens,
+                              std::move(block_sizes), std::move(kernel_block_sizes),
+                              std::move(max_num_blocks));
 }
 }  // namespace
 
 InputBatch::InputBatch(int max_num_reqs, int max_model_len,
                        int max_num_batched_tokens, int vocab_size,
                        std::vector<int> block_sizes,
-                       std::vector<int> kernel_block_sizes)
+                       std::vector<int> kernel_block_sizes,
+                       std::optional<std::vector<int>> max_num_blocks)
     : max_num_reqs(max_num_reqs),
       max_model_len(max_model_len),
       max_num_batched_tokens(max_num_batched_tokens),
       vocab_size(vocab_size),
       block_table(make_block_table(max_num_reqs, max_model_len,
                                    max_num_batched_tokens, std::move(block_sizes),
-                                   std::move(kernel_block_sizes))) {
+                                   std::move(kernel_block_sizes),
+                                   std::move(max_num_blocks))) {
   const size_t n = static_cast<size_t>(max_num_reqs);
   token_ids_cpu.assign(n * static_cast<size_t>(max_model_len), 0);
   num_tokens_no_spec.assign(n, 0);

@@ -92,6 +92,19 @@ __global__ void GeluMulSepK(Tout* out, const Tin* gate, const Tin* up, int64_t n
   }
 }
 
+// x[n, 2d] pair-interleaved columns (g0,u0,g1,u1,…); out[n,d].
+template <typename Tin, typename Tout>
+__global__ void GeluMulPairK(Tout* out, const Tin* x, int64_t n, int64_t d) {
+  for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n;
+       idx += gridDim.x * blockDim.x) {
+    const int64_t i = idx / d, j = idx - i * d;
+    const float g = Ld(x, i * 2 * d + 2 * j);
+    const float up = Ld(x, i * 2 * d + 2 * j + 1);
+    const float inner = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+    St(out, idx, 0.5f * g * (1.0f + tanhf(inner)) * up);
+  }
+}
+
 template <typename Tin, typename Tout>
 __global__ void SiluMulK(Tout* out, const Tin* x, int64_t n, int64_t d) {
   for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n;
@@ -278,6 +291,24 @@ void GeluAndMulKernelRocm(Queue& q, Tensor& out, const Tensor& x) {
   else
     VT_CHECK(false, "rocm gelu_and_mul dtype");
   Check(hipGetLastError(), "gelu_and_mul");
+}
+
+// Pair-interleaved GeGLU: x[M,2I] columns (g0,u0,g1,u1,…). Used when expert gu pack
+// is gate|up row-interleaved (VT_GEMMA4_GU_INTERLEAVE).
+void GeluAndMulPairRocm(Queue& q, Tensor& out, const Tensor& x) {
+  EnsureQueueDevice(q);
+  const int64_t d = x.shape[1] / 2, n = x.shape[0] * d;
+  if (n == 0) return;
+  hipStream_t st = AsStream(q);
+  if (x.dtype == DType::kBF16)
+    GeluMulPairK<__hip_bfloat16, __hip_bfloat16><<<GridFor(n), kBlock, 0, st>>>(
+        out.Ptr<__hip_bfloat16>(), x.Ptr<__hip_bfloat16>(), n, d);
+  else if (x.dtype == DType::kF32)
+    GeluMulPairK<float, float>
+        <<<GridFor(n), kBlock, 0, st>>>(out.Ptr<float>(), x.Ptr<float>(), n, d);
+  else
+    VT_CHECK(false, "rocm gelu_and_mul_pair dtype");
+  Check(hipGetLastError(), "gelu_and_mul_pair");
 }
 
 // Separate gate/up GeGLU (no pack). n = T * I elements.
@@ -734,6 +765,106 @@ void ReshapeAndCacheKernelRocm(Queue& q, const Tensor& k, const Tensor& v, Tenso
       VT_CHECK(false, "rocm reshape_and_cache: unsupported elem size");
   }
   Check(hipGetLastError(), "reshape_and_cache");
+}
+
+// ---------------- ReshapeAndCacheFp8 (NHD paged KV write, e4m3) ------------
+// Store: fp8 = Quantize(hp / scale). Source is model float (bf16/f32); cache is
+// 1-byte kI8. Lab W2-ROCm (CPU W1 already exists).
+#if defined(__gfx1200__) || defined(__gfx1201__)
+__device__ inline uint8_t F32ToF8E4M3Dev(float f) {
+  // Pack two floats; take low byte. OCP E4M3 on RDNA4.
+  const unsigned int packed = __builtin_amdgcn_cvt_pk_fp8_f32(f, 0.0f, 0u, false);
+  return static_cast<uint8_t>(packed & 0xffu);
+}
+#else
+__device__ inline uint8_t F32ToF8E4M3Dev(float f) {
+  // Software e4m3fn, round-nearest-even, saturate to ±448 (matches vt::F32ToF8E4M3).
+  constexpr float kFp8Max = 448.0f;
+  if (isnan(f)) return 0x7Fu;
+  const uint8_t sign = signbit(f) ? 0x80u : 0x00u;
+  const float a = fabsf(f);
+  if (!isfinite(a) || a >= kFp8Max) return static_cast<uint8_t>(sign | 0x7Eu);
+  if (a == 0.0f) return sign;
+  int e2 = 0;
+  const float frac = frexpf(a, &e2);
+  int exp_field = (e2 - 1) + 7;
+  if (exp_field <= 0) {
+    const float qd = a * 512.0f;
+    const int qi = static_cast<int>(nearbyintf(qd));
+    if (qi <= 0) return sign;
+    if (qi < 8) return static_cast<uint8_t>(sign | static_cast<uint8_t>(qi));
+    return static_cast<uint8_t>(sign | (1u << 3));
+  }
+  const float sig = frac * 2.0f;
+  int mi = static_cast<int>(nearbyintf(sig * 8.0f));
+  if (mi == 16) {
+    mi = 8;
+    exp_field += 1;
+  }
+  const int mant = mi - 8;
+  if (exp_field > 15 || (exp_field == 15 && mant >= 7)) {
+    return static_cast<uint8_t>(sign | 0x7Eu);
+  }
+  return static_cast<uint8_t>(sign | (static_cast<uint8_t>(exp_field) << 3) |
+                             static_cast<uint8_t>(mant));
+}
+#endif
+
+template <typename SrcT>
+__global__ void ReshapeAndCacheFp8K(const SrcT* key, const SrcT* value, uint8_t* key_cache,
+                                    uint8_t* value_cache, const int64_t* slot_mapping,
+                                    int64_t block_size, int64_t n_elems, int64_t k_block_stride,
+                                    int64_t k_page_stride, int64_t v_block_stride,
+                                    int64_t v_page_stride, int64_t k_tok_stride,
+                                    int64_t v_tok_stride, float inv_k_scale, float inv_v_scale) {
+  const int64_t token = blockIdx.x;
+  const int64_t slot = slot_mapping[token];
+  if (slot < 0) return;
+  const int64_t block = slot / block_size;
+  const int64_t offset = slot % block_size;
+  const int64_t kdst = block * k_block_stride + offset * k_page_stride;
+  const int64_t vdst = block * v_block_stride + offset * v_page_stride;
+  const int64_t ksrc = token * k_tok_stride;
+  const int64_t vsrc = token * v_tok_stride;
+  for (int64_t e = threadIdx.x; e < n_elems; e += blockDim.x) {
+    const float kh = Ld(key, ksrc + e) * inv_k_scale;
+    const float vh = Ld(value, vsrc + e) * inv_v_scale;
+    key_cache[kdst + e] = F32ToF8E4M3Dev(kh);
+    value_cache[vdst + e] = F32ToF8E4M3Dev(vh);
+  }
+}
+
+void ReshapeAndCacheFp8KernelRocm(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
+                                  Tensor& v_cache, const Tensor& slot_mapping,
+                                  Fp8KVCacheDataType kind, float k_scale, float v_scale) {
+  EnsureQueueDevice(q);
+  VT_CHECK(kind == Fp8KVCacheDataType::kFp8E4M3,
+           "rocm reshape_and_cache_fp8: only fp8_e4m3");
+  VT_CHECK(k_scale > 0.f && v_scale > 0.f, "rocm reshape_and_cache_fp8: scales must be > 0");
+  const int64_t num_slots = slot_mapping.shape[0];
+  const int64_t block_size = k_cache.shape[1];
+  const int64_t n_elems = k_cache.shape[2] * k_cache.shape[3];
+  if (num_slots == 0 || n_elems == 0) return;
+  hipStream_t st = AsStream(q);
+  const unsigned grid = static_cast<unsigned>(num_slots);
+  const unsigned block = static_cast<unsigned>(n_elems < 512 ? n_elems : 512);
+  const int64_t* slots = slot_mapping.Ptr<int64_t>();
+  const float inv_k = 1.f / k_scale;
+  const float inv_v = 1.f / v_scale;
+  if (k.dtype == DType::kBF16) {
+    ReshapeAndCacheFp8K<__hip_bfloat16><<<grid, block, 0, st>>>(
+        k.Ptr<__hip_bfloat16>(), v.Ptr<__hip_bfloat16>(), k_cache.Ptr<uint8_t>(),
+        v_cache.Ptr<uint8_t>(), slots, block_size, n_elems, k_cache.stride[0], k_cache.stride[1],
+        v_cache.stride[0], v_cache.stride[1], k.stride[0], v.stride[0], inv_k, inv_v);
+  } else if (k.dtype == DType::kF32) {
+    ReshapeAndCacheFp8K<float><<<grid, block, 0, st>>>(
+        k.Ptr<float>(), v.Ptr<float>(), k_cache.Ptr<uint8_t>(), v_cache.Ptr<uint8_t>(), slots,
+        block_size, n_elems, k_cache.stride[0], k_cache.stride[1], v_cache.stride[0],
+        v_cache.stride[1], k.stride[0], v.stride[0], inv_k, inv_v);
+  } else {
+    VT_CHECK(false, "rocm reshape_and_cache_fp8: source must be bf16 or f32");
+  }
+  Check(hipGetLastError(), "reshape_and_cache_fp8");
 }
 
 // ---------------- GeluTanh / GeluErf (elementwise) -------------------------

@@ -206,12 +206,11 @@ std::optional<KVCacheBlocks> KVCacheManager::allocate_slots(
   if (full_sequence_must_fit) {
     // First check and fail if the full request sequence won't fit.
     const int full_num_tokens = std::min(request.NumTokens(), max_model_len);
-    const int num_blocks_full = coordinator->get_num_blocks_to_allocate(
-        request.request_id, full_num_tokens, new_computed_block_list,
-        num_encoder_tokens, total_computed_tokens, full_num_tokens,
-        /*apply_admission_cap=*/true);
-    const int required_full = num_blocks_full + watermark_blocks_applied;
-    if (required_full > block_pool.get_num_free_blocks()) {
+    if (!coordinator->can_allocate_across_groups(
+            request.request_id, full_num_tokens, new_computed_block_list,
+            num_encoder_tokens, total_computed_tokens, full_num_tokens,
+            /*apply_admission_cap=*/true, watermark_blocks_applied,
+            /*reserved_blocks=*/0)) {
       return std::nullopt;
     }
   }
@@ -226,18 +225,13 @@ std::optional<KVCacheBlocks> KVCacheManager::allocate_slots(
   coordinator->remove_skipped_blocks(request.request_id, total_computed_tokens,
                                      request.num_prompt_tokens);
 
-  const int num_blocks_to_allocate = coordinator->get_num_blocks_to_allocate(
-      request.request_id, num_tokens_need_slot, new_computed_block_list,
-      num_encoder_tokens,
-      num_local_computed_tokens + num_external_computed_tokens,
-      num_tokens_main_model);
-
-  // Keep reserved_blocks free for other in-flight sequences, and an additional
-  // watermark of headroom for waiting/preempted admissions.
-  const int available_blocks =
-      block_pool.get_num_free_blocks() - reserved_blocks;
-  const int required_blocks = num_blocks_to_allocate + watermark_blocks_applied;
-  if (required_blocks > available_blocks) {
+  // Multi-pool aware free check (single-pool path matches prior sum vs block_pool).
+  if (!coordinator->can_allocate_across_groups(
+          request.request_id, num_tokens_need_slot, new_computed_block_list,
+          num_encoder_tokens,
+          num_local_computed_tokens + num_external_computed_tokens,
+          num_tokens_main_model, /*apply_admission_cap=*/false,
+          watermark_blocks_applied, reserved_blocks)) {
     // Cannot allocate new blocks (OOM -> the Scheduler preempts).
     return std::nullopt;
   }

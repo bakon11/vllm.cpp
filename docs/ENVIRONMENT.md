@@ -127,10 +127,19 @@ portable/reference path. In normal operation leave them unset.
 | `VT_ATTN_PREFILL_SHAREDK_WMMA` | on | ROCm SharedK fused with rocWMMA QK on sliding d=256 (and global-Q d=512). `0` forces scalar SharedK |
 | `VT_ATTN_DECODE_KV_SPLITS` | `0` | ROCm decode full-attn only: SGLang multi-CTA KV splits. `0`=off. `N`=fixed (lab cap 32). `auto`/`-1`=host max_seq_len pow2+CU-fill. Lab recipe `16` |
 | `VT_ATTN_DECODE_SLIDE_WARPS` | `8` | Sliding DecodeGqa K-warps (`8` or `16`). Lab recipe `16` (~+6–10% @23–30k) |
+| `VT_ATTN_DECODE_SLIDE_SPLITS` | `0` | Sliding multi-CTA KV splits (Split1/2). `0`=off. `N`=fixed (cap 32). `auto`=window-based CU-fill. Lab recipe `8` (Gemma-4 Hkv=8 underfill fix; +5–6% @p4–20k) |
+| `VT_ATTN_DECODE_SPLIT_WARPS` | `8` | Full Split1 K-warps. `12` @ d=512 QG=2 (o smem 48KB; lab KEEP +5% @p4–20k). `16` only @ d≤256 |
 | `VT_GEMMA4_FP8_HW_CVT` | `1` | ROCm ExpertGeGLU decode: gfx1201 OCP `__builtin_amdgcn_cvt_f32_fp8` dequant (no LDS LUT). Lab KEEP ~+8% @9–30k. `0` = shared LUT fallback |
 | `VT_GEMMA4_EXPERT_WMMA` | `0` | ROCm ExpertGeGLU **act** path: quantize x→E4M3 then rocWMMA fp8×fp8 16×16 tiles (gfx1201). Opt-in A/B; default OFF until quality+speed KEEP. Down stays HW scalar |
 | `VT_GEMMA4_ACT_WARPG` | `0` | ROCm ExpertGeGLU HW act: one warp per top-k expert (parallel G, full lane fill on H=2816). Opt-in A/B; default OFF until KEEP |
 | `VT_GEMMA4_ACT_TPB` | `256` | HW act threads/block (`128`/`192`/`256`). H=2816: 256 leaves ~80 idle; 128 better fill. Lab A/B ~flat e2e — default 256 |
+| `VT_GEMMA4_GU_INTERLEAVE` | `0` | FP8 expert gu pack: `1` → row order (g0,u0,g1,u1,…) so gate/up of same i are adjacent (H bytes). Decode GEMV locality A/B; prefill uses GeluAndMulPair. Default OFF until KEEP |
+| `VT_GEMMA4_DOWN_LDS` | `1` | Stage ExpertGeGLU down `act[G,I]` in LDS (~22KB). Lab KEEP ~−43% down_us, **~+6%** short gen_tok/s vs `=0`. `=0` legacy global act |
+| `VT_GEMMA4_DOWN_WARP` | `1` | Warp-coop ExpertGeGLU down (1 warp/h). KEEP ~−28% down_us, **~+2.5%** short gen on top of DOWN_LDS. `=0` thread-per-h |
+| `VT_GEMMA4_DOWN_TPB` | `256` | Down block size; 64/128 worse with LDS act staging |
+| `VT_GEMMA4_DOWN_NH` | `1` | Multi-h/thread; 2/4 **NOT KEEP** |
+| `VT_GEMMA4_EXPERT_SPLIT` | `0` | hipEvent act/down µs dump (syncs every expert call — measure only) |
+
 | `VT_ATTN_DECODE_SPLIT_WARPS` | `8` | Full-attn Split1 K-warps. `16` only valid for `d<=256`; d=512 LDS OOB — clamped to 8 |
 | `VT_ATTN_DECODE_FULL_WINDOW` | off | Decode-only local window on full layers. A/B @23k+splits flat — keep off |
 | `VT_STEP_PROFILE` | off | Lab: stderr prep/fwd/sample µs on pure-decode steps (syncs queue; slows e2e) |
@@ -185,7 +194,7 @@ on CUDA/CPU builds beyond the documented behavior.
 | `VT_GEMMA4_RESIDENT_EXPERTS` | unset | `=1` preloads the Gemma-4 MoE experts resident on the GPU(s) after the first use instead of streaming them per step (discrete-ROCm optimization). No-op (with a stderr note) on a binary built without `-DVLLM_CPP_HIP` |
 | `VT_GEMMA4_RESIDENT_GPUS` | `2` | Number of GPUs across which resident Gemma-4 experts are spread; clamped to the ROCm device count. Read only when `VT_GEMMA4_RESIDENT_EXPERTS=1` |
 | `VT_GEMMA4_RESIDENT_MAX_LAYERS` | (all) | Caps how many MoE layers get resident-preloaded, to fit a smaller VRAM budget. Read only when `VT_GEMMA4_RESIDENT_EXPERTS=1` |
-| `VT_GEMMA4_GPU0_HEADROOM_GB` | `12` | GiB kept free on GPU0 when packing resident experts (decode vs long-prefill trade). Lab dual R9700 + 49k KV: `8` survives 16k+ prefill; `6` OOMs ~11k |
+| `VT_GEMMA4_GPU0_HEADROOM_GB` | `16` | GiB kept free on GPU0 when packing resident experts. Lab dual R9700 long-ctx: **16** spills experts→GPU1 so GPU0 holds **98k** KV (`MAX_MODEL_LEN=98304`); 10 was 49k-era. 131k boots but OOM on forward; 200k+ needs SWA physical KV |
 | `VT_GEMMA4_PREFILL_BATCH_MOE` | auto / `1` in lab recipe | `=1` group-by-expert prefill GEMM for `T>=64`; `=0` serial M=1 (slow). Unset = auto |
 | `VT_GEMMA4_MLP_MOE_PARALLEL` | off | `=1` run Gemma4 MLP and MoE on two HIP streams (lab; wall ~flat on R9700) |
 | `VT_ATTN_PREFILL_FLASH` | off | `=1` SGLang-style BM×BN GQA flash prefill (lab A/B) |

@@ -333,6 +333,18 @@ std::vector<int> group_block_sizes(const KVCacheConfig& cfg) {
   }
   return sizes;
 }
+
+// Per-group block-table column caps. SlidingWindow still stores a FULL-SEQ
+// logical table (nulls for tokens outside the window), so columns must remain
+// cdiv(max_model_len, bs) — same as full-attn. The VRAM win is the physical
+// pool size (group_num_blocks), NOT fewer table columns. Shrinking columns to
+// max_admission caused append_row OOB → heap corruption / GPU hang (lab).
+// Returns nullopt so MultiGroupBlockTable uses the historical default.
+std::optional<std::vector<int>> group_max_num_blocks_per_req(
+    const KVCacheConfig& /*cfg*/, int /*max_model_len*/,
+    int /*max_num_batched_tokens*/) {
+  return std::nullopt;
+}
 }  // namespace
 
 GPUModelRunner::GPUModelRunner(
@@ -351,7 +363,9 @@ GPUModelRunner::GPUModelRunner(
       input_batch_(max_num_reqs, max_model_len, max_num_batched_tokens,
                    static_cast<int>(config.vocab_size),
                    group_block_sizes(kv_cache_config),
-                   group_block_sizes(kv_cache_config)) {
+                   group_block_sizes(kv_cache_config),
+                   group_max_num_blocks_per_req(kv_cache_config, max_model_len,
+                                               max_num_batched_tokens)) {
   max_num_reqs_ = max_num_reqs;
   max_num_batched_tokens_ = max_num_batched_tokens;
   // SPEC-MTP I5e: the async input-combine splices the device-resident
@@ -392,7 +406,9 @@ GPUModelRunner::GPUModelRunner(
       input_batch_(max_num_reqs, max_model_len, max_num_batched_tokens,
                    static_cast<int>(config.vocab_size),
                    group_block_sizes(kv_cache_config),
-                   group_block_sizes(kv_cache_config)) {
+                   group_block_sizes(kv_cache_config),
+                   group_max_num_blocks_per_req(kv_cache_config, max_model_len,
+                                               max_num_batched_tokens)) {
   max_num_reqs_ = max_num_reqs;
   max_num_batched_tokens_ = max_num_batched_tokens;
   // SPEC-MTP I5e: the async input-combine splices the device-resident
@@ -495,6 +511,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // so a later-appended draft group can never displace it. With num_spec==0
   // (every run today) there is exactly ONE full-attn group, so this is
   // byte-identical to the old behavior — the first and only group is chosen.
+  full_attn_group_id_ = -1;
+  gdn_group_id_ = -1;
+  slide_group_id_ = -1;
   for (int g = 0; g < static_cast<int>(kv_cache_config.kv_cache_groups.size());
        ++g) {
     const auto& group = kv_cache_config.kv_cache_groups[static_cast<size_t>(g)];
@@ -510,6 +529,10 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       // Skip a draft (eagle) group and keep the FIRST match as the target.
       if (!group.is_eagle_group && full_attn_group_id_ < 0) {
         full_attn_group_id_ = g;
+      }
+    } else if (kind == KVCacheSpecKind::kSlidingWindow) {
+      if (slide_group_id_ < 0) {
+        slide_group_id_ = g;
       }
     } else if (kind == KVCacheSpecKind::kMamba) {
       gdn_group_id_ = g;
@@ -649,6 +672,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       !vllm::platforms::GetPlatform(dev.type).is_cpu() &&
       (device_cache_env == nullptr || device_cache_env[0] != '0');
   full_attn_buf_.clear();
+  attn_layer_num_blocks_.clear();
   ssm_buf_.clear();
   conv_buf_.clear();
   // A full-attention-only model (e.g. dense Qwen3ForCausalLM) has NO
@@ -735,12 +759,42 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
                    "runner: asymmetric head_size_v is not expressible in the "
                    "per-layer PagedKvCache view");
         }
+        if (const auto* slide_sp =
+                dynamic_cast<const SlidingWindowSpec*>(sp.get())) {
+          VT_CHECK(slide_sp->head_size_v == slide_sp->head_size,
+                   "runner: asymmetric head_size_v is not expressible in the "
+                   "per-layer PagedKvCache view");
+        }
         VT_CHECK(l_page > 0,
                  "runner: per-layer attention spec reported a non-positive page");
       }
+      // SWA physical: sliding layers use the slide group's pool size (window-
+      // scoped), not the full-seq num_blocks_. Full layers keep num_blocks_.
+      int64_t layer_blocks = num_blocks_;
+      if (has_per_layer) {
+        const auto& sp =
+            kv_cache_config.per_layer_attn_specs[static_cast<size_t>(l)];
+        if (dynamic_cast<const SlidingWindowSpec*>(sp.get()) != nullptr) {
+          if (!kv_cache_config.group_num_blocks.empty() &&
+              slide_group_id_ >= 0 &&
+              static_cast<size_t>(slide_group_id_) <
+                  kv_cache_config.group_num_blocks.size()) {
+            layer_blocks =
+                kv_cache_config.group_num_blocks[static_cast<size_t>(
+                    slide_group_id_)];
+          } else if (const auto* sw =
+                         dynamic_cast<const SlidingWindowSpec*>(sp.get())) {
+            layer_blocks = sw->max_admission_blocks_per_request(
+                static_cast<int>(max_num_batched_tokens_),
+                static_cast<int>(num_blocks_ * fa_block_size));
+          }
+        }
+      }
+      layer_blocks = std::max<int64_t>(layer_blocks, 2);
+      attn_layer_num_blocks_.push_back(layer_blocks);
       full_attn_buf_.push_back(std::make_unique<CacheBuffer>(
           dev, queue_,
-          static_cast<size_t>(num_blocks_) * static_cast<size_t>(l_page),
+          static_cast<size_t>(layer_blocks) * static_cast<size_t>(l_page),
           kv_cache_backend_resident_));
       fa_dims.push_back(FaDims{l_Hkv, l_Dh, l_dtype});
     }
@@ -750,12 +804,14 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // to `full_attn_buf_`; in the uniform case every entry is {Hkv, Dh, kv_dtype}.
   VT_CHECK(fa_dims.size() == full_attn_buf_.size(),
            "runner: per-layer KV view geometry out of sync with buffers");
+  VT_CHECK(attn_layer_num_blocks_.size() == full_attn_buf_.size(),
+           "runner: per-layer num_blocks out of sync with buffers");
   attn_kv_.clear();
   for (size_t i = 0; i < full_attn_buf_.size(); ++i) {
     PagedKvCache kv;
     kv.data = full_attn_buf_[i]->data();
     kv.dtype = fa_dims[i].dtype;
-    kv.num_blocks = num_blocks_;
+    kv.num_blocks = attn_layer_num_blocks_[i];
     kv.block_size = fa_block_size;
     kv.num_kv_heads = fa_dims[i].num_kv_heads;
     kv.head_size = fa_dims[i].head_size;
@@ -1076,6 +1132,17 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   CommonAttentionMetadata attn_meta = MakeCommonAttentionMetadata(
       step, fa_bt, fa_cols, /*causal=*/true, full_attn_group_id_);
 
+  // Sliding-window group meta (Gemma-4 SWA physical hybrid). Default-empty when
+  // slide_group_id_ < 0 (legacy single full-attn group).
+  CommonAttentionMetadata slide_attn_meta;
+  if (slide_group_id_ >= 0) {
+    int sw_cols = 0;
+    const std::vector<int32_t> sw_bt =
+        gather_block_table(slide_group_id_, num_reqs, &sw_cols);
+    slide_attn_meta = MakeCommonAttentionMetadata(
+        step, sw_bt, sw_cols, /*causal=*/true, slide_group_id_);
+  }
+
   // GDN KV group metadata: the same step over the GDN group's block table,
   // segmented decode-first by the GDN builder (M1.6 Task 4). GATED on the model
   // HAVING a linear-attention (GDN/Mamba) KV group: a full-attention-only model
@@ -1191,6 +1258,7 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       .token_ids = token_ids,
       .positions = positions,
       .attn_meta = attn_meta,
+      .slide_attn_meta = (slide_group_id_ >= 0) ? &slide_attn_meta : nullptr,
       .gdn_meta = gdn_meta,
       .attn_kv = attn_kv_,
       .gdn_state = gdn_state_,
@@ -1311,6 +1379,7 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   exec_state_.logits = std::move(logits);
   exec_state_.step = std::move(step);
   exec_state_.attn_meta = std::move(attn_meta);
+  exec_state_.slide_attn_meta = std::move(slide_attn_meta);
   exec_state_.gdn_meta = std::move(gdn_meta);
   exec_state_.req_ids.reserve(static_cast<size_t>(num_reqs));
   for (int i = 0; i < num_reqs; ++i) {

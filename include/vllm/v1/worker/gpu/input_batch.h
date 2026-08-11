@@ -131,10 +131,12 @@ class InputBatch {
   // Upstream positional order: max_num_reqs, max_model_len,
   // max_num_batched_tokens, (device dropped), vocab_size, block_sizes,
   // kernel_block_sizes, (trailing knobs DEFERRED). block_sizes /
-  // kernel_block_sizes are per KV cache group.
+  // kernel_block_sizes are per KV cache group. Optional max_num_blocks is
+  // per-group column cap (SWA physical hybrid); nullopt => cdiv(max_model_len).
   InputBatch(int max_num_reqs, int max_model_len, int max_num_batched_tokens,
              int vocab_size, std::vector<int> block_sizes,
-             std::vector<int> kernel_block_sizes);
+             std::vector<int> kernel_block_sizes,
+             std::optional<std::vector<int>> max_num_blocks = std::nullopt);
 
   // add_request: place `request` into a slot (a freed hole if one exists, else
   // append at num_reqs), fill the per-slot arrays from it, add the block-table

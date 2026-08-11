@@ -26,10 +26,26 @@
 namespace vllm::v1 {
 
 inline vt::DType ResolveKvCacheDType() {
+  // Lab / serve: VT_KV_CACHE_DTYPE=fp8|fp8_e4m3 OR VT_KV_CACHE_FP8=1 → 1-byte
+  // fp8-e4m3 pages (halves KV vs bf16). Requires ROCm/CPU ReshapeAndCacheFp8 +
+  // paged-attn dequant (W2-ROCm). Default remains bf16.
+  if (const char* e = std::getenv("VT_KV_CACHE_FP8"); e != nullptr && e[0] == '1') {
+    return vt::DType::kI8;
+  }
+  if (const char* e = std::getenv("VT_KV_CACHE_DTYPE"); e != nullptr && e[0] != '\0') {
+    const std::string_view s(e);
+    if (s == "fp8" || s == "fp8_e4m3") return vt::DType::kI8;
+    if (s == "float32" || s == "fp32") return vt::DType::kF32;
+    if (s == "float16" || s == "fp16") return vt::DType::kF16;
+    if (s == "bfloat16" || s == "bf16" || s == "auto") return vt::DType::kBF16;
+  }
   const char* kv_f32_env = std::getenv("VT_KV_CACHE_F32");
   return (kv_f32_env != nullptr && kv_f32_env[0] == '1') ? vt::DType::kF32
                                                          : vt::DType::kBF16;
 }
+
+// True when ResolveKvCacheDType selected 1-byte fp8 storage.
+inline bool KvCacheIsFp8() { return ResolveKvCacheDType() == vt::DType::kI8; }
 
 // Resolution of vLLM's `CacheConfig.cache_dtype` string (config/cache.py:19-36,76)
 // into what our KV cache + ops need: the STORAGE dtype the allocator sizes blocks

@@ -2709,9 +2709,10 @@ void ReshapeAndCacheFp8(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_ca
   VT_CHECK(k_cache.stride[2] == head_size && v_cache.stride[2] == head_size,
            "reshape_and_cache_fp8: k_cache/v_cache page must be head-contiguous "
            "(stride[2] == head_size) — the NHD unbind-slice layout");
-  VT_CHECK(q.device.type == DeviceType::kCPU,
-           "reshape_and_cache_fp8: only the CPU fp8-KV store is implemented in W1 "
-           "(the CUDA fp8-KV store kernel is a named later brick)");
+  // W1: CPU. Lab W2-ROCm: DeviceType::kROCM (RDNA4). CUDA remains a later brick.
+  VT_CHECK(q.device.type == DeviceType::kCPU || q.device.type == DeviceType::kROCM,
+           "reshape_and_cache_fp8: only CPU and ROCm fp8-KV store are implemented "
+           "(CUDA fp8-KV store is a named later brick)");
   VT_CHECK(k.device == q.device && v.device == q.device && k_cache.device == q.device &&
                v_cache.device == q.device && slot_mapping.device == q.device,
            "reshape_and_cache_fp8: device mismatch (k/v/k_cache/v_cache/slot_mapping/queue)");
@@ -3042,9 +3043,10 @@ void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_
              "paged_attention: fp8 KV read requires 1-byte fp8 cache (DType::kI8)");
     VT_CHECK(args.k_scale > 0.0f && args.v_scale > 0.0f,
              "paged_attention: fp8 KV read requires k_scale/v_scale > 0");
-    VT_CHECK(q.device.type == DeviceType::kCPU,
-             "paged_attention: only the CPU fp8-KV read is implemented in W1 "
-             "(the CUDA fp8-KV paged-attention kernel is a named later brick)");
+    // W1: CPU. Lab W2-ROCm: kROCM. CUDA remains a later brick.
+    VT_CHECK(q.device.type == DeviceType::kCPU || q.device.type == DeviceType::kROCM,
+             "paged_attention: only CPU and ROCm fp8-KV read are implemented "
+             "(CUDA fp8-KV paged-attention is a named later brick)");
   }
   // metadata: block_table [num_reqs, max_blocks] i32, seq_lens [num_reqs] i32,
   // query_start_loc [num_reqs+1] i32.

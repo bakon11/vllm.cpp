@@ -37,6 +37,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -330,8 +331,32 @@ void Gemma4AttnBlock(Dev d, DBuf& o_out, const Gemma4LayerWeights& w, const Gemm
     Tensor v3 = Reshape(v.t(), {T, Hkv, Dh});
     Tensor kw = k3;
     Tensor vw = v3;
-    // Cast buffers only when dtype differs (rare for bf16 KV).
-    if (kv.dtype != adt) {
+    Tensor k_cache = KvSlice(kv, d.q.device, 0);
+    Tensor v_cache = KvSlice(kv, d.q.device, 1);
+    // FP8 KV (lab W2-ROCm): store Quantize(hp/scale) into 1-byte pages.
+    // kv.dtype==kI8 from ResolveKvCacheDType (VT_KV_CACHE_FP8=1 / DTYPE=fp8).
+    if (kv.dtype == DType::kI8) {
+      // Scales: default 1.0 (uncalibrated, mirrors BaseKVCacheMethod). Override
+      // via VT_KV_FP8_K_SCALE / VT_KV_FP8_V_SCALE when calibrating.
+      static const float k_scale = [] {
+        if (const char* e = std::getenv("VT_KV_FP8_K_SCALE"); e && e[0]) {
+          const float v = std::strtof(e, nullptr);
+          if (v > 0.f) return v;
+        }
+        return 1.f;
+      }();
+      static const float v_scale = [] {
+        if (const char* e = std::getenv("VT_KV_FP8_V_SCALE"); e && e[0]) {
+          const float v = std::strtof(e, nullptr);
+          if (v > 0.f) return v;
+        }
+        return 1.f;
+      }();
+      // Source stays model dtype (bf16); do NOT cast to kI8 first.
+      vt::ReshapeAndCacheFp8(d.q, kw, vw, k_cache, v_cache, si.slot_mapping.t(),
+                             vt::Fp8KVCacheDataType::kFp8E4M3, k_scale, v_scale);
+    } else if (kv.dtype != adt) {
+      // Cast buffers only when dtype differs (rare for bf16 KV).
       DBuf kcast(d, kv.dtype, {T, Hkv, Dh});
       DBuf vcast(d, kv.dtype, {T, Hkv, Dh});
       if (kv.dtype == DType::kBF16) {
@@ -343,12 +368,8 @@ void Gemma4AttnBlock(Dev d, DBuf& o_out, const Gemma4LayerWeights& w, const Gemm
       }
       kw = kcast.t();
       vw = vcast.t();
-      Tensor k_cache = KvSlice(kv, d.q.device, 0);
-      Tensor v_cache = KvSlice(kv, d.q.device, 1);
       vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, si.slot_mapping.t());
     } else {
-      Tensor k_cache = KvSlice(kv, d.q.device, 0);
-      Tensor v_cache = KvSlice(kv, d.q.device, 1);
       vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, si.slot_mapping.t());
     }
   }
@@ -362,6 +383,25 @@ void Gemma4AttnBlock(Dev d, DBuf& o_out, const Gemma4LayerWeights& w, const Gemm
   pa.max_seq_len = meta.max_seq_len;
   if (sliding_window.has_value() && *sliding_window > 0)
     pa.window_size = vt::AttentionWindow{static_cast<int32_t>(*sliding_window - 1), 0};
+  if (kv.dtype == DType::kI8) {
+    pa.kv_cache_dtype = vt::Fp8KVCacheDataType::kFp8E4M3;
+    static const float k_scale = [] {
+      if (const char* e = std::getenv("VT_KV_FP8_K_SCALE"); e && e[0]) {
+        const float v = std::strtof(e, nullptr);
+        if (v > 0.f) return v;
+      }
+      return 1.f;
+    }();
+    static const float v_scale = [] {
+      if (const char* e = std::getenv("VT_KV_FP8_V_SCALE"); e && e[0]) {
+        const float v = std::strtof(e, nullptr);
+        if (v > 0.f) return v;
+      }
+      return 1.f;
+    }();
+    pa.k_scale = k_scale;
+    pa.v_scale = v_scale;
+  }
   vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, si.block_table.t(),
                      si.seq_lens.t(), si.query_start_loc.t(), pa);
 
@@ -417,10 +457,11 @@ void GatherRows(Dev d, void* dst, const Tensor& src, const std::vector<int32_t>&
 void ForwardGemma4Layers(Dev d, DBuf& hidden, const Gemma4Layout& g,
                          const Gemma4Weights& weights, const HfConfig& /*config*/,
                          const CommonAttentionMetadata& attn_meta,
+                         const CommonAttentionMetadata* slide_attn_meta,
                          const std::vector<PagedKvCache>& attn_kv, StepInputs& si,
-                         DBuf& ones_sliding, DBuf& ones_full, DBuf& prop_cache,
-                         DBuf& ple_by_layer, int64_t T, int64_t H, int64_t I, int64_t L,
-                         int64_t ple) {
+                         StepInputs* si_slide, DBuf& ones_sliding, DBuf& ones_full,
+                         DBuf& prop_cache, DBuf& ple_by_layer, int64_t T, int64_t H,
+                         int64_t I, int64_t L, int64_t ple) {
   const float eps = 1e-6f;
   const vt::RmsNormArgs plain{eps, false};
   const size_t ple_row_bytes = static_cast<size_t>(ple) * sizeof(uint16_t);
@@ -481,6 +522,13 @@ void ForwardGemma4Layers(Dev d, DBuf& hidden, const Gemma4Layout& g,
     VT_CHECK(kv_idx >= 0 && kv_idx < L, "gemma4: bad kv target layer");
     const PagedKvCache& kv = attn_kv[static_cast<size_t>(kv_idx)];
 
+    // SWA physical hybrid: sliding layers use the slide group's block_table +
+    // slot_mapping; full layers keep the full-attn group. Legacy single-group
+    // path leaves slide_attn_meta/si_slide null → always attn_meta/si.
+    const CommonAttentionMetadata& layer_meta =
+        (!full && slide_attn_meta != nullptr) ? *slide_attn_meta : attn_meta;
+    StepInputs& layer_si = (!full && si_slide != nullptr) ? *si_slide : si;
+
     Tensor w_in = ResidentWeight(d, w.input_layernorm, {H});
     vt::RmsNorm(d.q, dhn.t(), hidden.t(), w_in, plain);
 
@@ -504,7 +552,7 @@ void ForwardGemma4Layers(Dev d, DBuf& hidden, const Gemma4Layout& g,
     }
     const auto t0 = layer_prof ? clock::now() : clock::time_point{};
 
-    Gemma4AttnBlock(d, attn_o, w, g, dhn.t(), si, attn_meta, kv, T, Dh, full,
+    Gemma4AttnBlock(d, attn_o, w, g, dhn.t(), layer_si, layer_meta, kv, T, Dh, full,
                     ones_dh, full ? &prop_cache.t() : nullptr, window,
                     g.rope_theta_sliding);
 
@@ -774,6 +822,7 @@ DBuf ForwardGemma4Logits(Dev d, DBuf& hidden, const Gemma4Weights& weights,
 DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const std::vector<int32_t>& positions,
                  const CommonAttentionMetadata& attn_meta,
+                 const CommonAttentionMetadata* slide_attn_meta,
                  const std::vector<PagedKvCache>& attn_kv,
                  const Gemma4Weights& weights, const HfConfig& config,
                  const std::vector<int32_t>& logits_indices,
@@ -912,6 +961,10 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   }
 
   StepInputs si = BuildStepInputs(d, positions, attn_meta, config);
+  std::optional<StepInputs> si_slide;
+  if (slide_attn_meta != nullptr) {
+    si_slide = BuildStepInputs(d, positions, *slide_attn_meta, config);
+  }
 
   // hidden state stream (each layer fully materializes h; no separate residual).
   DBuf hidden(d, DType::kBF16, {T, H});
@@ -919,7 +972,8 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
            static_cast<size_t>(T) * static_cast<size_t>(H) * sizeof(uint16_t));
 
   // Layers (capturable region for future decode graph) then logits.
-  ForwardGemma4Layers(d, hidden, g, weights, config, attn_meta, attn_kv, si, ones_sliding,
+  ForwardGemma4Layers(d, hidden, g, weights, config, attn_meta, slide_attn_meta,
+                      attn_kv, si, si_slide ? &*si_slide : nullptr, ones_sliding,
                       ones_full, prop_cache, ple_by_layer, T, H, I, L, ple);
   return ForwardGemma4Logits(d, hidden, weights, g, config, logits_indices, T, H, vocab);
 }
@@ -943,10 +997,11 @@ std::vector<float> Gemma4Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Gemma4Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const CommonAttentionMetadata* slide_attn_meta) {
   Dev d{vt::GetBackend(queue.device.type), queue};
-  DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices);
+  DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, slide_attn_meta,
+                             attn_kv, weights, config, logits_indices);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
@@ -957,10 +1012,11 @@ ForwardLogits Gemma4Model::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Gemma4Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const CommonAttentionMetadata* slide_attn_meta) {
   Dev d{vt::GetBackend(queue.device.type), queue};
-  DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices);
+  DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, slide_attn_meta,
+                             attn_kv, weights, config, logits_indices);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(d, std::move(dlogits), n_out, config.vocab_size);
 }
@@ -970,14 +1026,15 @@ std::vector<float> Gemma4Model::ForwardMm(
     const std::vector<int32_t>& ple_token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Gemma4Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const CommonAttentionMetadata* slide_attn_meta) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   // token_ids is unused when inputs_embeds_override is set (T comes from
   // positions); pass an empty vector so the mm seam never dereferences it.
   const std::vector<int32_t> no_tokens;
-  DBuf dlogits = ForwardBody(d, no_tokens, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices, &inputs_embeds_bf16,
-                             &ple_token_ids);
+  DBuf dlogits = ForwardBody(d, no_tokens, positions, attn_meta, slide_attn_meta,
+                             attn_kv, weights, config, logits_indices,
+                             &inputs_embeds_bf16, &ple_token_ids);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
@@ -1130,8 +1187,8 @@ ForwardLogits Gemma4DecodeGraph::Step(const std::vector<int32_t>& token_ids,
     }
   }
   if (!I.enabled || I.failed || T != 1 || positions.size() != 1) {
-    DBuf lg = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, I.weights, I.config,
-                          kNoGather);
+    DBuf lg = ForwardBody(d, token_ids, positions, attn_meta, /*slide=*/nullptr,
+                          attn_kv, I.weights, I.config, kNoGather);
     return WrapDeviceLogits(d, std::move(lg), lg.t().shape[0], vocab);
   }
 
@@ -1182,8 +1239,8 @@ ForwardLogits Gemma4DecodeGraph::Step(const std::vector<int32_t>& token_ids,
   int64_t max_pos = 0;
   for (int32_t p : positions) max_pos = std::max<int64_t>(max_pos, p);
   if (max_pos > I.prop_cap) {
-    DBuf lg = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, I.weights, I.config,
-                          kNoGather);
+    DBuf lg = ForwardBody(d, token_ids, positions, attn_meta, /*slide=*/nullptr,
+                          attn_kv, I.weights, I.config, kNoGather);
     return WrapDeviceLogits(d, std::move(lg), lg.t().shape[0], vocab);
   }
 
@@ -1237,9 +1294,10 @@ ForwardLogits Gemma4DecodeGraph::Step(const std::vector<int32_t>& token_ids,
   RefreshStepInputsInPlace(d, *I.si, I.h_pos, I.h_attn, I.config);
 
   auto run_layers_logits = [&]() {
-    ForwardGemma4Layers(d, *I.hidden, I.layout, I.weights, I.config, I.h_attn, attn_kv, *I.si,
-                        *I.ones_sliding, *I.ones_full, *I.prop_cache, *I.ple_by_layer, T, H,
-                        Inter, L, ple);
+    ForwardGemma4Layers(d, *I.hidden, I.layout, I.weights, I.config, I.h_attn,
+                        /*slide_attn_meta=*/nullptr, attn_kv, *I.si,
+                        /*si_slide=*/nullptr, *I.ones_sliding, *I.ones_full,
+                        *I.prop_cache, *I.ple_by_layer, T, H, Inter, L, ple);
     (void)ForwardGemma4Logits(d, *I.hidden, I.weights, I.layout, I.config, kNoGather, T, H,
                               vocab, &*I.logits);
   };
@@ -1306,6 +1364,8 @@ std::optional<ForwardLogits> Gemma4DecodeGraphForward(
       !platforms::GetPlatform(input.queue.device.type).support_static_graph_mode()) {
     return std::nullopt;
   }
+  // SWA physical hybrid needs dual attn meta — graph path not wired yet.
+  if (input.slide_attn_meta != nullptr) return std::nullopt;
   if (input.token_ids.size() != 1) return std::nullopt;
   if (!graph) graph = std::make_unique<Gemma4DecodeGraph>(weights, input.config, input.queue);
   return graph->Step(input.token_ids, input.positions, input.attn_meta, input.attn_kv);

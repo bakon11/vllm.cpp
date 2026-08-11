@@ -51,11 +51,14 @@ struct Gemma4FusedExperts {
   mutable void* down_dev = nullptr;
   // Native FP8 layer packs (preferred for is_fp8 resident). Per-expert
   // dev_fp8_* / dev_s_* point into these bases; free bases on teardown only.
-  mutable void* fp8_gu_base = nullptr;   // u8 [E, 2I, H]
+  mutable void* fp8_gu_base = nullptr;   // u8 [E, 2I, H] — row order depends on gu_pair_interleave
   mutable void* fp8_dn_base = nullptr;   // u8 [E, H, I]
   mutable void* fp8_sgu_base = nullptr;  // bf16 [E, 2I]
   mutable void* fp8_sdn_base = nullptr;  // bf16 [E, H]
   mutable bool fp8_native_resident = false;
+  // Lab: gate/up rows interleaved (g0,u0,g1,u1,…) so decode act streams adjacent H-bytes.
+  // Scales match row order. Prefill MatmulBT still N=2I; needs Gelu pair epilogue.
+  mutable bool gu_pair_interleave = false;
   mutable int dev_id = -1;
   bool Empty() const { return gate_up.Empty() && fp8.empty(); }
 };

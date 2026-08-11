@@ -227,6 +227,29 @@ __device__ inline float gelu_tanh(float g) {
   return 0.5f * g * (1.f + tanhf(inner));
 }
 
+// gu pack row layout: pair=0 → [gate_0..gate_{I-1}, up_0..up_{I-1}]
+//                   pair=1 → [g0,u0,g1,u1,…] (VT_GEMMA4_GU_INTERLEAVE)
+__device__ inline void GuGateUpRows(const uint8_t* __restrict__ gu, int i, int I, int H, int pair,
+                                    const uint8_t*& grow, const uint8_t*& urow) {
+  if (pair) {
+    grow = gu + static_cast<int64_t>(2 * i) * H;
+    urow = grow + H;
+  } else {
+    grow = gu + static_cast<int64_t>(i) * H;
+    urow = gu + static_cast<int64_t>(I + i) * H;
+  }
+}
+__device__ inline void GuGateUpScales(const __hip_bfloat16* __restrict__ sg, int i, int I, int pair,
+                                      float& sgate, float& sup) {
+  if (pair) {
+    sgate = __bfloat162float(sg[2 * i]);
+    sup = __bfloat162float(sg[2 * i + 1]);
+  } else {
+    sgate = __bfloat162float(sg[i]);
+    sup = __bfloat162float(sg[I + i]);
+  }
+}
+
 __device__ inline float DotFp8Row(const float* __restrict__ x_cache, const uint8_t* __restrict__ wrow,
                                   int K) {
   float acc = 0.f;
@@ -343,7 +366,7 @@ __global__ void Fp8ChannelGemmMKernel(__hip_bfloat16* __restrict__ y,  // [M,N]
 // Fused gate|up act T=1: grid = I. LUT + optional global x_f32.
 __global__ void ExpertFp8ActKernel(float* __restrict__ act, const __hip_bfloat16* __restrict__ x,
                                    const uint8_t* __restrict__ w_gu,
-                                   const __hip_bfloat16* __restrict__ s_gu, int I, int H) {
+                                   const __hip_bfloat16* __restrict__ s_gu, int I, int H, int pair) {
   const int i = static_cast<int>(blockIdx.x);
   if (i >= I) return;
   __shared__ float lut[256];
@@ -354,8 +377,9 @@ __global__ void ExpertFp8ActKernel(float* __restrict__ act, const __hip_bfloat16
   for (int h = tid; h < H; h += kBlock) x_cache[h] = __bfloat162float(x[h]);
   __syncthreads();
 
-  const uint8_t* grow = w_gu + static_cast<int64_t>(i) * H;
-  const uint8_t* urow = w_gu + static_cast<int64_t>(I + i) * H;
+  const uint8_t* grow;
+  const uint8_t* urow;
+  GuGateUpRows(w_gu, i, I, H, pair, grow, urow);
   float gate = 0.f, up = 0.f;
   const int H16 = H & ~15;
   for (int h = tid * 16; h < H16; h += kBlock * 16) {
@@ -375,8 +399,8 @@ __global__ void ExpertFp8ActKernel(float* __restrict__ act, const __hip_bfloat16
   gate = BlockSum256(gate);
   up = BlockSum256(up);
   if (tid == 0) {
-    const float sg = __bfloat162float(s_gu[i]);
-    const float su = __bfloat162float(s_gu[I + i]);
+    float sg, su;
+    GuGateUpScales(s_gu, i, I, pair, sg, su);
     act[i] = gelu_tanh(sg * gate) * (su * up);
   }
 }
@@ -490,11 +514,15 @@ bool ExpertGeGLUFp8M1Rocm(Queue& q, void* y, const void* x, const void* fp8_gu, 
   const size_t shmem = static_cast<size_t>(H) * sizeof(float);
   if (shmem > 48 * 1024) return false;
   if (!EnsureAct(I)) return false;
+  static const int gu_pair = [] {
+    const char* e = std::getenv("VT_GEMMA4_GU_INTERLEAVE");
+    return (e && e[0] == '1') ? 1 : 0;
+  }();
   hipStream_t st = static_cast<hipStream_t>(q.handle);
   float* act = TlsAct().p;
   ExpertFp8ActKernel<<<I, kBlock, shmem, st>>>(
       act, static_cast<const __hip_bfloat16*>(x), static_cast<const uint8_t*>(fp8_gu),
-      static_cast<const __hip_bfloat16*>(s_gu), I, H);
+      static_cast<const __hip_bfloat16*>(s_gu), I, H, gu_pair);
   const int grid_dn = (H + kBlock - 1) / kBlock;
   ExpertFp8DownKernel<<<grid_dn, kBlock, 0, st>>>(
       static_cast<__hip_bfloat16*>(y), act, static_cast<const uint8_t*>(fp8_dn),
@@ -512,7 +540,7 @@ __global__ void ExpertFp8ActTopKKernel(float* __restrict__ act,  // [G,I]
                                        const float* __restrict__ x_f,  // [H]
                                        const uint8_t* const* __restrict__ w_gu,
                                        const __hip_bfloat16* const* __restrict__ s_gu, int G,
-                                       int I, int H) {
+                                       int I, int H, int pair) {
   const int i = static_cast<int>(blockIdx.x);
   if (i >= I) return;
   __shared__ float lut[256];
@@ -522,8 +550,9 @@ __global__ void ExpertFp8ActTopKKernel(float* __restrict__ act,  // [G,I]
   for (int g = 0; g < G; ++g) {
     const uint8_t* gu = w_gu[g];
     const __hip_bfloat16* sg = s_gu[g];
-    const uint8_t* grow = gu + static_cast<int64_t>(i) * H;
-    const uint8_t* urow = gu + static_cast<int64_t>(I + i) * H;
+    const uint8_t* grow;
+    const uint8_t* urow;
+    GuGateUpRows(gu, i, I, H, pair, grow, urow);
     float gate = 0.f, up = 0.f;
     const int H16 = H & ~15;
     for (int h = tid * 16; h < H16; h += kBlock * 16) {
@@ -536,8 +565,8 @@ __global__ void ExpertFp8ActTopKKernel(float* __restrict__ act,  // [G,I]
     }
     BlockSumFast2(gate, up);
     if (tid == 0) {
-      const float sgate = __bfloat162float(sg[i]);
-      const float sup = __bfloat162float(sg[I + i]);
+      float sgate, sup;
+      GuGateUpScales(sg, i, I, pair, sgate, sup);
       act[static_cast<int64_t>(g) * I + i] = gelu_tanh(sgate * gate) * (sup * up);
     }
     // No trailing __syncthreads: next g only uses private regs + BlockSumFast2 barriers.
@@ -593,6 +622,11 @@ bool ExpertGeGLUFp8TopKM1Rocm(Queue& q, void* ysum, const void* x, const void* c
   if (I <= 0 || H <= 0) return false;
   // Act no longer needs H*f32 dynamic smem (x expanded to global).
   if (H <= 0) return false;
+
+  static const int gu_pair = [] {
+    const char* e = std::getenv("VT_GEMMA4_GU_INTERLEAVE");
+    return (e && e[0] == '1') ? 1 : 0;
+  }();
 
   const int dev = q.device.index;
   if (dev < 0 || dev >= 8) return false;
@@ -673,7 +707,7 @@ bool ExpertGeGLUFp8TopKM1Rocm(Queue& q, void* ysum, const void* x, const void* c
   dim3 grid_act(static_cast<unsigned>(I));
   ExpertFp8ActTopKKernel<<<grid_act, kBlock, 0, st>>>(
       tls.d_act, tls.d_xf, reinterpret_cast<const uint8_t* const*>(tls.d_fgu),
-      reinterpret_cast<const __hip_bfloat16* const*>(tls.d_sgu), G, I, H);
+      reinterpret_cast<const __hip_bfloat16* const*>(tls.d_sgu), G, I, H, gu_pair);
 
   const int grid_dn = (H + kBlock - 1) / kBlock;
   ExpertFp8DownTopKKernel<<<grid_dn, kBlock, 0, st>>>(
@@ -696,7 +730,8 @@ __global__ void ExpertFp8ActTopKIndexedKernel(float* __restrict__ act,
                                               const float* __restrict__ x_f,
                                               const uint8_t* __restrict__ gu_base,
                                               const __hip_bfloat16* __restrict__ sgu_base,
-                                              const int32_t* __restrict__ idx, int G, int I, int H) {
+                                              const int32_t* __restrict__ idx, int G, int I, int H,
+                                              int pair) {
   const int i = static_cast<int>(blockIdx.x);
   if (i >= I || G <= 0) return;
   __shared__ float lut[256];
@@ -714,8 +749,9 @@ __global__ void ExpertFp8ActTopKIndexedKernel(float* __restrict__ act,
     const int e = sidx[g];
     const uint8_t* gu = gu_base + static_cast<size_t>(e) * gu_one;
     const __hip_bfloat16* sg = sgu_base + static_cast<size_t>(e) * sgu_one;
-    const uint8_t* grow = gu + static_cast<int64_t>(i) * H;
-    const uint8_t* urow = gu + static_cast<int64_t>(I + i) * H;
+    const uint8_t* grow;
+    const uint8_t* urow;
+    GuGateUpRows(gu, i, I, H, pair, grow, urow);
 
     float gate = 0.f, up = 0.f;
     for (int h = tid * 16; h < H16; h += kBlock * 16) {
@@ -728,8 +764,8 @@ __global__ void ExpertFp8ActTopKIndexedKernel(float* __restrict__ act,
     }
     BlockSumFast2(gate, up);
     if (tid == 0) {
-      const float sgate = __bfloat162float(sg[i]);
-      const float sup = __bfloat162float(sg[I + i]);
+      float sgate, sup;
+      GuGateUpScales(sg, i, I, pair, sgate, sup);
       act[static_cast<int64_t>(g) * I + i] = gelu_tanh(sgate * gate) * (sup * up);
     }
     // No trailing barrier: BlockSumFast2 already syncs; act[g] not read by later g.
@@ -738,12 +774,13 @@ __global__ void ExpertFp8ActTopKIndexedKernel(float* __restrict__ act,
 
 // Hardware FP8 convert path — no 1KB LDS LUT (gfx1201 OCP).
 // K-loop strides use blockDim.x (supports VT_GEMMA4_ACT_TPB=128/192/256).
+// pair=1: gu rows (g0,u0,g1,u1,…) from VT_GEMMA4_GU_INTERLEAVE pack.
 __global__ void ExpertFp8ActTopKIndexedKernelHw(float* __restrict__ act,
                                                 const float* __restrict__ x_f,
                                                 const uint8_t* __restrict__ gu_base,
                                                 const __hip_bfloat16* __restrict__ sgu_base,
                                                 const int32_t* __restrict__ idx, int G, int I,
-                                                int H) {
+                                                int H, int pair) {
   const int i = static_cast<int>(blockIdx.x);
   if (i >= I || G <= 0) return;
   __shared__ int sidx[kMaxTopK];
@@ -760,8 +797,9 @@ __global__ void ExpertFp8ActTopKIndexedKernelHw(float* __restrict__ act,
     const int e = sidx[g];
     const uint8_t* gu = gu_base + static_cast<size_t>(e) * gu_one;
     const __hip_bfloat16* sg = sgu_base + static_cast<size_t>(e) * sgu_one;
-    const uint8_t* grow = gu + static_cast<int64_t>(i) * H;
-    const uint8_t* urow = gu + static_cast<int64_t>(I + i) * H;
+    const uint8_t* grow;
+    const uint8_t* urow;
+    GuGateUpRows(gu, i, I, H, pair, grow, urow);
 
     float gate = 0.f, up = 0.f;
     for (int h = tid * 16; h < H16; h += tpb * 16) {
@@ -774,10 +812,145 @@ __global__ void ExpertFp8ActTopKIndexedKernelHw(float* __restrict__ act,
     }
     BlockSumFast2(gate, up);
     if (tid == 0) {
-      const float sgate = __bfloat162float(sg[i]);
-      const float sup = __bfloat162float(sg[I + i]);
+      float sgate, sup;
+      GuGateUpScales(sg, i, I, pair, sgate, sup);
       act[static_cast<int64_t>(g) * I + i] = gelu_tanh(sgate * gate) * (sup * up);
     }
+  }
+}
+
+// Dense H-strip HW act: every thread owns float4 chunks (k=tid; k+=tpb).
+// KEEP *KernelHw uses h=tid*16 stride tpb*16 → only 176/256 threads work @H=2816.
+// Env: VT_GEMMA4_ACT_DENSE=1. Optional VT_GEMMA4_ACT_PAR_G=1 → grid=I*G (one expert/CTA).
+__global__ void ExpertFp8ActTopKIndexedKernelHwDense(float* __restrict__ act,
+                                                     const float* __restrict__ x_f,
+                                                     const uint8_t* __restrict__ gu_base,
+                                                     const __hip_bfloat16* __restrict__ sgu_base,
+                                                     const int32_t* __restrict__ idx, int G, int I,
+                                                     int H, int pair, int par_g) {
+  int i, g0, g1;
+  if (par_g) {
+    // grid = I * G
+    const int bid = static_cast<int>(blockIdx.x);
+    i = bid % I;
+    g0 = bid / I;
+    g1 = g0 + 1;
+    if (g0 >= G || i >= I) return;
+  } else {
+    i = static_cast<int>(blockIdx.x);
+    if (i >= I || G <= 0) return;
+    g0 = 0;
+    g1 = G;
+  }
+  __shared__ int sidx[kMaxTopK];
+  const int tid = static_cast<int>(threadIdx.x);
+  const int tpb = static_cast<int>(blockDim.x);
+  if (tid < G) sidx[tid] = idx[tid];
+  __syncthreads();
+
+  const size_t gu_one = static_cast<size_t>(2) * static_cast<size_t>(I) * static_cast<size_t>(H);
+  const size_t sgu_one = static_cast<size_t>(2) * static_cast<size_t>(I);
+  const int H4 = H & ~3;
+  const int n4 = H4 >> 2;  // float4 count
+
+  for (int g = g0; g < g1; ++g) {
+    const int e = sidx[g];
+    const uint8_t* gu = gu_base + static_cast<size_t>(e) * gu_one;
+    const __hip_bfloat16* sg = sgu_base + static_cast<size_t>(e) * sgu_one;
+    const uint8_t* grow;
+    const uint8_t* urow;
+    GuGateUpRows(gu, i, I, H, pair, grow, urow);
+
+    float gate = 0.f, up = 0.f;
+    for (int k = tid; k < n4; k += tpb) {
+      const int base = k * 4;
+      const float4 xv = *reinterpret_cast<const float4*>(x_f + base);
+      const uint32_t gw = *reinterpret_cast<const uint32_t*>(grow + base);
+      const uint32_t uw = *reinterpret_cast<const uint32_t*>(urow + base);
+      float gg0, gg1, gg2, gg3, uu0, uu1, uu2, uu3;
+      Fp8E4M3HwFromU32(gw, gg0, gg1, gg2, gg3);
+      Fp8E4M3HwFromU32(uw, uu0, uu1, uu2, uu3);
+      gate += xv.x * gg0 + xv.y * gg1 + xv.z * gg2 + xv.w * gg3;
+      up += xv.x * uu0 + xv.y * uu1 + xv.z * uu2 + xv.w * uu3;
+    }
+    for (int h = H4 + tid; h < H; h += tpb) {
+      const float xv = x_f[h];
+      gate += xv * Fp8E4M3HwFromByte(grow[h]);
+      up += xv * Fp8E4M3HwFromByte(urow[h]);
+    }
+    BlockSumFast2(gate, up);
+    if (tid == 0) {
+      float sgate, sup;
+      GuGateUpScales(sg, i, I, pair, sgate, sup);
+      act[static_cast<int64_t>(g) * I + i] = gelu_tanh(sgate * gate) * (sup * up);
+    }
+  }
+}
+
+// One-warp act per (i,g): grid=I*G, tpb=32. Avoids 256-thread BlockSum + idle lanes.
+// Env: VT_GEMMA4_ACT_WARP_I=1 (implies par-g geometry).
+__global__ void ExpertFp8ActTopKIndexedKernelHwWarpI(float* __restrict__ act,
+                                                     const float* __restrict__ x_f,
+                                                     const uint8_t* __restrict__ gu_base,
+                                                     const __hip_bfloat16* __restrict__ sgu_base,
+                                                     const int32_t* __restrict__ idx, int G, int I,
+                                                     int H, int pair) {
+  const int bid = static_cast<int>(blockIdx.x);
+  const int i = bid % I;
+  const int g = bid / I;
+  if (g >= G || i >= I) return;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+
+  // Broadcast expert id (only lane 0 loads idx — full warp needs same e).
+  __shared__ int sidx[kMaxTopK];
+  if (lane < G) sidx[lane] = idx[lane];
+  __syncthreads();
+  const int e = sidx[g];
+
+  const size_t gu_one = static_cast<size_t>(2) * static_cast<size_t>(I) * static_cast<size_t>(H);
+  const size_t sgu_one = static_cast<size_t>(2) * static_cast<size_t>(I);
+  const uint8_t* gu = gu_base + static_cast<size_t>(e) * gu_one;
+  const __hip_bfloat16* sg = sgu_base + static_cast<size_t>(e) * sgu_one;
+  const uint8_t* grow;
+  const uint8_t* urow;
+  GuGateUpRows(gu, i, I, H, pair, grow, urow);
+
+  float gate = 0.f, up = 0.f;
+  const int H4 = H & ~3;
+  // 32 lanes × float4 = 128 elems/round
+  const int n_vec = H4 / 128;
+  for (int t = 0; t < n_vec; ++t) {
+    const int base = lane * 4 + t * 128;
+    const float4 xv = *reinterpret_cast<const float4*>(x_f + base);
+    const uint32_t gw = *reinterpret_cast<const uint32_t*>(grow + base);
+    const uint32_t uw = *reinterpret_cast<const uint32_t*>(urow + base);
+    float g0, g1, g2, g3, u0, u1, u2, u3;
+    Fp8E4M3HwFromU32(gw, g0, g1, g2, g3);
+    Fp8E4M3HwFromU32(uw, u0, u1, u2, u3);
+    gate += xv.x * g0 + xv.y * g1 + xv.z * g2 + xv.w * g3;
+    up += xv.x * u0 + xv.y * u1 + xv.z * u2 + xv.w * u3;
+  }
+  for (int base = n_vec * 128 + lane * 4; base < H4; base += 128) {
+    const float4 xv = *reinterpret_cast<const float4*>(x_f + base);
+    const uint32_t gw = *reinterpret_cast<const uint32_t*>(grow + base);
+    const uint32_t uw = *reinterpret_cast<const uint32_t*>(urow + base);
+    float g0, g1, g2, g3, u0, u1, u2, u3;
+    Fp8E4M3HwFromU32(gw, g0, g1, g2, g3);
+    Fp8E4M3HwFromU32(uw, u0, u1, u2, u3);
+    gate += xv.x * g0 + xv.y * g1 + xv.z * g2 + xv.w * g3;
+    up += xv.x * u0 + xv.y * u1 + xv.z * u2 + xv.w * u3;
+  }
+  for (int h = H4 + lane; h < H; h += 32) {
+    const float xv = x_f[h];
+    gate += xv * Fp8E4M3HwFromByte(grow[h]);
+    up += xv * Fp8E4M3HwFromByte(urow[h]);
+  }
+  gate = WarpSum(gate);
+  up = WarpSum(up);
+  if (lane == 0) {
+    float sgate, sup;
+    GuGateUpScales(sg, i, I, pair, sgate, sup);
+    act[static_cast<int64_t>(g) * I + i] = gelu_tanh(sgate * gate) * (sup * up);
   }
 }
 
@@ -1030,6 +1203,261 @@ __global__ void ExpertFp8DownTopKIndexedKernelHw(__hip_bfloat16* __restrict__ ys
                                                  const int32_t* __restrict__ idx,
                                                  const float* __restrict__ wts, int G, int I,
                                                  int H) {
+  __shared__ int sidx[kMaxTopK];
+  __shared__ float swts[kMaxTopK];
+  // Stage act[G,I] once/CTA — without this every h-thread reloads full act from global
+  // (~H·G·I·4 B redundant). I=704 G=8 → ~22KB LDS.
+  extern __shared__ float sact[];
+  const int tid = static_cast<int>(threadIdx.x);
+  const int tpb = static_cast<int>(blockDim.x);
+  if (tid < G) {
+    sidx[tid] = idx[tid];
+    swts[tid] = wts[tid];
+  }
+  __syncthreads();
+  const int act_n = G * I;
+  for (int i = tid; i < act_n; i += tpb) sact[i] = act[i];
+  __syncthreads();
+
+  const size_t dn_one = static_cast<size_t>(H) * static_cast<size_t>(I);
+  const size_t sdn_one = static_cast<size_t>(H);
+  const int stride = static_cast<int>(gridDim.x * blockDim.x);
+  const int I16 = I & ~15;
+  for (int h = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); h < H; h += stride) {
+    float acc = 0.f;
+    for (int g = 0; g < G; ++g) {
+      const int e = sidx[g];
+      const uint8_t* drow = dn_base + static_cast<size_t>(e) * dn_one + static_cast<size_t>(h) * I;
+      const float* arow = sact + g * I;
+      float dot = 0.f;
+      int i = 0;
+      for (; i < I16; i += 16) {
+        const float4 a0 = *reinterpret_cast<const float4*>(arow + i);
+        const float4 a1 = *reinterpret_cast<const float4*>(arow + i + 4);
+        const float4 a2 = *reinterpret_cast<const float4*>(arow + i + 8);
+        const float4 a3 = *reinterpret_cast<const float4*>(arow + i + 12);
+        const uint32_t w0 = *reinterpret_cast<const uint32_t*>(drow + i);
+        const uint32_t w1 = *reinterpret_cast<const uint32_t*>(drow + i + 4);
+        const uint32_t w2 = *reinterpret_cast<const uint32_t*>(drow + i + 8);
+        const uint32_t w3 = *reinterpret_cast<const uint32_t*>(drow + i + 12);
+        float p0, p1, p2, p3;
+        Fp8E4M3HwFromU32(w0, p0, p1, p2, p3);
+        dot += a0.x * p0 + a0.y * p1 + a0.z * p2 + a0.w * p3;
+        Fp8E4M3HwFromU32(w1, p0, p1, p2, p3);
+        dot += a1.x * p0 + a1.y * p1 + a1.z * p2 + a1.w * p3;
+        Fp8E4M3HwFromU32(w2, p0, p1, p2, p3);
+        dot += a2.x * p0 + a2.y * p1 + a2.z * p2 + a2.w * p3;
+        Fp8E4M3HwFromU32(w3, p0, p1, p2, p3);
+        dot += a3.x * p0 + a3.y * p1 + a3.z * p2 + a3.w * p3;
+      }
+      for (; i + 3 < I; i += 4) {
+        const float4 av = *reinterpret_cast<const float4*>(arow + i);
+        const uint32_t wp = *reinterpret_cast<const uint32_t*>(drow + i);
+        float q0, q1, q2, q3;
+        Fp8E4M3HwFromU32(wp, q0, q1, q2, q3);
+        dot += av.x * q0 + av.y * q1 + av.z * q2 + av.w * q3;
+      }
+      for (; i < I; ++i) dot += arow[i] * Fp8E4M3HwFromByte(drow[i]);
+      const __hip_bfloat16* sd = sdn_base + static_cast<size_t>(e) * sdn_one;
+      acc += swts[g] * __bfloat162float(sd[h]) * dot;
+    }
+    ysum[h] = __float2bfloat16(acc);
+  }
+}
+
+// Warp-cooperative LDS down: one warp owns one h-row; lanes split I and warp-reduce.
+// Better CU fill than 11 CTAs×256 (H=2816 → ~88 CTAs @256 TPB / 8 warps). Opt-in VT_GEMMA4_DOWN_WARP=1.
+__global__ void ExpertFp8DownTopKIndexedKernelHwWarp(__hip_bfloat16* __restrict__ ysum,
+                                                     const float* __restrict__ act,
+                                                     const uint8_t* __restrict__ dn_base,
+                                                     const __hip_bfloat16* __restrict__ sdn_base,
+                                                     const int32_t* __restrict__ idx,
+                                                     const float* __restrict__ wts, int G, int I,
+                                                     int H) {
+  __shared__ int sidx[kMaxTopK];
+  __shared__ float swts[kMaxTopK];
+  extern __shared__ float sact[];
+  const int tid = static_cast<int>(threadIdx.x);
+  const int tpb = static_cast<int>(blockDim.x);
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int nwarps = tpb >> 5;
+  if (tid < G) {
+    sidx[tid] = idx[tid];
+    swts[tid] = wts[tid];
+  }
+  __syncthreads();
+  const int act_n = G * I;
+  for (int i = tid; i < act_n; i += tpb) sact[i] = act[i];
+  __syncthreads();
+
+  const int h = static_cast<int>(blockIdx.x) * nwarps + warp;
+  if (h >= H) return;
+
+  const size_t dn_one = static_cast<size_t>(H) * static_cast<size_t>(I);
+  const size_t sdn_one = static_cast<size_t>(H);
+  const int I16 = I & ~15;
+  float acc = 0.f;
+  for (int g = 0; g < G; ++g) {
+    const int e = sidx[g];
+    const uint8_t* drow = dn_base + static_cast<size_t>(e) * dn_one + static_cast<size_t>(h) * I;
+    const float* arow = sact + g * I;
+    float dot = 0.f;
+    // lanes strip-mine I in 16-wide chunks (lane owns every 32nd group of 16 when possible)
+    for (int base = lane * 16; base + 15 < I; base += 32 * 16) {
+      const float4 a0 = *reinterpret_cast<const float4*>(arow + base);
+      const float4 a1 = *reinterpret_cast<const float4*>(arow + base + 4);
+      const float4 a2 = *reinterpret_cast<const float4*>(arow + base + 8);
+      const float4 a3 = *reinterpret_cast<const float4*>(arow + base + 12);
+      const uint32_t w0 = *reinterpret_cast<const uint32_t*>(drow + base);
+      const uint32_t w1 = *reinterpret_cast<const uint32_t*>(drow + base + 4);
+      const uint32_t w2 = *reinterpret_cast<const uint32_t*>(drow + base + 8);
+      const uint32_t w3 = *reinterpret_cast<const uint32_t*>(drow + base + 12);
+      float p0, p1, p2, p3;
+      Fp8E4M3HwFromU32(w0, p0, p1, p2, p3);
+      dot += a0.x * p0 + a0.y * p1 + a0.z * p2 + a0.w * p3;
+      Fp8E4M3HwFromU32(w1, p0, p1, p2, p3);
+      dot += a1.x * p0 + a1.y * p1 + a1.z * p2 + a1.w * p3;
+      Fp8E4M3HwFromU32(w2, p0, p1, p2, p3);
+      dot += a2.x * p0 + a2.y * p1 + a2.z * p2 + a2.w * p3;
+      Fp8E4M3HwFromU32(w3, p0, p1, p2, p3);
+      dot += a3.x * p0 + a3.y * p1 + a3.z * p2 + a3.w * p3;
+    }
+    // tail: scalar strip by lane
+    for (int i = I16 + lane; i < I; i += 32) {
+      dot += arow[i] * Fp8E4M3HwFromByte(drow[i]);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      dot += __shfl_down(dot, off);
+    }
+    if (lane == 0) {
+      const __hip_bfloat16* sd = sdn_base + static_cast<size_t>(e) * sdn_one;
+      acc += swts[g] * __bfloat162float(sd[h]) * dot;
+    }
+  }
+  if (lane == 0) ysum[h] = __float2bfloat16(acc);
+}
+
+// Multi-h LDS down: each thread owns NH consecutive rows; reuses sact across h (ILP + better CU fill
+// when paired with smaller TPB). NH=2 or 4 via template. Bounds-safe for H % NH != 0.
+template <int NH>
+__global__ void ExpertFp8DownTopKIndexedKernelHwNh(__hip_bfloat16* __restrict__ ysum,
+                                                   const float* __restrict__ act,
+                                                   const uint8_t* __restrict__ dn_base,
+                                                   const __hip_bfloat16* __restrict__ sdn_base,
+                                                   const int32_t* __restrict__ idx,
+                                                   const float* __restrict__ wts, int G, int I,
+                                                   int H) {
+  static_assert(NH == 2 || NH == 4, "NH");
+  __shared__ int sidx[kMaxTopK];
+  __shared__ float swts[kMaxTopK];
+  extern __shared__ float sact[];
+  const int tid = static_cast<int>(threadIdx.x);
+  const int tpb = static_cast<int>(blockDim.x);
+  if (tid < G) {
+    sidx[tid] = idx[tid];
+    swts[tid] = wts[tid];
+  }
+  __syncthreads();
+  const int act_n = G * I;
+  for (int i = tid; i < act_n; i += tpb) sact[i] = act[i];
+  __syncthreads();
+
+  const size_t dn_one = static_cast<size_t>(H) * static_cast<size_t>(I);
+  const size_t sdn_one = static_cast<size_t>(H);
+  // One logical "slot" per thread covers NH h-rows.
+  const int nslot = (H + NH - 1) / NH;
+  const int stride = static_cast<int>(gridDim.x * blockDim.x);
+  const int I16 = I & ~15;
+  for (int slot = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); slot < nslot;
+       slot += stride) {
+    const int h0 = slot * NH;
+    float acc[NH];
+#pragma unroll
+    for (int n = 0; n < NH; ++n) acc[n] = 0.f;
+    for (int g = 0; g < G; ++g) {
+      const int e = sidx[g];
+      const float* arow = sact + g * I;
+      const uint8_t* drow[NH];
+      float sc[NH];
+      const __hip_bfloat16* sd = sdn_base + static_cast<size_t>(e) * sdn_one;
+#pragma unroll
+      for (int n = 0; n < NH; ++n) {
+        const int h = h0 + n;
+        if (h < H) {
+          drow[n] = dn_base + static_cast<size_t>(e) * dn_one + static_cast<size_t>(h) * I;
+          sc[n] = swts[g] * __bfloat162float(sd[h]);
+        } else {
+          drow[n] = nullptr;
+          sc[n] = 0.f;
+        }
+      }
+      float dot[NH];
+#pragma unroll
+      for (int n = 0; n < NH; ++n) dot[n] = 0.f;
+      int i = 0;
+      for (; i < I16; i += 16) {
+        const float4 a0 = *reinterpret_cast<const float4*>(arow + i);
+        const float4 a1 = *reinterpret_cast<const float4*>(arow + i + 4);
+        const float4 a2 = *reinterpret_cast<const float4*>(arow + i + 8);
+        const float4 a3 = *reinterpret_cast<const float4*>(arow + i + 12);
+#pragma unroll
+        for (int n = 0; n < NH; ++n) {
+          if (!drow[n]) continue;
+          const uint32_t w0 = *reinterpret_cast<const uint32_t*>(drow[n] + i);
+          const uint32_t w1 = *reinterpret_cast<const uint32_t*>(drow[n] + i + 4);
+          const uint32_t w2 = *reinterpret_cast<const uint32_t*>(drow[n] + i + 8);
+          const uint32_t w3 = *reinterpret_cast<const uint32_t*>(drow[n] + i + 12);
+          float p0, p1, p2, p3;
+          Fp8E4M3HwFromU32(w0, p0, p1, p2, p3);
+          dot[n] += a0.x * p0 + a0.y * p1 + a0.z * p2 + a0.w * p3;
+          Fp8E4M3HwFromU32(w1, p0, p1, p2, p3);
+          dot[n] += a1.x * p0 + a1.y * p1 + a1.z * p2 + a1.w * p3;
+          Fp8E4M3HwFromU32(w2, p0, p1, p2, p3);
+          dot[n] += a2.x * p0 + a2.y * p1 + a2.z * p2 + a2.w * p3;
+          Fp8E4M3HwFromU32(w3, p0, p1, p2, p3);
+          dot[n] += a3.x * p0 + a3.y * p1 + a3.z * p2 + a3.w * p3;
+        }
+      }
+      for (; i + 3 < I; i += 4) {
+        const float4 av = *reinterpret_cast<const float4*>(arow + i);
+#pragma unroll
+        for (int n = 0; n < NH; ++n) {
+          if (!drow[n]) continue;
+          const uint32_t wp = *reinterpret_cast<const uint32_t*>(drow[n] + i);
+          float q0, q1, q2, q3;
+          Fp8E4M3HwFromU32(wp, q0, q1, q2, q3);
+          dot[n] += av.x * q0 + av.y * q1 + av.z * q2 + av.w * q3;
+        }
+      }
+      for (; i < I; ++i) {
+        const float av = arow[i];
+#pragma unroll
+        for (int n = 0; n < NH; ++n) {
+          if (!drow[n]) continue;
+          dot[n] += av * Fp8E4M3HwFromByte(drow[n][i]);
+        }
+      }
+#pragma unroll
+      for (int n = 0; n < NH; ++n) acc[n] += sc[n] * dot[n];
+    }
+#pragma unroll
+    for (int n = 0; n < NH; ++n) {
+      const int h = h0 + n;
+      if (h < H) ysum[h] = __float2bfloat16(acc[n]);
+    }
+  }
+}
+
+// Legacy down (no LDS act) — A/B via VT_GEMMA4_DOWN_LDS=0.
+__global__ void ExpertFp8DownTopKIndexedKernelHwNoLds(__hip_bfloat16* __restrict__ ysum,
+                                                      const float* __restrict__ act,
+                                                      const uint8_t* __restrict__ dn_base,
+                                                      const __hip_bfloat16* __restrict__ sdn_base,
+                                                      const int32_t* __restrict__ idx,
+                                                      const float* __restrict__ wts, int G, int I,
+                                                      int H) {
   __shared__ int sidx[kMaxTopK];
   __shared__ float swts[kMaxTopK];
   const int tid = static_cast<int>(threadIdx.x);
@@ -1343,13 +1771,95 @@ bool ExpertGeGLUFp8TopKIndexedRocm(Queue& q, void* ysum, const void* x, const vo
     if (v == 128 || v == 192 || v == 256) return v;
     return 256;
   }();
+  // Dense float4 H-strip (all threads busy). Opt-in A/B.
+  static const int act_dense = [] {
+    const char* e = std::getenv("VT_GEMMA4_ACT_DENSE");
+    return (e && e[0] == '1') ? 1 : 0;
+  }();
+  // Parallel G via grid=I*G (with dense). Opt-in A/B.
+  static const int act_par_g = [] {
+    const char* e = std::getenv("VT_GEMMA4_ACT_PAR_G");
+    return (e && e[0] == '1') ? 1 : 0;
+  }();
+  // One warp per (i,g), grid=I*G, tpb=32. Opt-in A/B.
+  static const int act_warp_i = [] {
+    const char* e = std::getenv("VT_GEMMA4_ACT_WARP_I");
+    return (e && e[0] == '1') ? 1 : 0;
+  }();
+  // VT_GEMMA4_DOWN_LDS: 1/default = stage act[G,I] in LDS for down kernel; 0 = legacy global act.
+  static const int down_lds = [] {
+    const char* e = std::getenv("VT_GEMMA4_DOWN_LDS");
+    if (e && e[0] == '0') return 0;
+    return 1;
+  }();
+  // Down block size: 64/128/256. Smaller → more CTAs (H=2816 → 11@256, 22@128, 44@64).
+  static const int down_tpb = [] {
+    const char* e = std::getenv("VT_GEMMA4_DOWN_TPB");
+    if (!e || !e[0]) return 256;
+    const int v = std::atoi(e);
+    if (v == 64 || v == 128 || v == 256) return v;
+    return 256;
+  }();
+  // Multi-h per thread (LDS path only): 1=baseline, 2/4 = ExpertFp8DownTopKIndexedKernelHwNh.
+  static const int down_nh = [] {
+    const char* e = std::getenv("VT_GEMMA4_DOWN_NH");
+    if (!e || !e[0]) return 1;
+    const int v = std::atoi(e);
+    if (v == 1 || v == 2 || v == 4) return v;
+    return 1;
+  }();
+  // Warp-coop down (one warp per h). KEEP 2026-08-11: ~−28% down_us, ~+2.5% short gen.
+  // =0 thread-per-h LDS baseline. Default ON.
+  static const int down_warp = [] {
+    const char* e = std::getenv("VT_GEMMA4_DOWN_WARP");
+    if (e && e[0] == '0') return 0;
+    return 1;
+  }();
+  // Must match UploadFp8NativeLayer pack (VT_GEMMA4_GU_INTERLEAVE).
+  static const int gu_pair = [] {
+    const char* e = std::getenv("VT_GEMMA4_GU_INTERLEAVE");
+    return (e && e[0] == '1') ? 1 : 0;
+  }();
+  // VT_GEMMA4_EXPERT_SPLIT=1 → hipEvent µs for act / down (KEEP path diagnostics).
+  static const bool split_prof = [] {
+    const char* e = std::getenv("VT_GEMMA4_EXPERT_SPLIT");
+    return e && e[0] == '1';
+  }();
+  struct SplitProf {
+    hipEvent_t e0 = nullptr, e1 = nullptr, e2 = nullptr, e3 = nullptr;
+    double us_act = 0, us_dn = 0;
+    unsigned long long n = 0;
+    bool ready = false;
+    int bound_dev = -1;
+  };
+  static thread_local SplitProf sp_slot[8];
+  SplitProf* sp = nullptr;
+  if (split_prof && dev >= 0 && dev < 8) {
+    sp = &sp_slot[dev];
+    if (!sp->ready || sp->bound_dev != dev) {
+      if (sp->e0) {
+        (void)hipEventDestroy(sp->e0);
+        (void)hipEventDestroy(sp->e1);
+        (void)hipEventDestroy(sp->e2);
+        (void)hipEventDestroy(sp->e3);
+      }
+      *sp = SplitProf{};
+      sp->bound_dev = dev;
+      auto mk = [](hipEvent_t* e) {
+        return hipEventCreateWithFlags(e, hipEventDefault) == hipSuccess;
+      };
+      sp->ready = mk(&sp->e0) && mk(&sp->e1) && mk(&sp->e2) && mk(&sp->e3);
+    }
+  }
   static bool once_pack = false;
   if (!once_pack) {
     once_pack = true;
     std::fprintf(stderr,
                  "INFO ExpertGeGLU act_i_pack=%d fp8_hw_cvt=%d expert_wmma=%d act_warpg=%d "
-                 "act_tpb=%d\n",
-                 act_pack, hw_cvt, expert_wmma, act_warpg, act_tpb);
+                 "act_tpb=%d act_dense=%d act_par_g=%d act_warp_i=%d gu_pair=%d down_lds=%d "
+                 "down_tpb=%d down_nh=%d down_warp=%d expert_split=%d\n",
+                 act_pack, hw_cvt, expert_wmma, act_warpg, act_tpb, act_dense, act_par_g, act_warp_i,
+                 gu_pair, down_lds, down_tpb, down_nh, down_warp, split_prof ? 1 : 0);
     std::fflush(stderr);
   }
 
@@ -1359,13 +1869,18 @@ bool ExpertGeGLUFp8TopKIndexedRocm(Queue& q, void* ysum, const void* x, const vo
 #endif
   // Always allow launch path on this lab (HIP arches=gfx1201). Kernel is
   // empty-stub on non-gfx12 device objects.
-  const bool wmma_ok =
-      expert_wmma && hw_cvt && (I % kWmma == 0) && (H % kWmma == 0) && (I / kWmma) > 0;
+  // WMMA tiles need 16 contiguous gate rows — incompatible with pair interleave.
+  const bool wmma_ok = expert_wmma && hw_cvt && !gu_pair && (I % kWmma == 0) &&
+                       (H % kWmma == 0) && (I / kWmma) > 0;
   // Warp-G needs G warps in one CTA (G≤8 → ≤256 threads) and HW cvt.
-  const bool warpg_ok = act_warpg && hw_cvt && G > 0 && G <= 8 && !wmma_ok;
+  // Pair layout needs GuGateUpRows in WarpG/I2 kernels — not wired; force off.
+  const bool warpg_ok =
+      act_warpg && hw_cvt && !gu_pair && G > 0 && G <= 8 && !wmma_ok;
 
+  if (split_prof && sp && sp->ready) (void)hipEventRecord(sp->e0, st);
+
+  // --- act launch ---
   if (wmma_ok) {
-    // Quantize x_f → x_f8 + sx, WMMA act, HW down.
     (void)hipMemsetAsync(tls.d_sx, 0, sizeof(float), st);
     {
       const int xt = 256;
@@ -1378,56 +1893,112 @@ bool ExpertGeGLUFp8TopKIndexedRocm(Queue& q, void* ysum, const void* x, const vo
     ExpertFp8ActTopKIndexedKernelWmma<<<grid_act, 32, 0, st>>>(
         tls.d_act, tls.d_xf8, tls.d_sx, static_cast<const uint8_t*>(gu_base),
         static_cast<const __hip_bfloat16*>(sgu_base), idx_dev, G, I, H);
-    const int grid_dn = (H + kBlock - 1) / kBlock;
-    ExpertFp8DownTopKIndexedKernelHw<<<grid_dn, kBlock, 0, st>>>(
-        static_cast<__hip_bfloat16*>(ysum), tls.d_act, static_cast<const uint8_t*>(dn_base),
-        static_cast<const __hip_bfloat16*>(sdn_base), idx_dev, wts_dev, G, I, H);
   } else if (warpg_ok) {
     dim3 grid_act(static_cast<unsigned>(I));
     const int tpb = G * 32;
     ExpertFp8ActTopKIndexedKernelHwWarpG<<<grid_act, tpb, 0, st>>>(
         tls.d_act, tls.d_xf, static_cast<const uint8_t*>(gu_base),
         static_cast<const __hip_bfloat16*>(sgu_base), idx_dev, G, I, H);
-    const int grid_dn = (H + kBlock - 1) / kBlock;
-    ExpertFp8DownTopKIndexedKernelHw<<<grid_dn, kBlock, 0, st>>>(
-        static_cast<__hip_bfloat16*>(ysum), tls.d_act, static_cast<const uint8_t*>(dn_base),
-        static_cast<const __hip_bfloat16*>(sdn_base), idx_dev, wts_dev, G, I, H);
-  } else if (hw_cvt && act_pack == 2) {
+  } else if (hw_cvt && act_warp_i && !gu_pair) {
+    const unsigned ng = static_cast<unsigned>(I) * static_cast<unsigned>(G);
+    ExpertFp8ActTopKIndexedKernelHwWarpI<<<ng, 32, 0, st>>>(
+        tls.d_act, tls.d_xf, static_cast<const uint8_t*>(gu_base),
+        static_cast<const __hip_bfloat16*>(sgu_base), idx_dev, G, I, H, gu_pair);
+  } else if (hw_cvt && act_dense) {
+    const unsigned ng =
+        act_par_g ? static_cast<unsigned>(I) * static_cast<unsigned>(G)
+                  : static_cast<unsigned>(I);
+    ExpertFp8ActTopKIndexedKernelHwDense<<<ng, act_tpb, 0, st>>>(
+        tls.d_act, tls.d_xf, static_cast<const uint8_t*>(gu_base),
+        static_cast<const __hip_bfloat16*>(sgu_base), idx_dev, G, I, H, gu_pair, act_par_g);
+  } else if (hw_cvt && act_pack == 2 && !gu_pair) {
     const unsigned ng = static_cast<unsigned>((I + 1) / 2);
     ExpertFp8ActTopKIndexedKernelHwI2<<<ng, act_tpb, 0, st>>>(
         tls.d_act, tls.d_xf, static_cast<const uint8_t*>(gu_base),
         static_cast<const __hip_bfloat16*>(sgu_base), idx_dev, G, I, H);
-    const int grid_dn = (H + kBlock - 1) / kBlock;
-    ExpertFp8DownTopKIndexedKernelHw<<<grid_dn, kBlock, 0, st>>>(
-        static_cast<__hip_bfloat16*>(ysum), tls.d_act, static_cast<const uint8_t*>(dn_base),
-        static_cast<const __hip_bfloat16*>(sdn_base), idx_dev, wts_dev, G, I, H);
   } else if (hw_cvt) {
     dim3 grid_act(static_cast<unsigned>(I));
     ExpertFp8ActTopKIndexedKernelHw<<<grid_act, act_tpb, 0, st>>>(
         tls.d_act, tls.d_xf, static_cast<const uint8_t*>(gu_base),
-        static_cast<const __hip_bfloat16*>(sgu_base), idx_dev, G, I, H);
-    const int grid_dn = (H + kBlock - 1) / kBlock;
-    ExpertFp8DownTopKIndexedKernelHw<<<grid_dn, kBlock, 0, st>>>(
-        static_cast<__hip_bfloat16*>(ysum), tls.d_act, static_cast<const uint8_t*>(dn_base),
-        static_cast<const __hip_bfloat16*>(sdn_base), idx_dev, wts_dev, G, I, H);
+        static_cast<const __hip_bfloat16*>(sgu_base), idx_dev, G, I, H, gu_pair);
   } else if (act_pack == 2) {
     const unsigned ng = static_cast<unsigned>((I + 1) / 2);
     ExpertFp8ActTopKIndexedKernelI2<<<ng, kBlock, 0, st>>>(
         tls.d_act, tls.d_xf, static_cast<const uint8_t*>(gu_base),
         static_cast<const __hip_bfloat16*>(sgu_base), idx_dev, G, I, H);
-    const int grid_dn = (H + kBlock - 1) / kBlock;
-    ExpertFp8DownTopKIndexedKernel<<<grid_dn, kBlock, 0, st>>>(
-        static_cast<__hip_bfloat16*>(ysum), tls.d_act, static_cast<const uint8_t*>(dn_base),
-        static_cast<const __hip_bfloat16*>(sdn_base), idx_dev, wts_dev, G, I, H);
   } else {
     dim3 grid_act(static_cast<unsigned>(I));
     ExpertFp8ActTopKIndexedKernel<<<grid_act, kBlock, 0, st>>>(
         tls.d_act, tls.d_xf, static_cast<const uint8_t*>(gu_base),
-        static_cast<const __hip_bfloat16*>(sgu_base), idx_dev, G, I, H);
-    const int grid_dn = (H + kBlock - 1) / kBlock;
-    ExpertFp8DownTopKIndexedKernel<<<grid_dn, kBlock, 0, st>>>(
-        static_cast<__hip_bfloat16*>(ysum), tls.d_act, static_cast<const uint8_t*>(dn_base),
-        static_cast<const __hip_bfloat16*>(sdn_base), idx_dev, wts_dev, G, I, H);
+        static_cast<const __hip_bfloat16*>(sgu_base), idx_dev, G, I, H, gu_pair);
+  }
+
+  if (split_prof && sp && sp->ready) (void)hipEventRecord(sp->e1, st);
+
+  // --- down launch (same for all act paths) ---
+  {
+    const int tpb_dn = down_tpb;
+    const size_t smem =
+        down_lds ? static_cast<size_t>(G) * static_cast<size_t>(I) * sizeof(float) : 0;
+    if (hw_cvt || wmma_ok || warpg_ok) {
+      if (down_lds && down_warp) {
+        const int nwarps = tpb_dn / 32;
+        const int grid_dn = (H + nwarps - 1) / nwarps;
+        ExpertFp8DownTopKIndexedKernelHwWarp<<<grid_dn, tpb_dn, smem, st>>>(
+            static_cast<__hip_bfloat16*>(ysum), tls.d_act, static_cast<const uint8_t*>(dn_base),
+            static_cast<const __hip_bfloat16*>(sdn_base), idx_dev, wts_dev, G, I, H);
+      } else if (down_lds && down_nh == 2) {
+        const int nslot = (H + 1) / 2;
+        const int grid_dn = (nslot + tpb_dn - 1) / tpb_dn;
+        ExpertFp8DownTopKIndexedKernelHwNh<2><<<grid_dn, tpb_dn, smem, st>>>(
+            static_cast<__hip_bfloat16*>(ysum), tls.d_act, static_cast<const uint8_t*>(dn_base),
+            static_cast<const __hip_bfloat16*>(sdn_base), idx_dev, wts_dev, G, I, H);
+      } else if (down_lds && down_nh == 4) {
+        const int nslot = (H + 3) / 4;
+        const int grid_dn = (nslot + tpb_dn - 1) / tpb_dn;
+        ExpertFp8DownTopKIndexedKernelHwNh<4><<<grid_dn, tpb_dn, smem, st>>>(
+            static_cast<__hip_bfloat16*>(ysum), tls.d_act, static_cast<const uint8_t*>(dn_base),
+            static_cast<const __hip_bfloat16*>(sdn_base), idx_dev, wts_dev, G, I, H);
+      } else if (down_lds) {
+        const int grid_dn = (H + tpb_dn - 1) / tpb_dn;
+        ExpertFp8DownTopKIndexedKernelHw<<<grid_dn, tpb_dn, smem, st>>>(
+            static_cast<__hip_bfloat16*>(ysum), tls.d_act, static_cast<const uint8_t*>(dn_base),
+            static_cast<const __hip_bfloat16*>(sdn_base), idx_dev, wts_dev, G, I, H);
+      } else {
+        const int grid_dn = (H + tpb_dn - 1) / tpb_dn;
+        ExpertFp8DownTopKIndexedKernelHwNoLds<<<grid_dn, tpb_dn, 0, st>>>(
+            static_cast<__hip_bfloat16*>(ysum), tls.d_act, static_cast<const uint8_t*>(dn_base),
+            static_cast<const __hip_bfloat16*>(sdn_base), idx_dev, wts_dev, G, I, H);
+      }
+    } else {
+      const int grid_dn = (H + kBlock - 1) / kBlock;
+      ExpertFp8DownTopKIndexedKernel<<<grid_dn, kBlock, 0, st>>>(
+          static_cast<__hip_bfloat16*>(ysum), tls.d_act, static_cast<const uint8_t*>(dn_base),
+          static_cast<const __hip_bfloat16*>(sdn_base), idx_dev, wts_dev, G, I, H);
+    }
+  }
+
+  if (split_prof && sp && sp->ready) {
+    (void)hipEventRecord(sp->e2, st);
+    // e0→e1 = act (+ optional wmma quant); e1→e2 = down. x_expand is outside this window.
+    if (hipEventSynchronize(sp->e2) == hipSuccess) {
+      float ms_act = 0.f, ms_dn = 0.f;
+      (void)hipEventElapsedTime(&ms_act, sp->e0, sp->e1);
+      (void)hipEventElapsedTime(&ms_dn, sp->e1, sp->e2);
+      sp->us_act += ms_act * 1000.0;
+      sp->us_dn += ms_dn * 1000.0;
+      ++sp->n;
+      if (sp->n == 64 || (sp->n > 0 && (sp->n % 512) == 0)) {
+        const double inv = 1.0 / static_cast<double>(sp->n);
+        std::fprintf(stderr,
+                     "INFO ExpertGeGLU split dev=%d n=%llu act_us=%.1f down_us=%.1f act%%=%.0f "
+                     "down%%=%.0f (per call avg)\n",
+                     dev, sp->n, sp->us_act * inv, sp->us_dn * inv,
+                     100.0 * sp->us_act / (sp->us_act + sp->us_dn + 1e-9),
+                     100.0 * sp->us_dn / (sp->us_act + sp->us_dn + 1e-9));
+        std::fflush(stderr);
+      }
+    }
   }
   return hipGetLastError() == hipSuccess;
 }

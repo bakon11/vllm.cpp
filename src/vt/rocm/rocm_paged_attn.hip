@@ -119,6 +119,28 @@ __device__ inline void St(__hip_bfloat16* p, int64_t i, float v) {
   p[i] = __float2bfloat16(v);
 }
 
+// fp8-e4m3 byte → f32 (no scale). Scale applied by caller (LoadKv = dequant * scale).
+#if defined(__gfx1200__) || defined(__gfx1201__)
+__device__ inline float Fp8E4M3ToF32Dev(uint8_t b) {
+  return __builtin_amdgcn_cvt_f32_fp8(static_cast<unsigned int>(b), 0);
+}
+#else
+__device__ inline float Fp8E4M3ToF32Dev(uint8_t b) {
+  const uint32_t sign = (static_cast<uint32_t>(b) >> 7) & 1u;
+  const uint32_t exp = (static_cast<uint32_t>(b) >> 3) & 0xfu;
+  const uint32_t mant = static_cast<uint32_t>(b) & 0x7u;
+  const float sm = sign ? -1.f : 1.f;
+  if (exp == 0xfu && mant == 0x7u) return nanf("");
+  if (exp == 0u) return sm * (static_cast<float>(mant) * (1.f / 512.f));
+  const float mantissa = 1.f + static_cast<float>(mant) * (1.f / 8.f);
+  return sm * ldexpf(mantissa, static_cast<int>(exp) - 7);
+}
+#endif
+
+__device__ inline float LdFp8(const uint8_t* p, int64_t i, float scale) {
+  return Fp8E4M3ToF32Dev(p[i]) * scale;
+}
+
 __device__ inline float Softcap(float s, float cap) {
   return cap > 0.f ? cap * tanhf(s / cap) : s;
 }
@@ -240,6 +262,132 @@ __global__ void PagedAttnOnline(TO* out, const TQ* query, const TKV* k_cache,
       } else {
         for (int64_t e = threadIdx.x; e < d; e += blockDim.x)
           acc[e] = acc[e] * corr + pw * Ld(v_cache, vbase + e);
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        s_l = s_l * corr + pw;
+        s_m = m_new;
+      }
+      __syncthreads();
+    }
+  }
+
+  const float inv = (s_l > 0.f) ? (1.f / s_l) : 0.f;
+  for (int64_t e = threadIdx.x; e < d; e += blockDim.x) St(out, qoff + e, acc[e] * inv);
+}
+
+// FP8 KV online attention — same structure as PagedAttnOnline but K/V loads are
+// Dequant(fp8)*scale. First ROCm brick (lab W2); decode-opt/GQA FP8 is later.
+template <typename TQ, typename TO>
+__global__ void PagedAttnOnlineFp8(TO* out, const TQ* query, const uint8_t* k_cache,
+                                   const uint8_t* v_cache, const int32_t* block_table,
+                                   const int32_t* seq_lens, const int32_t* query_start_loc,
+                                   int64_t num_reqs, int64_t hq, int64_t num_kv_heads, int64_t d,
+                                   int64_t block_size, int64_t bt_row, int64_t bt_col,
+                                   int64_t kc_blk, int64_t kc_pg, int64_t kc_hd, int64_t vc_blk,
+                                   int64_t vc_pg, int64_t vc_hd, float scale, float softcap,
+                                   bool causal, int window_left, int window_right, float k_scale,
+                                   float v_scale) {
+  const int64_t t = blockIdx.x;
+  const int64_t h = blockIdx.y;
+  if (h >= hq) return;
+
+  int64_t r = -1, q0 = 0, q1 = 0;
+  if (num_reqs == 1) {
+    r = 0;
+    q0 = query_start_loc[0];
+    q1 = query_start_loc[1];
+    if (t < q0 || t >= q1) return;
+  } else {
+    for (int64_t rr = 0; rr < num_reqs; ++rr) {
+      const int64_t a = query_start_loc[rr], b = query_start_loc[rr + 1];
+      if (t >= a && t < b) {
+        r = rr;
+        q0 = a;
+        q1 = b;
+        break;
+      }
+    }
+    if (r < 0) return;
+  }
+
+  const int64_t query_len = q1 - q0;
+  const int64_t seqlen = seq_lens[r];
+  const int64_t context = seqlen - query_len;
+  const int64_t p = context + (t - q0);
+
+  int64_t jmin = 0;
+  if (window_left >= 0) {
+    jmin = p - window_left;
+    if (jmin < 0) jmin = 0;
+  }
+  int64_t jmax = causal ? p : (seqlen - 1);
+  if (window_right >= 0) {
+    const int64_t jr = p + window_right;
+    if (jr < jmax) jmax = jr;
+  }
+  if (jmax > seqlen - 1) jmax = seqlen - 1;
+  const int64_t g = h / (hq / num_kv_heads);
+  const int64_t qoff = (t * hq + h) * d;
+  const bool vec4 = (d % 4) == 0;
+
+  extern __shared__ float smem[];
+  float* acc = smem;
+  float* red = smem + d;
+  __shared__ float s_score, s_m, s_l;
+
+  for (int64_t e = threadIdx.x; e < d; e += blockDim.x) acc[e] = 0.f;
+  if (threadIdx.x == 0) {
+    s_m = -INFINITY;
+    s_l = 0.f;
+  }
+  __syncthreads();
+
+  if (jmax >= jmin) {
+    for (int64_t j = jmin; j <= jmax; ++j) {
+      const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
+      const int64_t off = j % block_size;
+      const int64_t kbase = blk * kc_blk + off * kc_pg + g * kc_hd;
+      float part = 0.f;
+      if (vec4) {
+        const int64_t nvec = d >> 2;
+        for (int64_t v = threadIdx.x; v < nvec; v += blockDim.x) {
+          const int64_t e = v << 2;
+          part += Ld(query, qoff + e) * LdFp8(k_cache, kbase + e, k_scale);
+          part += Ld(query, qoff + e + 1) * LdFp8(k_cache, kbase + e + 1, k_scale);
+          part += Ld(query, qoff + e + 2) * LdFp8(k_cache, kbase + e + 2, k_scale);
+          part += Ld(query, qoff + e + 3) * LdFp8(k_cache, kbase + e + 3, k_scale);
+        }
+      } else {
+        for (int64_t e = threadIdx.x; e < d; e += blockDim.x)
+          part += Ld(query, qoff + e) * LdFp8(k_cache, kbase + e, k_scale);
+      }
+      red[threadIdx.x] = part;
+      __syncthreads();
+      for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
+        if ((int)threadIdx.x < stride) red[threadIdx.x] += red[threadIdx.x + stride];
+        __syncthreads();
+      }
+      if (threadIdx.x == 0) s_score = Softcap(red[0] * scale, softcap);
+      __syncthreads();
+
+      const float s = s_score;
+      const float m_new = fmaxf(s_m, s);
+      const float corr = expf(s_m - m_new);
+      const float pw = expf(s - m_new);
+      const int64_t vbase = blk * vc_blk + off * vc_pg + g * vc_hd;
+      if (vec4) {
+        const int64_t nvec = d >> 2;
+        for (int64_t v = threadIdx.x; v < nvec; v += blockDim.x) {
+          const int64_t e = v << 2;
+          acc[e] = acc[e] * corr + pw * LdFp8(v_cache, vbase + e, v_scale);
+          acc[e + 1] = acc[e + 1] * corr + pw * LdFp8(v_cache, vbase + e + 1, v_scale);
+          acc[e + 2] = acc[e + 2] * corr + pw * LdFp8(v_cache, vbase + e + 2, v_scale);
+          acc[e + 3] = acc[e + 3] * corr + pw * LdFp8(v_cache, vbase + e + 3, v_scale);
+        }
+      } else {
+        for (int64_t e = threadIdx.x; e < d; e += blockDim.x)
+          acc[e] = acc[e] * corr + pw * LdFp8(v_cache, vbase + e, v_scale);
       }
       __syncthreads();
       if (threadIdx.x == 0) {
@@ -680,8 +828,9 @@ __global__ void PagedAttnDecodeGqaSplit1Bf16(float* mid_o, float* mid_m, float* 
 
   if (js <= je) {
     for (int64_t j = js + warp; j <= je; j += NWARPS) {
-      const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
-      const int64_t off = j % block_size;
+      const int64_t page = j / block_size;
+      const int64_t blk = block_table[r * bt_row + page * bt_col];
+      const int64_t off = j - page * block_size;
       float k_reg[kEpl];
       float v_reg[kEpl];
       LoadRowEplBf16<kEpl>(k_cache, blk * kc_blk + off * kc_pg + g * kc_hd, lane, k_reg);
@@ -1919,9 +2068,15 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
                               const Tensor& v_cache, const Tensor& block_table,
                               const Tensor& seq_lens, const Tensor& query_start_loc,
                               const PagedAttentionArgs& args) {
-  VT_CHECK(args.kv_cache_dtype == Fp8KVCacheDataType::kAuto,
-           "rocm paged_attention: fp8 KV not implemented");
   VT_CHECK(args.scale > 0.f, "rocm paged_attention: scale must be > 0");
+  if (args.kv_cache_dtype != Fp8KVCacheDataType::kAuto) {
+    VT_CHECK(args.kv_cache_dtype == Fp8KVCacheDataType::kFp8E4M3,
+             "rocm paged_attention: only fp8_e4m3 KV implemented");
+    VT_CHECK(k_cache.dtype == DType::kI8 && v_cache.dtype == DType::kI8,
+             "rocm paged_attention: fp8 KV requires kI8 cache");
+    VT_CHECK(args.k_scale > 0.f && args.v_scale > 0.f,
+             "rocm paged_attention: fp8 KV needs k_scale/v_scale > 0");
+  }
   if (CpuRefEnabled()) {
     PagedAttnCpuRef(q, out, query, k_cache, v_cache, block_table, seq_lens, query_start_loc,
                     args);
@@ -1943,6 +2098,42 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
   const int64_t bt_row = block_table.stride[0], bt_col = block_table.stride[1];
   const int64_t kc_blk = k_cache.stride[0], kc_pg = k_cache.stride[1], kc_hd = k_cache.stride[2];
   const int64_t vc_blk = v_cache.stride[0], vc_pg = v_cache.stride[1], vc_hd = v_cache.stride[2];
+
+  // FP8 KV: online path only (decode GQA/SharedK stay bf16 until optimized).
+  if (args.kv_cache_dtype == Fp8KVCacheDataType::kFp8E4M3) {
+    static bool once = false;
+    if (!once) {
+      std::fprintf(stderr,
+                   "INFO rocm paged_attention: fp8-e4m3 KV online path "
+                   "(k_scale=%g v_scale=%g)\n",
+                   args.k_scale, args.v_scale);
+      once = true;
+    }
+    unsigned threads = 64;
+    while (threads < 256u && threads < static_cast<unsigned>(d)) threads *= 2;
+    if (threads > 256u) threads = 256;
+    const size_t smem = sizeof(float) * (static_cast<size_t>(d) + threads);
+    dim3 grid(static_cast<unsigned>(total_q), static_cast<unsigned>(hq));
+    if (query.dtype == DType::kBF16 && out.dtype == DType::kBF16) {
+      PagedAttnOnlineFp8<__hip_bfloat16, __hip_bfloat16><<<grid, threads, smem, st>>>(
+          out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(), k_cache.Ptr<uint8_t>(),
+          v_cache.Ptr<uint8_t>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+          query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
+          bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale, args.logits_soft_cap,
+          args.causal, window_left, window_right, args.k_scale, args.v_scale);
+    } else if (query.dtype == DType::kF32 && out.dtype == DType::kF32) {
+      PagedAttnOnlineFp8<float, float><<<grid, threads, smem, st>>>(
+          out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<uint8_t>(), v_cache.Ptr<uint8_t>(),
+          block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(), query_start_loc.Ptr<int32_t>(),
+          num_reqs, hq, num_kv_heads, d, block_size, bt_row, bt_col, kc_blk, kc_pg, kc_hd,
+          vc_blk, vc_pg, vc_hd, args.scale, args.logits_soft_cap, args.causal, window_left,
+          window_right, args.k_scale, args.v_scale);
+    } else {
+      VT_CHECK(false, "rocm paged_attention fp8: query/out must be bf16 or f32");
+    }
+    Check(hipGetLastError(), "paged_attention fp8 online launch");
+    return;
+  }
 
   static const bool decode_opt = [] {
     const char* e = std::getenv("VT_ATTN_DECODE_OPT");
@@ -2176,11 +2367,13 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
       }
       const int nwarps = kDecWarps;
       // Full-attn split path: optional more K-warps per split CTA (VT_ATTN_DECODE_SPLIT_WARPS).
+      // 8=default · 16 only @ d<=256 (d=512 o-smem 64KB+) · 12 @ d=512 QG=2 (o=48KB).
       static const int split_warps_env = [] {
         const char* e = std::getenv("VT_ATTN_DECODE_SPLIT_WARPS");
         if (!e || !e[0]) return 8;
         int v = std::atoi(e);
-        return (v == 16) ? 16 : 8;
+        if (v == 16 || v == 12) return v;
+        return 8;
       }();
       // Full-attn QG tile: default 4 @ d=512 (qg=8 → z=2) amortizes KV over 2× Q heads
       // vs QG=2/z=4. Smem: o only = NWARPS*QG*d*4; QG=4 NWARPS=8 d=512 → 64KB.
@@ -2196,6 +2389,8 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
       const int split_nwarps = [&] {
         // d=512 + NWARPS=16 → o smem NWARPS*QG*d too fat even at QG=2 (64KB+).
         if (split_warps_env == 16 && d <= 256) return 16;
+        // 12 warps × QG2 × d512 × 4B = 48KB dynamic o — fits gfx1201 64KB.
+        if (split_warps_env == 12 && d == 512) return 12;
         return 8;
       }();
       // QG for this launch (sliding keeps 2 via z_groups=1 path below).
@@ -2216,22 +2411,40 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
       const unsigned z_groups = static_cast<unsigned>(qg / launch_qg);
       dim3 block(static_cast<unsigned>(nwarps * 32));
       dim3 block_split(static_cast<unsigned>(split_nwarps * 32));
-      // Full layers only (orig_full). Keep splits even when decode-window clamps wl —
-      // otherwise 8 CTAs under-fill CUs on the windowed range (measured flat @23k).
-      const bool want_split =
-          decode_kv_splits_env != 0 && orig_full_layer && total_q == num_reqs &&
-          query.dtype == DType::kBF16;
+      // Full layers: VT_ATTN_DECODE_KV_SPLITS (keep even under decode-window clamp).
+      // Sliding layers: VT_ATTN_DECODE_SLIDE_SPLITS — Gemma-4 slide is Hkv=8 z=1
+      // → only 8 CTAs unsplit on 64 CU; multi-CTA window splits fill CUs (lab A/B).
+      static const int slide_splits_env = [] {
+        const char* e = std::getenv("VT_ATTN_DECODE_SLIDE_SPLITS");
+        if (!e || !e[0]) return 0;
+        if (e[0] == 'a' || e[0] == 'A') return -1;  // auto
+        int v = std::atoi(e);
+        if (v < -1) v = -1;
+        if (v > 32) v = 32;
+        return v;
+      }();
+      const bool decode_bf16_t1 =
+          total_q == num_reqs && query.dtype == DType::kBF16;
+      const bool want_split_full =
+          decode_kv_splits_env != 0 && orig_full_layer && decode_bf16_t1;
+      const bool want_split_slide =
+          slide_splits_env != 0 && !orig_full_layer && decode_bf16_t1;
+      const bool want_split = want_split_full || want_split_slide;
       if (want_split) {
         if (args.max_seq_len > 0) {
           split_seqlen_cache = args.max_seq_len;
         }
-        int nsplit = decode_kv_splits_env;
+        int nsplit = want_split_slide ? slide_splits_env : decode_kv_splits_env;
         if (nsplit < 0) {
           // Port of CUDA MLA ComputeNumKvSplits + occupancy fill idea:
           //   ideal = next_pow2(max(1, max_seq_len/512))
-          //   grid CTAs = total_q * Hkv * z_groups * nsplit ≈ 8*nsplit @ Gemma-4 full
+          //   grid CTAs = total_q * Hkv * z_groups * nsplit
+          //   full ≈ 8*nsplit; slide Gemma-4 ≈ 8*nsplit (Hkv=8 z=1)
           //   target ≥ ~2 * 64 CUs → nsplit ≥ 16 for batch-1; grow with depth.
-          const int sl = split_seqlen_cache > 0 ? split_seqlen_cache : 2048;
+          // Sliding auto: use window span (not full seq) — work is O(window).
+          const int sl = want_split_slide
+                             ? (wl >= 0 ? (wl + 1) : 1024)
+                             : (split_seqlen_cache > 0 ? split_seqlen_cache : 2048);
           const int sm_count = 64;  // gfx1201 R9700
           const int ctas_per_split = std::max(
               1, static_cast<int>(num_reqs) * static_cast<int>(num_kv_heads) *
@@ -2255,11 +2468,13 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
         if (nsplit > 32) nsplit = 32;  // hard lab cap (fixed N too)
         {
           static bool once_qg = false;
-          if (!once_qg && launch_qg != 2) {
+          if (!once_qg && (launch_qg != 2 || want_split_slide)) {
             std::fprintf(stderr,
-                         "INFO decode full_qg=%d z_groups=%u nwarps=%d smem_o=%zu (d=%lld qg=%lld)\n",
-                         launch_qg, z_groups, split_nwarps, smem_split,
-                         static_cast<long long>(d), static_cast<long long>(qg));
+                         "INFO decode %s_qg=%d z_groups=%u nwarps=%d nsplit=%d smem_o=%zu "
+                         "(d=%lld qg=%lld)\n",
+                         want_split_slide ? "slide" : "full", launch_qg, z_groups,
+                         split_nwarps, nsplit, smem_split, static_cast<long long>(d),
+                         static_cast<long long>(qg));
             once_qg = true;
           }
         }
@@ -2303,7 +2518,15 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
                 bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
                 args.logits_soft_cap, args.causal, wl, wr, nsplit, static_cast<int>(z_groups));
           } else {
-            if (split_nwarps == 16) {
+            if (split_nwarps == 12) {
+              PagedAttnDecodeGqaSplit1Bf16<2, 16, 12><<<grid1, block_split, smem_split, st>>>(
+                  ws.o, ws.m, ws.l, query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
+                  v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+                  query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
+                  bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+                  args.logits_soft_cap, args.causal, wl, wr, nsplit,
+                  static_cast<int>(z_groups));
+            } else if (split_nwarps == 16) {
               PagedAttnDecodeGqaSplit1Bf16<2, 16, 16><<<grid1, block_split, smem_split, st>>>(
                   ws.o, ws.m, ws.l, query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
                   v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),

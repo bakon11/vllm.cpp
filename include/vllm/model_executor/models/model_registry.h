@@ -230,6 +230,10 @@ struct ModelForwardInput {
   const std::vector<int32_t>& token_ids;
   const std::vector<int32_t>& positions;
   const v1::CommonAttentionMetadata& attn_meta;
+  // Optional sliding-window group meta (Gemma-4 SWA physical hybrid). Null when
+  // the model has a single full-attn group (legacy / non-hybrid). Sliding layers
+  // must use this for block_table + slot_mapping; full layers keep attn_meta.
+  const v1::CommonAttentionMetadata* slide_attn_meta = nullptr;
   const v1::GDNAttentionMetadata& gdn_meta;
   std::vector<PagedKvCache>& attn_kv;
   std::vector<GdnStateCache>& gdn_state;

@@ -418,6 +418,13 @@ class GPUModelRunner final : public ModelRunnerBase {
   // KV group layout (resolved from the KVCacheConfig).
   int full_attn_group_id_ = -1;
   int gdn_group_id_ = -1;
+  // Gemma-4 SWA physical: SlidingWindowSpec group (hybrid full+slide). -1 when
+  // absent (legacy single full-attn group).
+  int slide_group_id_ = -1;
+  // Physical block counts per attn layer (parallel to full_attn_buf_ / attn_kv_).
+  // Empty => every layer uses num_blocks_. When SWA physical, sliding layers use
+  // the slide group's pool size.
+  std::vector<int64_t> attn_layer_num_blocks_;
   int64_t num_blocks_ = 0;
   // Per-block attention-cache bytes as reported by the KV spec (see the
   // fa_page_size_bytes() accessor).
@@ -710,6 +717,9 @@ class GPUModelRunner final : public ModelRunnerBase {
     int num_reqs = 0;
     StepInputs step;
     CommonAttentionMetadata attn_meta;
+    // Optional sliding-window group meta (Gemma-4 SWA physical). Default-empty
+    // num_reqs==0 means absent; models that ignore it stay byte-identical.
+    CommonAttentionMetadata slide_attn_meta;
     GDNAttentionMetadata gdn_meta;
     std::vector<std::string> req_ids;  // dense order (== input_batch order)
     // SPEC-MTP I5d: the target's post-final-norm [T,H] hidden tap captured this

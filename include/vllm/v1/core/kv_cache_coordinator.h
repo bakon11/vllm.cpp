@@ -176,13 +176,28 @@ class KVCacheCoordinator {
   bool enable_caching;
   int scheduler_block_size;
   // The BlockPool owned + shared by all managers (upstream self.block_pool).
+  // When group_num_blocks is set (Gemma-4 SWA physical), this is the pool for
+  // group 0 (typically full-attention); additional groups get private pools in
+  // group_pools_ and managers reference those instead.
   BlockPool block_pool;
+  // Extra per-group pools (owned). Empty when all groups share block_pool.
+  std::vector<std::unique_ptr<BlockPool>> group_pools_;
+  // Parallel to single_type_managers: which pool each manager uses.
+  std::vector<BlockPool*> manager_pools_;
   // KV cache group indices that get the EAGLE last-block drop.
   std::set<int> eagle_group_ids;
   // One manager per kv cache group (built by the spec->manager factory).
   std::vector<std::unique_ptr<SingleTypeKVCacheManager>> single_type_managers;
   // Dense caching (nullopt) is the only path the gate models exercise.
   std::optional<int> retention_interval = std::nullopt;
+
+  // Per-group free-block check for multi-pool SWA (falls back to summing against
+  // block_pool when group_pools_ is empty).
+  bool can_allocate_across_groups(
+      const std::string& request_id, int num_tokens,
+      const KVCacheBlocksTuple& new_computed_blocks, int num_encoder_tokens,
+      int total_computed_tokens, int num_tokens_main_model,
+      bool apply_admission_cap, int watermark_blocks, int reserved_blocks) const;
 
  protected:
   KVCacheCoordinator(KVCacheConfig kv_cache_config, int max_model_len,

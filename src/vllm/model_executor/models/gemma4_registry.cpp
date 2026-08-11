@@ -16,6 +16,8 @@
 
 #include <set>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -156,19 +158,19 @@ ForwardLogits ForwardGemma4ForConditionalGeneration(
         Gemma4Model::ForwardMm(*mm.inputs_embeds_bf16, *mm.ple_token_ids,
                                input.positions, input.attn_meta, input.attn_kv,
                                weights, input.config, input.queue,
-                               input.logits_indices),
+                               input.logits_indices, input.slide_attn_meta),
         input.config.vocab_size);
   }
   if (input.gather_logits) {
     return Gemma4Model::ForwardDevice(input.token_ids, input.positions,
                                       input.attn_meta, input.attn_kv, weights,
                                       input.config, input.queue,
-                                      input.logits_indices);
+                                      input.logits_indices, input.slide_attn_meta);
   }
   return HostLogits(
       Gemma4Model::Forward(input.token_ids, input.positions, input.attn_meta,
                            input.attn_kv, weights, input.config, input.queue,
-                           input.logits_indices),
+                           input.logits_indices, input.slide_attn_meta),
       input.config.vocab_size);
 }
 
@@ -190,16 +192,15 @@ void ParseGemma4ForConditionalGenerationConfig(const HfConfig& config) {
 v1::KVCacheConfig MakeGemma4ForConditionalGenerationKVCache(const HfConfig& config,
                                                             int block_size,
                                                             int num_blocks) {
-  // TRUE topology (G1b LANDED): TWO head dims — sliding layers head_dim=256,
-  // full_attention layers global_head_dim=512, both num_key_value_heads=2, plus
-  // YOCO KV-sharing on the last num_kv_shared_layers. The runner now consumes a
-  // PER-LAYER attention spec (`per_layer_attn_specs`, runner.cpp G1b), so each
-  // non-GDN layer allocates + views its own head_dim. The single group below
-  // still drives the (head_dim-independent) block table / KV manager; its spec
-  // carries the LARGER head_dim as an honest per-page upper bound.
-  // HfConfig::raw is the FULL config.json (hf_config.cpp:414); Gemma-4's
-  // global_head_dim / layer_types are nested under `text_config` in the mm
-  // wrapper, so resolve that view (top-level for a plain config).
+  // TRUE topology (G1b + SWA physical 2026-08-11):
+  //   - sliding layers: head_dim=256, Hkv=8, SlidingWindowSpec (window-scoped
+  //     physical pool + per-layer tensor size)
+  //   - full_attention layers: global_head_dim=512, Hkv=2, FullAttentionSpec
+  // Hybrid coordinator (2 attention groups) + group_num_blocks gives the long-ctx
+  // VRAM win: ~5 GiB KV @262k vs ~55 GiB full-store.
+  // Opt out: VT_GEMMA4_SWA_PHYSICAL=0 → legacy single FullAttention group.
+  // HfConfig::raw is the FULL config.json; Gemma-4 text scalars live under
+  // text_config in the mm wrapper.
   const nlohmann::json& raw =
       (config.raw.contains("text_config") && config.raw.at("text_config").is_object())
           ? config.raw.at("text_config")
@@ -218,6 +219,11 @@ v1::KVCacheConfig MakeGemma4ForConditionalGenerationKVCache(const HfConfig& conf
       it != raw.end() && it->is_number_integer()) {
     head_dim_full = it->get<int>();
   }
+  int sliding_window = 0;
+  if (const auto it = raw.find("sliding_window");
+      it != raw.end() && it->is_number_integer()) {
+    sliding_window = it->get<int>();
+  }
   const vt::DType kv_dtype = v1::ResolveKvCacheDType();
   const int64_t L = config.num_hidden_layers;
 
@@ -231,20 +237,106 @@ v1::KVCacheConfig MakeGemma4ForConditionalGenerationKVCache(const HfConfig& conf
     }
   }
 
+  const bool swa_physical = [] {
+    const char* e = std::getenv("VT_GEMMA4_SWA_PHYSICAL");
+    // Default ON when sliding_window is present; explicit 0 disables.
+    if (e != nullptr && e[0] == '0') return false;
+    return true;
+  }();
+
   v1::KVCacheConfig kv;
   kv.num_blocks = num_blocks;
-  kv.kv_cache_groups.emplace_back(
-      std::vector<std::string>{"fa"},
-      std::make_shared<v1::FullAttentionSpec>(
-          block_size, std::max(num_kv_heads, num_kv_heads_full),
-          std::max(head_dim_sliding, head_dim_full), kv_dtype));
   kv.per_layer_attn_specs.reserve(static_cast<size_t>(L));
+
+  const bool use_hybrid_swa =
+      swa_physical && sliding_window > 0 &&
+      std::any_of(is_full.begin(), is_full.end(), [](bool f) { return !f; }) &&
+      std::any_of(is_full.begin(), is_full.end(), [](bool f) { return f; });
+
+  if (!use_hybrid_swa) {
+    // Legacy single-group path (byte-identical to pre-SWA-physical).
+    kv.kv_cache_groups.emplace_back(
+        std::vector<std::string>{"fa"},
+        std::make_shared<v1::FullAttentionSpec>(
+            block_size, std::max(num_kv_heads, num_kv_heads_full),
+            std::max(head_dim_sliding, head_dim_full), kv_dtype));
+    for (int64_t l = 0; l < L; ++l) {
+      const bool full = is_full[static_cast<size_t>(l)];
+      const int hd = full ? head_dim_full : head_dim_sliding;
+      const int hkv = full ? num_kv_heads_full : num_kv_heads;
+      kv.per_layer_attn_specs.push_back(std::make_shared<v1::FullAttentionSpec>(
+          block_size, hkv, hd, kv_dtype));
+    }
+    return kv;
+  }
+
+  // Hybrid: group 0 = full attention layers, group 1 = sliding-window layers.
+  std::vector<std::string> full_names;
+  std::vector<std::string> slide_names;
+  full_names.reserve(static_cast<size_t>(L));
+  slide_names.reserve(static_cast<size_t>(L));
   for (int64_t l = 0; l < L; ++l) {
-    const bool full = is_full[static_cast<size_t>(l)];
-    const int hd = full ? head_dim_full : head_dim_sliding;
-    const int hkv = full ? num_kv_heads_full : num_kv_heads;
-    kv.per_layer_attn_specs.push_back(std::make_shared<v1::FullAttentionSpec>(
-        block_size, hkv, hd, kv_dtype));
+    const std::string name = "layers." + std::to_string(l) + ".attn";
+    if (is_full[static_cast<size_t>(l)]) {
+      full_names.push_back(name);
+    } else {
+      slide_names.push_back(name);
+    }
+  }
+
+  auto full_spec = std::make_shared<v1::FullAttentionSpec>(
+      block_size, num_kv_heads_full, head_dim_full, kv_dtype);
+  auto slide_spec = std::make_shared<v1::SlidingWindowSpec>(
+      block_size, num_kv_heads, head_dim_sliding, kv_dtype, sliding_window);
+
+  kv.kv_cache_groups.emplace_back(std::move(full_names), full_spec);
+  kv.kv_cache_groups.emplace_back(std::move(slide_names), slide_spec);
+
+  // Full group keeps the serve num_blocks (max_model_len capacity).
+  // Sliding group: admission cap for one long request (+null block headroom).
+  // make_kv_cache does not see max_num_batched_tokens — use serve default
+  // (8192) or VT_MAX_NUM_BATCHED_TOKENS so the pool covers window+batch, not
+  // just the window (lab 2026-08-11: batch=window undersized → admit abort).
+  const int batch_for_swa = [] {
+    if (const char* e = std::getenv("VT_MAX_NUM_BATCHED_TOKENS");
+        e != nullptr && e[0] != '\0') {
+      const int v = std::atoi(e);
+      if (v > 0) return v;
+    }
+    if (const char* e = std::getenv("MAX_NUM_BATCHED_TOKENS");
+        e != nullptr && e[0] != '\0') {
+      const int v = std::atoi(e);
+      if (v > 0) return v;
+    }
+    return 8192;
+  }();
+  const int slide_blocks = slide_spec->max_admission_blocks_per_request(
+      batch_for_swa, /*max_model_len=*/num_blocks * block_size);
+  // max_num_seqs=1 lab default: one request's window footprint. Multi-seq
+  // would need ×max_num_seqs — override via VT_GEMMA4_SWA_POOL_BLOCKS.
+  // +1: BlockPool reserves block 0 as null → free starts at N-1; admission
+  // needs the full max_admission footprint (lab admit abort @ N=max_admission).
+  int slide_pool = std::max(slide_blocks + 1, 2);
+  if (const char* e = std::getenv("VT_GEMMA4_SWA_POOL_BLOCKS");
+      e != nullptr && e[0] != '\0') {
+    const int v = std::atoi(e);
+    if (v >= 2) slide_pool = v;
+  }
+  kv.group_num_blocks = {num_blocks, slide_pool};
+  std::fprintf(stderr,
+               "INFO gemma4 SWA physical: groups=full+slide full_blocks=%d "
+               "slide_blocks=%d (batch_for_swa=%d window=%d max_admission=%d)\n",
+               num_blocks, slide_pool, batch_for_swa, sliding_window,
+               slide_blocks);
+
+  for (int64_t l = 0; l < L; ++l) {
+    if (is_full[static_cast<size_t>(l)]) {
+      kv.per_layer_attn_specs.push_back(std::make_shared<v1::FullAttentionSpec>(
+          block_size, num_kv_heads_full, head_dim_full, kv_dtype));
+    } else {
+      kv.per_layer_attn_specs.push_back(std::make_shared<v1::SlidingWindowSpec>(
+          block_size, num_kv_heads, head_dim_sliding, kv_dtype, sliding_window));
+    }
   }
   return kv;
 }

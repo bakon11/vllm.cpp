@@ -18,6 +18,7 @@
 #include "vt/dtype.h"
 #include "vt/fused_ops.h"
 #include "vt/ops.h"
+#include "vt/rocm/rocm_gelu_mul_sep.h"
 
 namespace vllm {
 namespace {
@@ -119,30 +120,61 @@ bool UploadFp8NativeLayer(Gemma4FusedExperts& ex, int dev) {
     return false;
 
   std::vector<uint8_t> gu_pack(gu_one);
+  // VT_GEMMA4_GU_INTERLEAVE=1 → row order (g0,u0,g1,u1,…) so gate_i|up_i are adjacent
+  // (H bytes apart vs I*H). Decode GEMV BW locality; MatmulBT N=2I still valid.
+  static const bool gu_interleave = [] {
+    const char* e = std::getenv("VT_GEMMA4_GU_INTERLEAVE");
+    return e && e[0] == '1';
+  }();
   for (int64_t e = 0; e < E; ++e) {
     auto& fex = ex.fp8[static_cast<size_t>(e)];
     VT_CHECK(fex.gate_w.HasHostBytes() && fex.up_w.HasHostBytes() && fex.down_w.HasHostBytes(),
              "fp8 native resident: missing weights");
     VT_CHECK(fex.gate_s.HasHostBytes() && fex.up_s.HasHostBytes() && fex.down_s.HasHostBytes(),
              "fp8 native resident: missing scales");
-    // Pack gate|up FP8 contiguous [2I, H]
     const size_t half = static_cast<size_t>(I * H);
-    std::memcpy(gu_pack.data(), fex.gate_w.bytes.data(), half);
-    std::memcpy(gu_pack.data() + half, fex.up_w.bytes.data(), half);
+    const auto* gate = reinterpret_cast<const uint8_t*>(fex.gate_w.bytes.data());
+    const auto* up = reinterpret_cast<const uint8_t*>(fex.up_w.bytes.data());
+    if (gu_interleave) {
+      for (int64_t i = 0; i < I; ++i) {
+        std::memcpy(gu_pack.data() + static_cast<size_t>(2 * i) * static_cast<size_t>(H),
+                    gate + static_cast<size_t>(i) * static_cast<size_t>(H),
+                    static_cast<size_t>(H));
+        std::memcpy(gu_pack.data() + static_cast<size_t>(2 * i + 1) * static_cast<size_t>(H),
+                    up + static_cast<size_t>(i) * static_cast<size_t>(H), static_cast<size_t>(H));
+      }
+    } else {
+      // Pack gate|up FP8 contiguous [2I, H] split halves
+      std::memcpy(gu_pack.data(), gate, half);
+      std::memcpy(gu_pack.data() + half, up, half);
+    }
     Check(hipMemcpy(static_cast<char*>(gu) + static_cast<size_t>(e) * gu_one, gu_pack.data(),
                     gu_one, hipMemcpyHostToDevice),
           "H2D fp8 gu");
     Check(hipMemcpy(static_cast<char*>(dn) + static_cast<size_t>(e) * dn_one,
                     fex.down_w.bytes.data(), dn_one, hipMemcpyHostToDevice),
           "H2D fp8 dn");
-    // scales: gate then up → [2I]
-    Check(hipMemcpy(static_cast<char*>(sgu) + static_cast<size_t>(e) * sgu_one,
-                    fex.gate_s.bytes.data(), static_cast<size_t>(I) * 2, hipMemcpyHostToDevice),
-          "H2D sgu g");
-    Check(hipMemcpy(static_cast<char*>(sgu) + static_cast<size_t>(e) * sgu_one +
-                        static_cast<size_t>(I) * 2,
-                    fex.up_s.bytes.data(), static_cast<size_t>(I) * 2, hipMemcpyHostToDevice),
-          "H2D sgu u");
+    // scales
+    std::vector<uint16_t> sgu_pack(static_cast<size_t>(2 * I));
+    const auto* gs = reinterpret_cast<const uint16_t*>(fex.gate_s.bytes.data());
+    const auto* us = reinterpret_cast<const uint16_t*>(fex.up_s.bytes.data());
+    if (gu_interleave) {
+      for (int64_t i = 0; i < I; ++i) {
+        sgu_pack[static_cast<size_t>(2 * i)] = gs[i];
+        sgu_pack[static_cast<size_t>(2 * i + 1)] = us[i];
+      }
+      Check(hipMemcpy(static_cast<char*>(sgu) + static_cast<size_t>(e) * sgu_one, sgu_pack.data(),
+                      sgu_one, hipMemcpyHostToDevice),
+            "H2D sgu pair");
+    } else {
+      Check(hipMemcpy(static_cast<char*>(sgu) + static_cast<size_t>(e) * sgu_one,
+                      fex.gate_s.bytes.data(), static_cast<size_t>(I) * 2, hipMemcpyHostToDevice),
+            "H2D sgu g");
+      Check(hipMemcpy(static_cast<char*>(sgu) + static_cast<size_t>(e) * sgu_one +
+                          static_cast<size_t>(I) * 2,
+                      fex.up_s.bytes.data(), static_cast<size_t>(I) * 2, hipMemcpyHostToDevice),
+            "H2D sgu u");
+    }
     Check(hipMemcpy(static_cast<char*>(sdn) + static_cast<size_t>(e) * sdn_one,
                     fex.down_s.bytes.data(), sdn_one, hipMemcpyHostToDevice),
           "H2D sdn");
@@ -167,9 +199,14 @@ bool UploadFp8NativeLayer(Gemma4FusedExperts& ex, int dev) {
   ex.fp8_sgu_base = sgu;
   ex.fp8_sdn_base = sdn;
   ex.fp8_native_resident = true;
+  ex.gu_pair_interleave = gu_interleave;
   ex.gate_up_dev = nullptr;
   ex.down_dev = nullptr;
   ex.dev_id = dev;
+  if (gu_interleave) {
+    std::fprintf(stderr, "INFO gemma4 fp8-native gu_pair_interleave=1 (gate|up adjacent rows)\n");
+    std::fflush(stderr);
+  }
   return true;
 }
 
@@ -754,7 +791,14 @@ bool RunGemma4Fp8ExpertGeGLUPrefillOnExpertDevice(vt::Queue& compute_q, int expe
     vt::Tensor gu_act = vt::Tensor::Contiguous(tls.gu_act, vt::DType::kBF16, dev, {M, 2 * I});
     vt::Tensor act = vt::Tensor::Contiguous(tls.act, vt::DType::kBF16, dev, {M, I});
     vt::MatmulBT(compute_q, gu_act, x, gu_w);
-    vt::GeluAndMul(compute_q, act, gu_act);
+    static const bool gu_pair = [] {
+      const char* e = std::getenv("VT_GEMMA4_GU_INTERLEAVE");
+      return e && e[0] == '1';
+    }();
+    if (gu_pair)
+      vt::rocm::GeluAndMulPairRocm(compute_q, act, gu_act);
+    else
+      vt::GeluAndMul(compute_q, act, gu_act);
     vt::MatmulBTAlphaBeta(compute_q, y_compute, act.data, tls.dn_w, M, H, I, 1.f, 0.f,
                           vt::DType::kBF16);
     return true;
@@ -868,7 +912,14 @@ bool RunGemma4Fp8ExpertGeGLUPrefillOnExpertDevice(vt::Queue& compute_q, int expe
   vt::Tensor gu_act = vt::Tensor::Contiguous(tls.gu_act, vt::DType::kBF16, edev, {M, 2 * I});
   vt::Tensor act = vt::Tensor::Contiguous(tls.act, vt::DType::kBF16, edev, {M, I});
   vt::MatmulBT(tls.eq, gu_act, x, gu_w);
-  vt::GeluAndMul(tls.eq, act, gu_act);
+  static const bool gu_pair = [] {
+    const char* e = std::getenv("VT_GEMMA4_GU_INTERLEAVE");
+    return e && e[0] == '1';
+  }();
+  if (gu_pair)
+    vt::rocm::GeluAndMulPairRocm(tls.eq, act, gu_act);
+  else
+    vt::GeluAndMul(tls.eq, act, gu_act);
   vt::MatmulBTAlphaBeta(tls.eq, tls.y, act.data, tls.dn_w, M, H, I, 1.f, 0.f, vt::DType::kBF16);
 
   if (hipEventRecord(tls.ev_e, est) != hipSuccess) return false;

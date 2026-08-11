@@ -20,6 +20,7 @@
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/fused_ops.h"
+#include "vt/rocm/rocm_gelu_mul_sep.h"
 
 namespace vllm {
 namespace {
@@ -29,6 +30,21 @@ using dense_attn::Dev;
 using dense_attn::ResidentWeight;
 using vt::DType;
 using vt::Tensor;
+
+// Match UploadFp8NativeLayer / ExpertGeGLU act: pair-interleaved gu rows.
+inline bool GuPairInterleave() {
+  static const bool v = [] {
+    const char* e = std::getenv("VT_GEMMA4_GU_INTERLEAVE");
+    return e && e[0] == '1';
+  }();
+  return v;
+}
+inline void GeluGateUp(vt::Queue& q, Tensor& act, const Tensor& gu_act) {
+  if (GuPairInterleave())
+    vt::rocm::GeluAndMulPairRocm(q, act, gu_act);
+  else
+    vt::GeluAndMul(q, act, gu_act);
+}
 
 // Scratch reused across top-k experts within a token (and host H2D weight slots).
 struct ExpertScratch {
@@ -124,7 +140,7 @@ void ExpertGeGLUFp8Native(Dev d, DBuf& out, const Tensor& x, const void* fp8_gu,
   Tensor gu_act = Tensor::Contiguous(s.gu.ptr(), DType::kBF16, dev, {T, 2 * I});
   Tensor act = Tensor::Contiguous(s.act.ptr(), DType::kBF16, dev, {T, I});
   vt::MatmulBT(d.q, gu_act, x, gu_w);
-  vt::GeluAndMul(d.q, act, gu_act);
+  GeluGateUp(d.q, act, gu_act);
   vt::MatmulBTAlphaBeta(d.q, out.ptr(), act.data, s.down_w.ptr(), static_cast<int>(T),
                         static_cast<int>(H), static_cast<int>(I), alpha, beta, DType::kBF16);
 }
@@ -167,7 +183,7 @@ bool ExpertGeGLUFp8TopKFusedGelu(Dev d, DBuf& ysum, const Tensor& x, const void*
                                      {G, 2 * I});
   Tensor act_all = Tensor::Contiguous(static_cast<uint16_t*>(tls.act->ptr()), DType::kBF16, dev,
                                       {G, I});
-  vt::GeluAndMul(d.q, act_all, gu_all);
+  GeluGateUp(d.q, act_all, gu_all);
   for (int g = 0; g < G; ++g) {
     const float alpha = wts[g];
     const float beta = (g == 0) ? 0.f : 1.f;
