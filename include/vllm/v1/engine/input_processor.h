@@ -69,6 +69,13 @@ class InputProcessor {
   // config is not retained).
   InputProcessor(const tok::Tokenizer& tokenizer, const HfConfig& config);
 
+  // Override serve window (e.g. --max-model-len). Call after construction when
+  // the operator ceiling is tighter than config.max_position_embeddings.
+  void set_max_model_len(int64_t max_model_len) {
+    if (max_model_len > 0) max_model_len_ = max_model_len;
+  }
+  int64_t max_model_len() const { return max_model_len_; }
+
   // process_inputs (text path): validate + tokenize + build the request.
   // `params` is taken BY VALUE (upstream clones it); PostInit()/eos-wiring
   // mutate the local copy, never the caller's. Throws std::runtime_error via
@@ -121,6 +128,9 @@ class InputProcessor {
   void UpdateFromGenerationConfig(SamplingParams& params) const;
   // update_from_tokenizer (T0 no-op: bad_words is deferred).
   void UpdateFromTokenizer(SamplingParams& params) const;
+  // Reject prompt > max_model_len; set/clamp max_tokens to remaining window.
+  void ApplyContextBudget(const std::string& request_id, std::size_t prompt_len,
+                          SamplingParams& params) const;
 
   const tok::Tokenizer& tokenizer_;
   // NOTE: no `const HfConfig&` member. The constructor consumes the HfConfig

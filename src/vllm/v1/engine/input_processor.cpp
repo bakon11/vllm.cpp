@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -188,12 +189,7 @@ EngineCoreRequest InputProcessor::process_inputs(
   std::vector<int32_t> prompt_token_ids =
       tokenizer_.EncodeWithSpecialTokens(prompt);
 
-  // params is already our clone (passed by value). If unset max_tokens, then
-  // generate up to the max_model_len (input_processor.py:317-321).
-  if (!params.max_tokens.has_value()) {
-    const int64_t seq_len = static_cast<int64_t>(prompt_token_ids.size());
-    params.max_tokens = static_cast<int>(max_model_len_ - seq_len);
-  }
+  ApplyContextBudget(request_id, prompt_token_ids.size(), params);
 
   UpdateFromGenerationConfig(params);
   UpdateFromTokenizer(params);
@@ -220,10 +216,7 @@ EngineCoreRequest InputProcessor::process_inputs_tokens(
 
   const double t = arrival_time.has_value() ? *arrival_time : NowSeconds();
 
-  if (!params.max_tokens.has_value()) {
-    const int64_t seq_len = static_cast<int64_t>(prompt_token_ids.size());
-    params.max_tokens = static_cast<int>(max_model_len_ - seq_len);
-  }
+  ApplyContextBudget(request_id, prompt_token_ids.size(), params);
 
   UpdateFromGenerationConfig(params);
   UpdateFromTokenizer(params);
@@ -252,10 +245,7 @@ EngineCoreRequest InputProcessor::process_inputs_mm(
 
   const double t = arrival_time.has_value() ? *arrival_time : NowSeconds();
 
-  if (!params.max_tokens.has_value()) {
-    const int64_t seq_len = static_cast<int64_t>(prompt_token_ids.size());
-    params.max_tokens = static_cast<int>(max_model_len_ - seq_len);
-  }
+  ApplyContextBudget(request_id, prompt_token_ids.size(), params);
 
   UpdateFromGenerationConfig(params);
   UpdateFromTokenizer(params);
@@ -268,6 +258,49 @@ EngineCoreRequest InputProcessor::process_inputs_mm(
   request.priority = priority;
   request.mm_features = std::move(mm_features);
   return request;
+}
+
+void InputProcessor::ApplyContextBudget(const std::string& request_id,
+                                        std::size_t prompt_len,
+                                        SamplingParams& params) const {
+  // Fail closed when the prompt alone exceeds the serve window. Previously the
+  // engine could accept oversized Hermes SOUL+history and spin forever in WAITING
+  // (idle GPU + SSE keepalives) until KV fail-fast aborted — if at all.
+  if (max_model_len_ <= 0) {
+    throw std::runtime_error("input_processor: max_model_len is not configured");
+  }
+  const int64_t plen = static_cast<int64_t>(prompt_len);
+  if (plen > max_model_len_) {
+    throw std::runtime_error(
+        "prompt too long for this server: prompt_tokens=" +
+        std::to_string(plen) + " max_model_len=" +
+        std::to_string(max_model_len_) + " request_id=" + request_id +
+        ". Shrink system/tools/history, raise --max-model-len/--num-blocks, "
+        "or enable compression on the client.");
+  }
+  const int room = static_cast<int>(max_model_len_ - plen);
+  if (room <= 0) {
+    throw std::runtime_error(
+        "no remaining context for generation: prompt_tokens=" +
+        std::to_string(plen) + " max_model_len=" +
+        std::to_string(max_model_len_) + " request_id=" + request_id);
+  }
+  // Unset max_tokens → fill remaining window (upstream input_processor.py).
+  if (!params.max_tokens.has_value() || *params.max_tokens <= 0) {
+    params.max_tokens = room;
+    return;
+  }
+  // Positive client max_tokens: clamp to remaining so prompt+gen cannot exceed
+  // max_model_len (stops near-ceiling hangs with finish never firing).
+  if (*params.max_tokens > room) {
+    std::fprintf(stderr,
+                 "INFO input_processor: clamp max_tokens %d -> %d "
+                 "(prompt_tokens=%lld max_model_len=%lld id=%s)\n",
+                 *params.max_tokens, room, static_cast<long long>(plen),
+                 static_cast<long long>(max_model_len_), request_id.c_str());
+    std::fflush(stderr);
+    params.max_tokens = room;
+  }
 }
 
 }  // namespace vllm::v1

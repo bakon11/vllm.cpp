@@ -419,7 +419,9 @@ class ChatSseStream final : public SseStream {
         std::optional<RequestOutput> ready =
             engine_.get_output_nowait(*async_request_);
         if (!ready.has_value()) {
-          if (MaybeSsePing(chunk)) return true;
+          // Queued but no RequestOutput yet: usually prefill, can also be stall.
+          if (MaybeSsePing(chunk, gen_started_ ? "decode_stall" : "engine_wait"))
+            return true;
           std::this_thread::sleep_for(std::chrono::milliseconds(50));
           continue;
         }
@@ -436,7 +438,7 @@ class ChatSseStream final : public SseStream {
           }
           return next(chunk);
         }
-        if (MaybeSsePing(chunk)) return true;
+        if (MaybeSsePing(chunk, "empty_output")) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         continue;
       }
@@ -604,13 +606,16 @@ class ChatSseStream final : public SseStream {
         throw std::runtime_error("stream aborted before engine queue");
       }
       lock.unlock();
-      if (MaybeSsePing(chunk)) return false;
+      if (MaybeSsePing(chunk, "queue_wait")) return false;
       lock.lock();
       queue_cv_.wait_for(lock, std::chrono::milliseconds(50));
     }
   }
 
-  bool MaybeSsePing(std::string& chunk) {
+  // Keepalive when the stream has no engine payload yet. `reason` is honest:
+  // queue_wait | engine_wait | decode_stall | empty_output.
+  // Never hardcode prefill_wait=1 (that misled ops for hung jobs).
+  bool MaybeSsePing(std::string& chunk, const char* reason) {
     const int interval = SsePingIntervalSec();
     if (interval <= 0) return false;
     const auto now = std::chrono::steady_clock::now();
@@ -631,7 +636,12 @@ class ChatSseStream final : public SseStream {
     chunk = std::string(kSsePingFrame) + "data: " + nlohmann::json(frame).dump() +
             "\n\n";
     if (GetRequestLogConfig().debug_stages) {
-      ChatDbg(response_id_, "stage=sse_ping prefill_wait=1");
+      const double waited =
+          std::chrono::duration<double>(now - stream_t0_).count();
+      ChatDbg(response_id_,
+              std::string("stage=sse_ping reason=") + reason +
+                  " gen_started=" + (gen_started_ ? "1" : "0") +
+                  " waited_s=" + std::to_string(waited));
     }
     return true;
   }
@@ -671,6 +681,7 @@ class ChatSseStream final : public SseStream {
   bool gen_started_ = false;
   std::chrono::steady_clock::time_point gen_start_{};
   std::chrono::steady_clock::time_point last_dbg_{std::chrono::steady_clock::now()};
+  std::chrono::steady_clock::time_point stream_t0_{std::chrono::steady_clock::now()};
   std::chrono::steady_clock::time_point last_ping_{std::chrono::steady_clock::now()};
 };
 

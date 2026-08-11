@@ -1393,3 +1393,55 @@ TEST_CASE(
   CHECK(out.num_scheduled_tokens.at(req_id) == 1);
   CHECK(out.scheduled_spec_decode_tokens.empty());
 }
+
+// Fail-fast unschedulable waiting (lab 2026-08-09 Hermes SOUL / tiny KV).
+// ---------------------------------------------------------------------------
+TEST_CASE("Scheduler.abort_unschedulable_waiting: aborts prompt that cannot fit KV") {
+  // ~64 token capacity (4 blocks × 16). Full-ISL reserve rejects a 200-token prompt.
+  auto scheduler = CreateScheduler(/*max_num_seqs=*/4, /*max_num_batched_tokens=*/8192,
+                                   /*enable_chunked_prefill=*/true, /*num_blocks=*/4,
+                                   /*block_size=*/16, /*max_model_len=*/8192);
+  auto requests = CreateRequests(/*num_requests=*/1, /*num_tokens=*/200);
+  const std::string id = requests[0]->request_id;
+  AddRequest(*scheduler, std::move(requests[0]));
+
+  CHECK(scheduler->get_num_unfinished_requests() == 1);
+  auto aborted = scheduler->abort_unschedulable_waiting();
+  REQUIRE(aborted.size() == 1);
+  CHECK(aborted[0] == id);
+  CHECK(scheduler->get_num_unfinished_requests() == 0);
+}
+
+TEST_CASE("Scheduler.abort_unschedulable_waiting: leaves admittable waiters alone") {
+  // Plenty of blocks — probe allocate succeeds; nothing aborted.
+  auto scheduler = CreateScheduler(/*max_num_seqs=*/4, /*max_num_batched_tokens=*/8192,
+                                   /*enable_chunked_prefill=*/true, /*num_blocks=*/1000,
+                                   /*block_size=*/16, /*max_model_len=*/8192);
+  auto requests = CreateRequests(/*num_requests=*/2, /*num_tokens=*/32);
+  AddRequest(*scheduler, std::move(requests[0]));
+  AddRequest(*scheduler, std::move(requests[1]));
+
+  auto aborted = scheduler->abort_unschedulable_waiting();
+  CHECK(aborted.empty());
+  CHECK(scheduler->get_num_unfinished_requests() == 2);
+  // schedule() can still admit them
+  auto out = scheduler->schedule();
+  CHECK(out.scheduled_new_reqs.size() == 2);
+}
+
+TEST_CASE("Scheduler.abort_unschedulable_waiting: no-op while running is non-empty") {
+  auto scheduler = CreateScheduler(/*max_num_seqs=*/2, /*max_num_batched_tokens=*/8192,
+                                   /*enable_chunked_prefill=*/true, /*num_blocks=*/1000,
+                                   /*block_size=*/16, /*max_model_len=*/8192);
+  auto ok = CreateRequests(1, /*num_tokens=*/8);
+  AddRequest(*scheduler, std::move(ok[0]));
+  auto out = scheduler->schedule();
+  CHECK(out.scheduled_new_reqs.size() == 1);
+
+  // Add a huge waiter while first is running — abort must not fire (running non-empty).
+  auto huge = CreateRequests(1, /*num_tokens=*/500, {"huge"});
+  AddRequest(*scheduler, std::move(huge[0]));
+  auto aborted = scheduler->abort_unschedulable_waiting();
+  CHECK(aborted.empty());
+  CHECK(scheduler->get_num_unfinished_requests() >= 2);
+}

@@ -1011,6 +1011,10 @@ LoadedEngine::LoadedEngine(HfConfig config,
                               vllm::v1::sha256_cbor)
                         : nullptr),
       engine_(input_processor_, engine_core_, output_processor_, block_hasher_) {
+  // Align InputProcessor budget with the serve window (scheduler / KV), not only
+  // HF max_position_embeddings — otherwise oversized Hermes prompts pass the
+  // processor and hang in WAITING against a smaller --num-blocks pool.
+  input_processor_.set_max_model_len(max_model_len_);
   (void)hash_ready_;
   // SPEC-DFLASH D5: wire the separately-loaded DFlash draft into the runner's
   // verify/propose loop. Done here (after runner_ is fully constructed, before
