@@ -5,6 +5,7 @@
 // M>1: weight stays FP8 — one dequant of W row into LDS, then all M acts (prefill batch).
 // No host/device expand of full expert packs to BF16.
 #include <hip/hip_bf16.h>
+#include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
 #include <vector>
 
@@ -16,10 +17,18 @@
 #include "vt/device.h"
 #include "vt/dtype.h"
 
+// rocWMMA FP8 expert tiles — gfx12 only (same gate as paged_attn SharedK).
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#include <rocwmma/rocwmma.hpp>
+#define VT_EXPERT_WMMA_OK 1
+#endif
+
 namespace vt::rocm {
 namespace {
 
 constexpr int kBlock = 256;
+// WMMA tile (gfx12 wave32 fp8×fp8→f32).
+constexpr int kWmma = 16;
 
 __device__ inline float F8E4M3ToF32(uint8_t byte) {
   const uint32_t sign = static_cast<uint32_t>(byte >> 7) & 0x1U;
@@ -918,6 +927,157 @@ __global__ void ExpertFp8DownTopKIndexedKernelHw(__hip_bfloat16* __restrict__ ys
   }
 }
 
+// --- FP8 WMMA ExpertGeGLU act (decode T=1, opt-in VT_GEMMA4_EXPERT_WMMA=1) -----
+// Quantize x_f → E4M3 once, then 16×16×16 fp8×fp8 WMMA tiles for gate/up GEMVs.
+// Down stays on ExpertFp8DownTopKIndexedKernelHw. Multi-wave mma forbidden (hang).
+
+__device__ inline float AtomicMaxFloat(float* addr, float val) {
+  int* iaddr = reinterpret_cast<int*>(addr);
+  int old = *iaddr, assumed;
+  do {
+    assumed = old;
+    const float old_f = __int_as_float(assumed);
+    if (old_f >= val) break;
+    old = atomicCAS(iaddr, assumed, __float_as_int(val));
+  } while (assumed != old);
+  return __int_as_float(old);
+}
+
+// Pass 1: absmax(|x|) into *sx_scratch (caller zeros to 0).
+__global__ void ExpertXAbsMaxKernel(float* __restrict__ sx_scratch, const float* __restrict__ x_f,
+                                    int H) {
+  __shared__ float sm[256];
+  const int tid = static_cast<int>(threadIdx.x);
+  float local = 0.f;
+  for (int i = static_cast<int>(blockIdx.x * blockDim.x + tid); i < H;
+       i += static_cast<int>(gridDim.x * blockDim.x)) {
+    local = fmaxf(local, fabsf(x_f[i]));
+  }
+  sm[tid] = local;
+  __syncthreads();
+#pragma unroll
+  for (int s = 128; s > 0; s >>= 1) {
+    if (tid < s) sm[tid] = fmaxf(sm[tid], sm[tid + s]);
+    __syncthreads();
+  }
+  if (tid == 0) AtomicMaxFloat(sx_scratch, sm[0]);
+}
+
+// Pass 2: sx = max(absmax/448, eps); x_f8 = E4M3(x/sx).
+__global__ void ExpertXQuantFp8Kernel(uint8_t* __restrict__ x_f8, float* __restrict__ sx_io,
+                                      const float* __restrict__ x_f, int H) {
+  __shared__ float ssx;
+  if (threadIdx.x == 0) {
+    float amax = *sx_io;
+    // OCP E4M3 finite max ≈ 448.
+    float sx = amax > 0.f ? (amax / 448.f) : 1.f;
+    if (sx < 1e-8f) sx = 1e-8f;
+    *sx_io = sx;
+    ssx = sx;
+  }
+  __syncthreads();
+  const float inv = 1.f / ssx;
+  for (int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); i < H;
+       i += static_cast<int>(gridDim.x * blockDim.x)) {
+    const float v = x_f[i] * inv;
+    x_f8[i] = static_cast<uint8_t>(
+        __hip_cvt_float_to_fp8(v, __HIP_SATFINITE, __HIP_E4M3));
+  }
+}
+
+// One warp / CTA: 16 intermediate rows × one expert. grid = (I/16)*G.
+// C = A_broadcast(x_f8) @ W^T  via rocWMMA fp8×fp8; scale by sx * channel.
+__global__ void ExpertFp8ActTopKIndexedKernelWmma(float* __restrict__ act,
+                                                  const uint8_t* __restrict__ x_f8,
+                                                  const float* __restrict__ sx_ptr,
+                                                  const uint8_t* __restrict__ gu_base,
+                                                  const __hip_bfloat16* __restrict__ sgu_base,
+                                                  const int32_t* __restrict__ idx, int G, int I,
+                                                  int H) {
+#if !defined(VT_EXPERT_WMMA_OK)
+  (void)act;
+  (void)x_f8;
+  (void)sx_ptr;
+  (void)gu_base;
+  (void)sgu_base;
+  (void)idx;
+  (void)G;
+  (void)I;
+  (void)H;
+#else
+  using namespace rocwmma;
+  constexpr int WM = kWmma;
+  const int n_it = I / WM;
+  if (n_it <= 0 || G <= 0) return;
+  const int bid = static_cast<int>(blockIdx.x);
+  const int g = bid / n_it;
+  const int t = bid - g * n_it;
+  if (g >= G) return;
+  const int i0 = t * WM;
+  const int tid = static_cast<int>(threadIdx.x);
+  // Single-wave CTA only.
+  if (tid >= 32) return;
+
+  __shared__ int se;
+  __shared__ float ssx;
+  __shared__ float s_c[WM * WM];
+  __shared__ float8_t s_a[WM * WM];
+  if (tid == 0) {
+    se = idx[g];
+    ssx = *sx_ptr;
+  }
+  __syncthreads();
+  const int e = se;
+  const float sx = ssx;
+  const size_t gu_one = static_cast<size_t>(2) * static_cast<size_t>(I) * static_cast<size_t>(H);
+  const size_t sgu_one = static_cast<size_t>(2) * static_cast<size_t>(I);
+  const uint8_t* gu = gu_base + static_cast<size_t>(e) * gu_one;
+  const __hip_bfloat16* sg = sgu_base + static_cast<size_t>(e) * sgu_one;
+  const float8_t* gu_f8 = reinterpret_cast<const float8_t*>(gu);
+  const float8_t* x8 = reinterpret_cast<const float8_t*>(x_f8);
+
+  auto run_half = [&](int row_base, float* out16) {
+    fragment<matrix_a, WM, WM, WM, float8_t, row_major> a_frag;
+    fragment<matrix_b, WM, WM, WM, float8_t, col_major> b_frag;
+    fragment<accumulator, WM, WM, WM, float> acc;
+    fill_fragment(acc, 0.f);
+    const float8_t* Wrow0 = gu_f8 + static_cast<size_t>(row_base) * static_cast<size_t>(H);
+    for (int k0 = 0; k0 < H; k0 += WM) {
+      // Broadcast x_f8[k0:k0+16] into 16×16 A (all rows equal).
+      for (int e2 = tid; e2 < WM * WM; e2 += 32) {
+        const int kk = e2 & (WM - 1);
+        s_a[e2] = x8[k0 + kk];
+      }
+      // matrix_b col_major ld=H: column n = weight row row_base+n, K along row.
+      __syncthreads();
+      load_matrix_sync(a_frag, s_a, WM);
+      load_matrix_sync(b_frag, Wrow0 + k0, H);
+      mma_sync(acc, a_frag, b_frag, acc);
+      __syncthreads();
+    }
+    store_matrix_sync(s_c, acc, WM, mem_row_major);
+    __syncthreads();
+    // A broadcast ⇒ all rows of C equal; take row 0.
+    if (tid < WM) out16[tid] = s_c[tid];
+    __syncthreads();
+  };
+
+  __shared__ float gate16[WM];
+  __shared__ float up16[WM];
+  run_half(i0, gate16);          // gate rows [i0,i0+16)
+  run_half(I + i0, up16);        // up rows
+
+  if (tid < WM) {
+    const int i = i0 + tid;
+    const float sgate = __bfloat162float(sg[i]);
+    const float sup = __bfloat162float(sg[I + i]);
+    const float gate = sx * gate16[tid];
+    const float up = sx * up16[tid];
+    act[static_cast<int64_t>(g) * I + i] = gelu_tanh(sgate * gate) * (sup * up);
+  }
+#endif  // VT_EXPERT_WMMA_OK
+}
+
 __global__ void ApplyExpertScaleRwKernel(float* __restrict__ rw, const int32_t* __restrict__ ri,
                                          const float* __restrict__ escale, int G, int E) {
   const int g = static_cast<int>(threadIdx.x);
@@ -929,8 +1089,11 @@ __global__ void ApplyExpertScaleRwKernel(float* __restrict__ rw, const int32_t* 
 struct IdxTls {
   float* d_act = nullptr;
   float* d_xf = nullptr;
+  uint8_t* d_xf8 = nullptr;
+  float* d_sx = nullptr;
   int act_cap = 0;
   int xf_cap = 0;
+  int xf8_cap = 0;
   int bound_dev = -1;
 };
 IdxTls& IdxTlsSlot(int dev) {
@@ -944,7 +1107,7 @@ bool EnsureIdxTls(int dev, int G, int I, int H) {
   auto& tls = IdxTlsSlot(dev);
   const int act_need = G * I;
   if (tls.bound_dev == dev && tls.d_act && tls.d_xf && tls.act_cap >= act_need &&
-      tls.xf_cap >= H)
+      tls.xf_cap >= H && tls.d_xf8 && tls.xf8_cap >= H && tls.d_sx)
     return true;  // hot path: no device API
   if (hipSetDevice(dev) != hipSuccess) return false;
   if (tls.bound_dev != dev) {
@@ -965,6 +1128,17 @@ bool EnsureIdxTls(int dev, int G, int I, int H) {
     tls.xf_cap = 0;
     if (hipMalloc(&tls.d_xf, static_cast<size_t>(H) * sizeof(float)) != hipSuccess) return false;
     tls.xf_cap = H;
+  }
+  if (tls.xf8_cap < H || !tls.d_xf8) {
+    if (tls.d_xf8) (void)hipFree(tls.d_xf8);
+    tls.d_xf8 = nullptr;
+    tls.xf8_cap = 0;
+    if (hipMalloc(&tls.d_xf8, static_cast<size_t>(H) * sizeof(uint8_t)) != hipSuccess)
+      return false;
+    tls.xf8_cap = H;
+  }
+  if (!tls.d_sx) {
+    if (hipMalloc(&tls.d_sx, sizeof(float)) != hipSuccess) return false;
   }
   return true;
 }
@@ -1010,13 +1184,48 @@ bool ExpertGeGLUFp8TopKIndexedRocm(Queue& q, void* ysum, const void* x, const vo
     if (e && e[0] == '0') return 0;
     return 1;
   }();
+  // VT_GEMMA4_EXPERT_WMMA=1 → FP8×FP8 WMMA act tiles (opt-in; quality+speed gated).
+  static const int expert_wmma = [] {
+    const char* e = std::getenv("VT_GEMMA4_EXPERT_WMMA");
+    if (e && e[0] == '1') return 1;
+    return 0;
+  }();
   static bool once_pack = false;
   if (!once_pack) {
     once_pack = true;
-    std::fprintf(stderr, "INFO ExpertGeGLU act_i_pack=%d fp8_hw_cvt=%d\n", act_pack, hw_cvt);
+    std::fprintf(stderr, "INFO ExpertGeGLU act_i_pack=%d fp8_hw_cvt=%d expert_wmma=%d\n", act_pack,
+                 hw_cvt, expert_wmma);
     std::fflush(stderr);
   }
-  if (hw_cvt) {
+
+#if defined(VT_EXPERT_WMMA_OK)
+  // Device TU sees gfx12 — WMMA kernel is real. Host-only compiles still launch
+  // when env is set (fat binary device side has the kernel).
+#endif
+  // Always allow launch path on this lab (HIP arches=gfx1201). Kernel is
+  // empty-stub on non-gfx12 device objects.
+  const bool wmma_ok =
+      expert_wmma && hw_cvt && (I % kWmma == 0) && (H % kWmma == 0) && (I / kWmma) > 0;
+
+  if (wmma_ok) {
+    // Quantize x_f → x_f8 + sx, WMMA act, HW down.
+    (void)hipMemsetAsync(tls.d_sx, 0, sizeof(float), st);
+    {
+      const int xt = 256;
+      const int xg = (H + xt - 1) / xt;
+      ExpertXAbsMaxKernel<<<xg, xt, 0, st>>>(tls.d_sx, tls.d_xf, H);
+      ExpertXQuantFp8Kernel<<<xg, xt, 0, st>>>(tls.d_xf8, tls.d_sx, tls.d_xf, H);
+    }
+    const unsigned n_it = static_cast<unsigned>(I / kWmma);
+    const unsigned grid_act = n_it * static_cast<unsigned>(G);
+    ExpertFp8ActTopKIndexedKernelWmma<<<grid_act, 32, 0, st>>>(
+        tls.d_act, tls.d_xf8, tls.d_sx, static_cast<const uint8_t*>(gu_base),
+        static_cast<const __hip_bfloat16*>(sgu_base), idx_dev, G, I, H);
+    const int grid_dn = (H + kBlock - 1) / kBlock;
+    ExpertFp8DownTopKIndexedKernelHw<<<grid_dn, kBlock, 0, st>>>(
+        static_cast<__hip_bfloat16*>(ysum), tls.d_act, static_cast<const uint8_t*>(dn_base),
+        static_cast<const __hip_bfloat16*>(sdn_base), idx_dev, wts_dev, G, I, H);
+  } else if (hw_cvt) {
     dim3 grid_act(static_cast<unsigned>(I));
     ExpertFp8ActTopKIndexedKernelHw<<<grid_act, kBlock, 0, st>>>(
         tls.d_act, tls.d_xf, static_cast<const uint8_t*>(gu_base),

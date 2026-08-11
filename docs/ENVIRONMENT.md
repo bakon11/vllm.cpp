@@ -128,6 +128,7 @@ portable/reference path. In normal operation leave them unset.
 | `VT_ATTN_DECODE_KV_SPLITS` | `0` | ROCm decode full-attn only: SGLang multi-CTA KV splits. `0`=off. `N`=fixed (lab cap 32). `auto`/`-1`=host max_seq_len pow2+CU-fill. Lab recipe `16` |
 | `VT_ATTN_DECODE_SLIDE_WARPS` | `8` | Sliding DecodeGqa K-warps (`8` or `16`). Lab recipe `16` (~+6–10% @23–30k) |
 | `VT_GEMMA4_FP8_HW_CVT` | `1` | ROCm ExpertGeGLU decode: gfx1201 OCP `__builtin_amdgcn_cvt_f32_fp8` dequant (no LDS LUT). Lab KEEP ~+8% @9–30k. `0` = shared LUT fallback |
+| `VT_GEMMA4_EXPERT_WMMA` | `0` | ROCm ExpertGeGLU **act** path: quantize x→E4M3 then rocWMMA fp8×fp8 16×16 tiles (gfx1201). Opt-in A/B; default OFF until quality+speed KEEP. Down stays HW scalar |
 | `VT_ATTN_DECODE_SPLIT_WARPS` | `8` | Full-attn Split1 K-warps. `16` only valid for `d<=256`; d=512 LDS OOB — clamped to 8 |
 | `VT_ATTN_DECODE_FULL_WINDOW` | off | Decode-only local window on full layers. A/B @23k+splits flat — keep off |
 | `VT_STEP_PROFILE` | off | Lab: stderr prep/fwd/sample µs on pure-decode steps (syncs queue; slows e2e) |
