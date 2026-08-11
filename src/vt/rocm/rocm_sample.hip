@@ -92,22 +92,44 @@ __global__ void SoftmaxK(float* out, const float* logits, int64_t v, bool log_so
 }
 
 // --- random sample (gumbel-max / exp noise) ---------------------------------
+// Parallel argmax over vocab. The 1-thread serial scan (cuda_sample.cu style)
+// is fine on fat CUDA SMs for ~128k vocab but on gfx1201 + Gemma-4 V=262144 it
+// costs ~0.5s/token and collapses Hermes (temp>0) decode to ~1.8 t/s while
+// greedy stays ~45 t/s. One block/row, kBlock threads, tree-reduce best score.
 __global__ void RandomSampleK(int64_t* out, const float* probs, const int64_t* seeds, int64_t v) {
   const int64_t row = blockIdx.x;
-  if (threadIdx.x != 0) return;
   const float* r = probs + row * v;
   const uint64_t seed = static_cast<uint64_t>(seeds[row]);
-  int64_t best = 0;
+  const int t = static_cast<int>(threadIdx.x);
+
   float best_v = kNegInf;
-  for (int64_t j = 0; j < v; ++j) {
+  int64_t best = 0;
+  for (int64_t j = t; j < v; j += kBlock) {
     const float qn = static_cast<float>(ExpNoise(seed, row, j));
-    const float score = r[j] / qn;
+    // Guard div-by-zero / denorm noise (should not happen with ExpNoise).
+    const float score = (qn > 0.0f) ? (r[j] / qn) : kNegInf;
     if (score > best_v) {
       best_v = score;
       best = j;
     }
   }
-  out[row] = best;
+
+  __shared__ float s_val[kBlock];
+  __shared__ int64_t s_idx[kBlock];
+  s_val[t] = best_v;
+  s_idx[t] = best;
+  __syncthreads();
+  for (int o = kBlock / 2; o > 0; o >>= 1) {
+    if (t < o) {
+      const float ov = s_val[t + o];
+      if (ov > s_val[t]) {
+        s_val[t] = ov;
+        s_idx[t] = s_idx[t + o];
+      }
+    }
+    __syncthreads();
+  }
+  if (t == 0) out[row] = s_idx[0];
 }
 
 // --- top-k / top-p (sort-free threshold, from cuda_sample) ------------------
@@ -378,7 +400,7 @@ void RandomSampleKernelRocm(Queue& q, Tensor& token_ids, const Tensor& probs,
                             const Tensor& seeds) {
   const int64_t n = probs.shape[0], v = probs.shape[1];
   if (n == 0 || v == 0) return;
-  RandomSampleK<<<static_cast<unsigned>(n), 1, 0, AsStream(q)>>>(
+  RandomSampleK<<<static_cast<unsigned>(n), kBlock, 0, AsStream(q)>>>(
       token_ids.Ptr<int64_t>(), probs.Ptr<float>(), seeds.Ptr<int64_t>(), v);
   Check(hipGetLastError(), "random_sample");
 }

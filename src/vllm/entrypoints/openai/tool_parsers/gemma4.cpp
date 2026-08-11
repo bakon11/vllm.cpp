@@ -553,16 +553,97 @@ nlohmann::ordered_json Gemma4ToolParser::ParseArray(const std::string& arr_str,
   return ParseGemmaArray(arr_str, partial);
 }
 
+// Bare `call:NAME{ARGS}` fallback — some decodes drop <|tool_call>/<tool_call|>
+// specials (text-only seam / free-form with structural tags off) but still emit
+// the call: body Hermes needs. Brace depth ignores content inside <|\"|> strings.
+void ScanBareCalls(const std::string& text, std::string& content_out,
+                   std::vector<GemmaCall>& calls_out) {
+  content_out.clear();
+  calls_out.clear();
+  std::size_t pos = 0;
+  const std::size_t n = text.size();
+  while (pos < n) {
+    const std::size_t s = text.find(kCall, pos);
+    if (s == std::string::npos) {
+      content_out += text.substr(pos);
+      break;
+    }
+    // Avoid matching inside identifiers ("callback:", paths, etc.).
+    if (s > 0) {
+      const char prev = text[s - 1];
+      if (std::isalnum(static_cast<unsigned char>(prev)) || prev == '_' ||
+          prev == '/') {
+        content_out += text.substr(pos, s + kCall.size() - pos);
+        pos = s + kCall.size();
+        continue;
+      }
+    }
+    content_out += text.substr(pos, s - pos);
+    const std::size_t name_start = s + kCall.size();
+    const std::size_t brace = text.find('{', name_start);
+    if (brace == std::string::npos) {
+      content_out += text.substr(s);
+      break;
+    }
+    GemmaCall call;
+    call.name = Strip(text.substr(name_start, brace - name_start));
+    call.has_name = !call.name.empty();
+    std::size_t i = brace + 1;
+    int depth = 1;
+    bool in_str = false;
+    while (i < n && depth > 0) {
+      if (!in_str && DelimAt(text, i)) {
+        in_str = true;
+        i += kDelimLen;
+        continue;
+      }
+      if (in_str) {
+        if (DelimAt(text, i)) {
+          in_str = false;
+          i += kDelimLen;
+          continue;
+        }
+        ++i;
+        continue;
+      }
+      if (text[i] == '{') {
+        ++depth;
+      } else if (text[i] == '}') {
+        --depth;
+        if (depth == 0) {
+          call.args_text = text.substr(brace + 1, i - (brace + 1));
+          call.complete = true;
+          ++i;
+          break;
+        }
+      }
+      ++i;
+    }
+    if (!call.complete) {
+      call.args_text = text.substr(brace + 1);
+      call.complete = false;
+      pos = n;
+    } else {
+      pos = i;
+    }
+    if (call.has_name) calls_out.push_back(std::move(call));
+  }
+}
+
 ExtractedToolCallInformation Gemma4ToolParser::extract_tool_calls(
     const std::string& model_output, const ChatCompletionRequest& request) {
-  // No start marker -> plain content (unmodified).
-  if (model_output.find(kStart) == std::string::npos) {
-    return ExtractedToolCallInformation{false, {}, model_output};
-  }
   try {
     std::string content;
     std::vector<GemmaCall> calls;
-    ScanBlocks(model_output, content, calls);
+    const bool has_wrapped = model_output.find(kStart) != std::string::npos;
+    if (has_wrapped) {
+      ScanBlocks(model_output, content, calls);
+    } else if (model_output.find(kCall) != std::string::npos) {
+      // Lab/Hermes free-form path: bare call:NAME{ARGS} without specials.
+      ScanBareCalls(model_output, content, calls);
+    } else {
+      return ExtractedToolCallInformation{false, {}, model_output};
+    }
 
     std::vector<ToolCall> tool_calls;
     for (const GemmaCall& c : calls) {
@@ -580,9 +661,14 @@ ExtractedToolCallInformation Gemma4ToolParser::extract_tool_calls(
       return ExtractedToolCallInformation{false, {}, model_output};
     }
 
-    // Content = text before the first <|tool_call>, stripped; None when empty.
+    // Content = text before the first tool marker, stripped; None when empty.
     std::optional<std::string> content_opt;
-    const std::size_t first = model_output.find(kStart);
+    std::size_t first = std::string::npos;
+    if (has_wrapped) {
+      first = model_output.find(kStart);
+    } else {
+      first = model_output.find(kCall);
+    }
     if (first != std::string::npos && first > 0) {
       const std::string c = Strip(model_output.substr(0, first));
       if (!c.empty()) content_opt = c;
@@ -604,7 +690,20 @@ std::optional<DeltaMessage> Gemma4ToolParser::extract_tool_calls_streaming(
   try {
     std::string content;
     std::vector<GemmaCall> calls;
-    ScanBlocks(current_text, content, calls);
+    if (current_text.find(kStart) != std::string::npos) {
+      ScanBlocks(current_text, content, calls);
+    } else if (current_text.find(kCall) != std::string::npos) {
+      ScanBareCalls(current_text, content, calls);
+    } else {
+      // Still stream plain content before any call marker appears.
+      if (current_text.size() > streamed_content_len_) {
+        DeltaMessage msg;
+        msg.content = current_text.substr(streamed_content_len_);
+        streamed_content_len_ = current_text.size();
+        return msg;
+      }
+      return std::nullopt;
+    }
 
     DeltaMessage msg;
     std::vector<DeltaToolCall> deltas;
