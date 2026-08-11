@@ -624,3 +624,133 @@ TEST_CASE("gemma4 stream: start tag split across chunks buffers cleanly") {
   CHECK(CollectName(r) == "get_weather");
   CHECK(Parsed(CollectArgs(r)) == nlohmann::json{{"location", "London"}});
 }
+
+// ── Maint-bot regressions (#328): bare + stream contracts ─────────────────────
+// Covers: wrapped, bare, prose containing `call:`, nested braces/string delims,
+// incomplete calls, and markers split across streaming chunks.
+
+TEST_CASE("gemma4 bare nonstream: complete call") {
+  Gemma4ToolParser p;
+  ChatCompletionRequest req = MakeRequest();
+  auto r = p.extract_tool_calls(
+      "call:get_weather{location:<|\"|>London<|\"|>}", req);
+  CHECK(r.tools_called);
+  REQUIRE(r.tool_calls.size() == 1);
+  CHECK(r.tool_calls[0].function.name == "get_weather");
+  CHECK(Parsed(r.tool_calls[0].function.arguments) ==
+        nlohmann::json{{"location", "London"}});
+  CHECK_FALSE(r.content.has_value());
+}
+
+TEST_CASE("gemma4 bare nonstream: prose prefix kept as content") {
+  Gemma4ToolParser p;
+  ChatCompletionRequest req = MakeRequest();
+  auto r = p.extract_tool_calls(
+      "Sure — call:get_weather{location:<|\"|>Paris<|\"|>}", req);
+  CHECK(r.tools_called);
+  REQUIRE(r.tool_calls.size() == 1);
+  CHECK(r.tool_calls[0].function.name == "get_weather");
+  REQUIRE(r.content.has_value());
+  CHECK(*r.content == "Sure —");
+}
+
+TEST_CASE("gemma4 bare nonstream: ordinary prose with call: substring not a tool") {
+  Gemma4ToolParser p;
+  ChatCompletionRequest req = MakeRequest();
+  // Identifier boundary: "callback:" must not become a tool call.
+  const std::string prose = "Use the callback: handler, not a tool.";
+  auto r = p.extract_tool_calls(prose, req);
+  CHECK_FALSE(r.tools_called);
+  REQUIRE(r.content.has_value());
+  CHECK(*r.content == prose);
+}
+
+TEST_CASE("gemma4 bare nonstream: nested braces and string delimiters") {
+  Gemma4ToolParser p;
+  ChatCompletionRequest req = MakeRequest();
+  // Nested object + delimiter-wrapped string that itself contains braces.
+  auto r = p.extract_tool_calls(
+      "call:search{input:{all:true,note:<|\"|>a{b}c<|\"|>}}", req);
+  CHECK(r.tools_called);
+  REQUIRE(r.tool_calls.size() == 1);
+  CHECK(r.tool_calls[0].function.name == "search");
+  auto args = Parsed(r.tool_calls[0].function.arguments);
+  CHECK(args["input"]["all"] == true);
+  CHECK(args["input"]["note"] == "a{b}c");
+}
+
+TEST_CASE("gemma4 bare nonstream: incomplete call stays plain content") {
+  Gemma4ToolParser p;
+  ChatCompletionRequest req = MakeRequest();
+  // No '{' yet — not a finished bare call; return unmodified.
+  auto r = p.extract_tool_calls("call:get_weather", req);
+  CHECK_FALSE(r.tools_called);
+  REQUIRE(r.content.has_value());
+  CHECK(*r.content == "call:get_weather");
+}
+
+TEST_CASE("gemma4 bare nonstream: wrapped still preferred over bare") {
+  Gemma4ToolParser p;
+  ChatCompletionRequest req = MakeRequest();
+  auto r = p.extract_tool_calls(
+      "<|tool_call>call:get_weather{location:<|\"|>London<|\"|>}<tool_call|>",
+      req);
+  CHECK(r.tools_called);
+  CHECK(r.tool_calls[0].function.name == "get_weather");
+}
+
+TEST_CASE("gemma4 stream bare: complete single call") {
+  Gemma4ToolParser p;
+  ChatCompletionRequest req = MakeRequest();
+  auto r = Stream(p,
+                  {"call:get_weather{", "location:<|\"|>London<|\"|>", "}"},
+                  req);
+  CHECK(CollectContent(r).empty());
+  CHECK(CollectName(r) == "get_weather");
+  CHECK(Parsed(CollectArgs(r)) == nlohmann::json{{"location", "London"}});
+}
+
+TEST_CASE("gemma4 stream bare: call: prefix split across chunks buffers") {
+  Gemma4ToolParser p;
+  ChatCompletionRequest req = MakeRequest();
+  auto r = Stream(p,
+                  {"ca", "ll:", "get_weather{", "location:<|\"|>Berlin<|\"|>", "}"},
+                  req);
+  // Partial "ca"/"ll:" must not leak as content before the bare call resolves.
+  CHECK(CollectContent(r).empty());
+  CHECK(CollectName(r) == "get_weather");
+  CHECK(Parsed(CollectArgs(r)) == nlohmann::json{{"location", "Berlin"}});
+}
+
+TEST_CASE("gemma4 stream bare: prose then bare call") {
+  Gemma4ToolParser p;
+  ChatCompletionRequest req = MakeRequest();
+  auto r = Stream(p,
+                  {"Let me check. ", "call:get_weather{",
+                   "location:<|\"|>Oslo<|\"|>", "}"},
+                  req);
+  CHECK(CollectContent(r).find("Let me check.") != std::string::npos);
+  CHECK(CollectName(r) == "get_weather");
+  CHECK(Parsed(CollectArgs(r)) == nlohmann::json{{"location", "Oslo"}});
+}
+
+TEST_CASE("gemma4 stream bare: incomplete call: does not leak as content mid-stream") {
+  Gemma4ToolParser p;
+  ChatCompletionRequest req = MakeRequest();
+  // Only a partial bare marker — buffer, no tool, no leaked "call".
+  auto r = Stream(p, {"call"}, req);
+  CHECK(CollectContent(r).empty());
+  CHECK(CollectName(r).empty());
+}
+
+TEST_CASE("gemma4 stream: start tag split across chunks buffers cleanly (bare path safe)") {
+  // Duplicate emphasis of the CI-failing case after the no-marker branch change.
+  Gemma4ToolParser p;
+  ChatCompletionRequest req = MakeRequest();
+  auto r = Stream(p, {"<", "|tool", "_call>", "call:get_weather{",
+                      "location:<|\"|>London<|\"|>}", "<tool_call|>"},
+                  req);
+  CHECK(CollectContent(r).empty());
+  CHECK(CollectName(r) == "get_weather");
+  CHECK(Parsed(CollectArgs(r)) == nlohmann::json{{"location", "London"}});
+}

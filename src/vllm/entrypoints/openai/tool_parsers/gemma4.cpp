@@ -477,6 +477,26 @@ std::string FixArgTypes(const std::string& args_json, const std::string& func_na
   return args_json;
 }
 
+
+// Strip trailing partial prefixes of tool markers so stream chunks never leak
+// half a `<|tool_call>` or bare `call:` into content (maint-bot split-tag case).
+void StripTrailingToolMarkerPrefixes(std::string& content_out) {
+  for (std::size_t k = kStart.size() - 1; k >= 1; --k) {
+    if (EndsWith(content_out, kStart.substr(0, k))) {
+      content_out.erase(content_out.size() - k);
+      break;
+    }
+    if (k == 1) break;
+  }
+  for (std::size_t k = kCall.size() - 1; k >= 1; --k) {
+    if (EndsWith(content_out, kCall.substr(0, k))) {
+      content_out.erase(content_out.size() - k);
+      break;
+    }
+    if (k == 1) break;
+  }
+}
+
 // ── Wire-format block scan ────────────────────────────────────────────────────
 // One <|tool_call>call:NAME{ARGS}<tool_call|> block recovered from the text.
 struct GemmaCall {
@@ -529,33 +549,14 @@ void ScanBlocks(const std::string& text, std::string& content_out,
     calls_out.push_back(std::move(call));
   }
 
-  // Buffer a trailing partial <|tool_call> start-tag prefix out of content so a
-  // split start tag never leaks (mirrors the engine never emitting a partial
-  // special token as text).
-  for (std::size_t k = kStart.size() - 1; k >= 1; --k) {
-    if (EndsWith(content_out, kStart.substr(0, k))) {
-      content_out.erase(content_out.size() - k);
-      break;
-    }
-    if (k == 1) break;
-  }
+  // Buffer trailing partial tool-marker prefixes out of content.
+  StripTrailingToolMarkerPrefixes(content_out);
 }
 
-}  // namespace
-
-nlohmann::ordered_json Gemma4ToolParser::ParseArgs(const std::string& args_str,
-                                                   bool partial) {
-  return ParseGemmaArgs(args_str, partial);
-}
-
-nlohmann::ordered_json Gemma4ToolParser::ParseArray(const std::string& arr_str,
-                                                    bool partial) {
-  return ParseGemmaArray(arr_str, partial);
-}
 
 // Bare `call:NAME{ARGS}` fallback — some decodes drop <|tool_call>/<tool_call|>
 // specials (text-only seam / free-form with structural tags off) but still emit
-// the call: body Hermes needs. Brace depth ignores content inside <|\"|> strings.
+// the call: body Hermes needs. Brace depth ignores content inside <|"|> strings.
 void ScanBareCalls(const std::string& text, std::string& content_out,
                    std::vector<GemmaCall>& calls_out) {
   content_out.clear();
@@ -582,7 +583,7 @@ void ScanBareCalls(const std::string& text, std::string& content_out,
     const std::size_t name_start = s + kCall.size();
     const std::size_t brace = text.find('{', name_start);
     if (brace == std::string::npos) {
-      content_out += text.substr(s);
+      // Incomplete bare call (no '{' yet) — buffer; do not leak as content.
       break;
     }
     GemmaCall call;
@@ -628,6 +629,20 @@ void ScanBareCalls(const std::string& text, std::string& content_out,
     }
     if (call.has_name) calls_out.push_back(std::move(call));
   }
+  StripTrailingToolMarkerPrefixes(content_out);
+}
+
+
+}  // namespace
+
+nlohmann::ordered_json Gemma4ToolParser::ParseArgs(const std::string& args_str,
+                                                   bool partial) {
+  return ParseGemmaArgs(args_str, partial);
+}
+
+nlohmann::ordered_json Gemma4ToolParser::ParseArray(const std::string& arr_str,
+                                                    bool partial) {
+  return ParseGemmaArray(arr_str, partial);
 }
 
 ExtractedToolCallInformation Gemma4ToolParser::extract_tool_calls(
@@ -690,19 +705,16 @@ std::optional<DeltaMessage> Gemma4ToolParser::extract_tool_calls_streaming(
   try {
     std::string content;
     std::vector<GemmaCall> calls;
+    // Unified content path: never emit a trailing partial `<|tool_call>` or
+    // bare `call:` prefix (split-across-chunks). Full markers dispatch to the
+    // wrapped / bare scanners; otherwise treat text as content with buffering.
     if (current_text.find(kStart) != std::string::npos) {
       ScanBlocks(current_text, content, calls);
     } else if (current_text.find(kCall) != std::string::npos) {
       ScanBareCalls(current_text, content, calls);
     } else {
-      // Still stream plain content before any call marker appears.
-      if (current_text.size() > streamed_content_len_) {
-        DeltaMessage msg;
-        msg.content = current_text.substr(streamed_content_len_);
-        streamed_content_len_ = current_text.size();
-        return msg;
-      }
-      return std::nullopt;
+      content = current_text;
+      StripTrailingToolMarkerPrefixes(content);
     }
 
     DeltaMessage msg;
