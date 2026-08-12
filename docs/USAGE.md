@@ -2247,7 +2247,11 @@ concurrent requests, memory helpers, and diagnostics. Later ABI versions add:
 | v18 | Video model-family selection (`family`, `vllm_video_engine_family`) and family-specific `extra_keys`/`extra_values` on `vllm_video_*` |
 
 Chat templates render through the vendored google/minja engine, the same
-renderer llama.cpp ships.
+renderer llama.cpp ships. Historical assistant tool calls retain OpenAI's
+JSON-string `function.arguments` on the API wire, but the renderer decodes that
+string to a structured Jinja value before applying the template, matching vLLM.
+Empty or JSON-null arguments render as `{}`; malformed JSON is rejected before
+generation instead of entering model history.
 
 ## Consuming it from C++
 

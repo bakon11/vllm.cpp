@@ -4,7 +4,7 @@ Issue: [#526](https://github.com/mudler/vllm.cpp/issues/526)
 
 Row: `TOOL-CALL-HISTORY-ARGS` (feature matrix §7, Tool calling)
 
-Status: **READY (spec-only checkpoint; implementation not started)**
+Status: **GATING (CPU RED/GREEN complete; independent review and live Gemma gate pending)**
 
 ## Problem
 
@@ -206,7 +206,12 @@ Live gate (after coordinated exclusive handoff):
 
 ## Now
 
-Issue #526 is open. Root cause and design are source-proven. The live daemon was
-recovered separately on 2026-08-12 and fresh tool calling works, but rendered
-completed history remains non-canonical. Next step: commit this spec-only
-checkpoint, then write the RED renderer test.
+Issue #526 is open. The renderer-boundary normalization and canonical Gemma 4
+fixture are implemented on the row branch. The focused test failed before the
+production change because completed history rendered JSON-quoted keys
+(`test-red-live-fixture.log`), then passed after the change
+(`test-green-expanded-2.log`). The expanded CPU protocol/serving set also passes.
+The OpenAI wire representation remains a string and malformed JSON fails closed
+without echoing argument contents. Next: commit an immutable implementation head,
+obtain fresh static + mutation review, then coordinate the exclusive live Gemma
+multi-turn gate and restore `:8010`.
