@@ -388,6 +388,8 @@ TEST_CASE("chat_template: multi-turn tool conversation renders through the Qwen3
   // The rendered prompt must carry the tool call AND the tool result, and end
   // with the assistant generation header.
   CHECK(out.find("get_weather") != std::string::npos);
+  CHECK(out.find("<parameter=city>\nRome\n</parameter>") !=
+        std::string::npos);
   CHECK(out.find("{\"temp\": 21}") != std::string::npos);
   CHECK(out.rfind("<|im_start|>assistant") != std::string::npos);
 }
@@ -455,4 +457,16 @@ TEST_CASE("chat_template: argument normalization leaves OpenAI wire encoding int
   CHECK(wire["tool_calls"][0]["function"]["arguments"] ==
         R"({"command":"date"})");
   CHECK(wire["tool_calls"][0]["function"]["arguments"].is_string());
+}
+
+TEST_CASE("chat_template: argument normalization is assistant-history only") {
+  const std::string malformed = R"({"command":)";
+  ChatMessage user = AssistantToolCall(malformed);
+  user.role = "user";
+
+  std::string out;
+  REQUIRE_NOTHROW(out = apply_chat_template(
+                      "{{ messages[0].tool_calls[0].function.arguments }}",
+                      {user}, /*add_generation_prompt=*/false));
+  CHECK(out == malformed);
 }

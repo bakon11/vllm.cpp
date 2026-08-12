@@ -4,7 +4,7 @@ Issue: [#526](https://github.com/mudler/vllm.cpp/issues/526)
 
 Row: `TOOL-CALL-HISTORY-ARGS` (feature matrix §7, Tool calling)
 
-Status: **GATING (CPU RED/GREEN complete; independent review and live Gemma gate pending)**
+Status: **GATING (CPU RED/GREEN + independent mutation review complete; live Gemma gate pending)**
 
 ## Problem
 
@@ -212,6 +212,9 @@ production change because completed history rendered JSON-quoted keys
 (`test-red-live-fixture.log`), then passed after the change
 (`test-green-expanded-2.log`). The expanded CPU protocol/serving set also passes.
 The OpenAI wire representation remains a string and malformed JSON fails closed
-without echoing argument contents. Next: commit an immutable implementation head,
-obtain fresh static + mutation review, then coordinate the exclusive live Gemma
-multi-turn gate and restore `:8010`.
+without echoing argument contents. Independent review at immutable `d2feeb8c`
+passed the implementation and proved the original-string mutation fails. Its
+role-predicate mutation exposed one test gap; a new non-assistant malformed-JSON
+regression now fails that mutation exactly, and the Qwen fixture locks the decoded
+`city=Rome` parameter shape. Next: coordinate the exclusive live Gemma multi-turn
+gate and restore `:8010`.
