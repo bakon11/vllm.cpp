@@ -88,4 +88,6 @@ FMHA_WMMA2 (quality fail + 0.67x @11k). Isolated P1 cm1 wg256 (~1.13x KEEP; need
 
 ### Residual compiler / ACO
 
-Faithful HIP cm1 hsaco on gfx1201: 192 VGPR, 339 spills, 940 B private, vs KEEP SharedK 35 spills / 120 B. Mechanism of the isolated 1.13x, not a named LLVM defect. Avoidability (regalloc vs live-range vs fundamental) is open. Phase-2 ROCm/LLVM rebuild stays blocked until a discriminator names a smallest component and a measurable prediction. A general codegen fix, if one exists, is a separate claim from the 3.35x bar.
+Faithful HIP cm1 hsaco on gfx1201: 192 VGPR, 339 spills, 940 B private, vs KEEP SharedK 35 spills / 120 B. Output-slicing bottoms out at 235 spills / 736 B (D_PT=1). Mechanism of the isolated 1.13x, not by itself a named LLVM defect.
+
+Matched RADV/ACO (Mesa 26.0.3, discrete R9700, llama.cpp coopmat1 spec Br=16 Bc=64 wg=128 sg=32 row_split=4): official pipeline stats are **0 spilled VGPR, 0 scratch** at VGPR=256 (f16 and q8_0 d=512). That is an (a)-leaning HIP-LLVM vs ACO disparity on equivalent ownership. Smallest LLVM/rocWMMA component is not named. Phase-2 rebuild stays blocked until that component and a measurable prediction exist. A general codegen fix, if one exists, is a separate claim from the 3.35x bar.
