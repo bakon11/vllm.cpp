@@ -3899,9 +3899,17 @@ ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`). Defaults stay safe off RDN
 GetBlas keeps two per-thread hipBLAS handles (`tls_slots[2]`, device 1 → slot 1)
 so a 0→1 hop does not destroy GPU0's handle. `ProductGetBlasHandle` is the
 test accessor for that file-local `GetBlas`. HIP live probe is a separate CTest
-target (exit 77 if `HIP_VISIBLE_DEVICES` empty); it enters capture so production `StreamIsCapturing` is load-bearing. No new env. This PR does **not**
-restructure the Gemma-4 layer loop or enable decode hipGraph (those stay lab-only
-until a CUDA token-exact gate can land them).
+target (exit 77 if `HIP_VISIBLE_DEVICES` empty); it enters capture so production `StreamIsCapturing` is load-bearing. No new env.
+This path does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
+(those stay lab-only until a CUDA token-exact gate can land them).
+
+Contributor KEEP recipe (2x R9700 gfx1201, ROCm 7.2.4, `PREFIX_CACHE=0`, unique
+pads, 2026-08-13): SharedK-WMMA on, FLASH/FMHA off, `VT_GEMMA4_PREFILL_GEMM_M=2048`,
+`PEER_ACT=1`, batch MoE `T>=64`, decode KV-splits 16 / slide-splits 8. Fair median
+prefill **2014 t/s @~11k** and **1099 t/s @~42k**; stream decode **55 t/s** temp=0.
+Paris / arith `63` / `gemma4` tool_calls held. Speculative, ngram, FMHA, and
+layer-split are **out of this recipe**. This is a reliable plateau, not Vulkan
+prefill parity. Details: [spec](../.agents/specs/gemma4-rocm-fp8-moe.md).
 
 ## LTX-2.5 text conditioning
 
