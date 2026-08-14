@@ -8,7 +8,7 @@
 - **Implementer:** hermes-vllm. **Reviewer:** research. **Operator/smoke:** coord.
 - **Git:** spec-only first (coord `25c9` / research `5071` / BLOCK `64cb`); impl after spec GREEN **on this same row branch**. Independent RED/GREEN from #837/#838. Ordered B then C is allowed; no all-at-once port. One PR per row. No shared `row/ROCM-GEMMA4-XDEV-MOE` landing history.
 - **Depends on:** #837 is a separate hypothesis. Operator runs B then C on T=2029. Impl of C may assume B already landed **or** must still be A/B-able alone.
-- **Supersedes for review:** `20332292` (BLOCK) and preview `c4fbe6e9` (not spec-GREEN).
+- **Supersedes for review:** `20332292` (BLOCK), preview `c4fbe6e9` (not spec-GREEN), and `231f38cf` (BLOCK `4954`).
 
 ## Now
 
@@ -26,7 +26,7 @@ No vLLM Python equivalent. Source is the pinned donor slices for **structure**. 
 |---|---|---|
 | `origin/main` `3ce5a1dc` | `RunGemma4Fp8ExpertGeGLUPrefillOnExpertDevice` `:648` | one function; same-dev `static thread_local SameTls tls` + sticky; peer `static thread_local Tls tls` + inline copy/GEMM/`ev_c`/`ev_e` |
 | hanging `vllm.cpp-bc64fa-r2` `1b1baf43` | `:692` | same monolithic body |
-| donor slices | wrapper `:959-1095`; `Launch…` `:1098`; `Finish…` `:1274`; `PeerPipeTls` `:55`; `DequantCacheSlotFor` `:225` | wrapper Launch(slot0)→Finish; same-dev `SameTls tls_slots[2]` + cache pin/unpin |
+| donor slices | wrapper `:959-1095`; `Launch…` `:1098`; `Finish…` `:1274`; `PeerPipeTls` `:55`; cache core `:60-209`; `DequantCacheSlotFor` `:225` | wrapper Launch(slot0)→Finish; `PrefillDequantCache` Slot/FreeAll/Ensure/GetLocked; same-dev `SameTls tls_slots[2]` + cache pin/unpin |
 
 `kPeerPipe` in lab is **default OFF**. Even OFF, the wrapper + dequant-cache lifetime is the delta (`713f`).
 
@@ -66,6 +66,8 @@ Caller in `gemma4_moe.cpp` prefill-batch peer-act chunk loop stays the public wr
 
 Donor Launch (`launch-finish-1090-1310.txt`) unpins at ~1262–1265 immediately after enqueueing GEMMs and **before** `hipEventRecord(tls.ev_e)`. Finish ~1274–1300 enqueues `hipStreamWaitEvent(cst, tls.ev_e)` + peer copy and does **not** host-wait `ev_e`. `DequantCacheSlotFor` is process-wide (220–231), so another worker/stream may evict/rewrite a zero-pin slot while the first expert stream still reads it. "Unpin after Finish" is still insufficient unless Finish proves `ev_e` complete.
 
+Donor `Ensure` (`dequant-cache-core-60-209.txt`) calls `FreeAll` whenever device/I/H/`nslots` disagree with the request. `FreeAll` `hipFree`s every slot and zeros `pins`, including live pins. Product must not copy that.
+
 ### Product ownership (required)
 
 Persist the pin in `PeerSlot`:
@@ -84,8 +86,12 @@ Rules:
 2. Finish may enqueue `hipStreamWaitEvent` + y-copy, then **must host-wait** `ev_e` (or `hipStreamSynchronize` on the expert stream that recorded it) **before** unpin. `hipStreamWaitEvent` on the compute stream is not a host-side retirement proof.
 3. Unpin under lock via `UnpinLocked` only after that host-wait succeeds. Then clear `cache_pin = -1`.
 4. Same-dev enqueue-only path: same rule. Record a done-event on the GEMM stream; host-wait it before unpin. "Enqueue then unpin" is forbidden even when compute_dev == expert_dev, unless a written concurrency argument proves no other worker can `GetLocked`/`evict` that slot — default is: **no such argument**, so host-wait.
-5. Every Launch/Finish error path: if `cache_pin >= 0`, host-wait any recorded `ev_e` if valid, then unpin, then restore compute device. No live expert event left. Pin count → 0.
+5. Every Launch/Finish error path after a successful `GetLocked` must retire GPU work **before** unpin:
+   - If `ev_e` was successfully recorded: host-wait `ev_e` (or `hipStreamSynchronize` on the stream that recorded it), then unpin.
+   - If pin is live and `ev_e` was **not** recorded (fail after pin, after dequant/GEMM enqueue, or `hipEventRecord(ev_e)` itself fails): **`hipStreamSynchronize` the expert stream** (same-dev: the compute/GEMM stream) **then** unpin. "Wait any recorded `ev_e` if valid" is not a retirement proof when the event does not exist.
+   - Then restore compute device. No live expert event left. Pin count → 0.
 6. Mutex scope still mirrors donor for Get/Unpin (`GetLocked` under lock, GEMM outside, `UnpinLocked` under lock). Do not hold the mutex across `MatmulBT`.
+7. **`Ensure` must not reconfigure while any pin is live.** If `dev/I/H/nslots` already match, return true. If they differ and any `slots[i].pins > 0`, return false (reject; do not `FreeAll`). Only call `FreeAll` when pin-count is 0 across the cache. Do not copy donor `Ensure`→`FreeAll` on a live pin. Slot-count comes from `PrefillDequantCacheSlots()` (donor default 1).
 
 ### Lifetime invariants (mutation-proven)
 
@@ -94,8 +100,9 @@ Rules:
 - Finish restores compute device before return;
 - `ev_c` is recorded on compute stream, `ev_e` on expert stream; no cross-device event record;
 - cache pin count returns to 0 on both success and every error return;
-- pin remains >0 from GetLocked until host-observed `ev_e` completion;
-- a second worker cannot obtain a rewrite/evict of a still-pinned slot.
+- pin remains >0 from GetLocked until host-observed retirement (`ev_e` complete, or expert/compute stream sync on the pre-record error path);
+- a second worker cannot obtain a rewrite/evict of a still-pinned slot;
+- `Ensure` never `FreeAll`s a cache that has any `pins > 0`.
 
 ## Risks
 
@@ -108,7 +115,7 @@ Rules:
 Host-only:
 
 1. Source invariant: product wrapper contains `LaunchGemma4Fp8ExpertGeGLUPrefillPeer` and `FinishGemma4Fp8ExpertGeGLUPrefillPeer`; does not keep a peer `static thread_local Tls tls` as the only storage.
-2. Source invariant: `PeerSlot` stores `cache_pin`; Launch does not call `UnpinLocked` before `ev_e` record; Finish host-waits before unpin.
+2. Source invariant: `PeerSlot` stores `cache_pin`; Launch does not call `UnpinLocked` before `ev_e` record; Finish host-waits before unpin; `Ensure` returns false when any pin is live instead of `FreeAll`.
 3. Pairing: every Launch path that returns true has a Finish; fail-Launch must unpin.
 4. `kPeerPipe` default is off (env unset → no overlapping slot 1).
 
@@ -117,10 +124,12 @@ RED: restore monolithic peer TLS → invariant 1 fails. RED: restore donor unpin
 Host or fake-cache mutations (required):
 
 - concurrent eviction: worker B `GetLocked`/rewrite of a zero-pin slot while worker A's expert stream still "reads" (fake outstanding GEMM). Must RED if unpin happened before retirement.
-- fail after pin, before event record → pin count 0, no live event.
+- fail after pin, **after work enqueue** (dequant or GEMM queued), before event record → expert-stream (same-dev: compute-stream) sync then unpin; pin count 0; no live event. A mutation that only fails immediately after pin (no enqueue) does **not** satisfy this case.
+- fail at `hipEventRecord(ev_e)` after work enqueue → same stream-sync fallback before unpin.
 - fail after event record, before wait → pin count 0 after cleanup, event retired or destroyed safely.
 - fail after wait, before copy → pin count 0.
 - fail after copy, before unpin → cleanup still unpins (idempotent).
+- concurrent `Ensure` with a new I/H or slot-count while any pin is live → `Ensure` returns false, no `FreeAll`, pinned buffers remain. RED if donor `Ensure`→`FreeAll` is restored.
 
 GPU (coord, after #837):
 
@@ -145,4 +154,4 @@ GPU (coord, after #837):
 
 ## Evidence
 
-Bus: `0384`, `713f`, `9772`, `25c9`, `5071`, `64cb`. Donor bytes hashed in `.agents/evidence/rocm-gemma4-prefill-peer/MANIFEST.md`.
+Bus: `0384`, `713f`, `9772`, `25c9`, `5071`, `64cb`, `4954`. Donor bytes hashed in `.agents/evidence/rocm-gemma4-prefill-peer/MANIFEST.md` (cache core 60–209 required).
