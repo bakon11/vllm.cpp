@@ -1,12 +1,12 @@
 // #838: widen Gemma-4 FP8 indexed MoE from T==1 to T<=63.
-// Pure host predicates + token offsets. No HIP. Product caches env once;
-// tests call the parse/predicate functions directly.
+// Host-injectable dispatch + single-scale fallback. No HIP.
 #pragma once
 
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cmath>
+#include <cstddef>
 #include <algorithm>
 #include <vector>
 
@@ -16,9 +16,6 @@ constexpr int64_t kGemma4PrefillBatchMinT = 64;
 constexpr int64_t kGemma4DecodeIndexedMaxTDefault = 63;
 constexpr int64_t kGemma4DecodeIndexedMaxTLo = 1;
 constexpr int64_t kGemma4DecodeIndexedMaxTHi = 63;
-
-// Oracle class for the default-on numerical route change (spec #838).
-// abs_tol = 2^-7 * max_abs(ref); rel_tol unused beyond that product form.
 constexpr float kGemma4IndexedOraclePow2 = 7.0f;
 
 inline int64_t ParseGemma4DecodeIndexedMaxT(const char* e) {
@@ -42,23 +39,77 @@ inline bool Gemma4IndexedOkT(int64_t T, int64_t indexed_max_t, int top_k, bool f
 }
 
 struct Gemma4IndexedTokenOff {
-  int64_t x_elems = 0;  // t * H into [T,H] bf16
+  int64_t x_elems = 0;
   int64_t y_elems = 0;
-  int64_t route = 0;    // t * top_k into [T,K] idx/wts
+  int64_t route = 0;
 };
 
 inline Gemma4IndexedTokenOff Gemma4IndexedTokenOffsets(int64_t t, int64_t H, int top_k) {
   return Gemma4IndexedTokenOff{t * H, t * H, t * static_cast<int64_t>(top_k)};
 }
 
-// Test-visible route witness: incremented once per successful per-token indexed helper.
 inline std::atomic<uint64_t>& Gemma4IndexedHelperHits() {
   static std::atomic<uint64_t> n{0};
   return n;
 }
 
-// Host serial/reference mix vs indexed loop. Fake expert: y[h] = x[h] * (e+1) * w.
-// Same math both arms — proves token stride / ownership, not HIP numerics.
+struct Gemma4IndexedCall {
+  int64_t t = 0;
+  Gemma4IndexedTokenOff off{};
+  bool peer = false;
+  const uint16_t* x = nullptr;
+  uint16_t* y = nullptr;
+  const int32_t* ri = nullptr;
+  const float* rw = nullptr;
+};
+
+struct Gemma4IndexedDispatchResult {
+  bool ok = false;
+  uint64_t hits = 0;
+  int restores = 0;
+  uint16_t* y_owner = nullptr;
+};
+
+// Production T-loop. `fn(call)` is the same-dev or peer helper. `restore()` runs
+// after every helper return (success or fail). Does not free `y`.
+template <typename Fn, typename Restore>
+inline Gemma4IndexedDispatchResult Gemma4IndexedDispatchTokens(
+    int64_t T, int64_t H, int top_k, bool peer, uint16_t* y, const uint16_t* x, const int32_t* ri,
+    const float* rw, Fn fn, Restore restore) {
+  Gemma4IndexedDispatchResult r;
+  r.y_owner = y;
+  if (T <= 0 || !y || !x || !ri || !rw) return r;
+  for (int64_t t = 0; t < T; ++t) {
+    const auto off = Gemma4IndexedTokenOffsets(t, H, top_k);
+    const Gemma4IndexedCall c{t, off, peer, x + off.x_elems, y + off.y_elems, ri + off.route,
+                              rw + off.route};
+    const bool one = fn(c);
+    restore();
+    ++r.restores;
+    if (!one) {
+      r.ok = false;
+      return r;
+    }
+    ++r.hits;
+    Gemma4IndexedHelperHits().fetch_add(1, std::memory_order_relaxed);
+  }
+  r.ok = true;
+  return r;
+}
+
+// Serial fallback scale. already_scaled=true skips (indexed must not leave rw mutated).
+inline void Gemma4ApplyHostExpertScaleOnce(float* hw, const int32_t* hi, const float* hscale,
+                                           int64_t T, int top_k, int64_t E, bool already_scaled) {
+  if (already_scaled || !hw || !hi || !hscale || T <= 0 || top_k <= 0) return;
+  for (int64_t t = 0; t < T; ++t) {
+    for (int i = 0; i < top_k; ++i) {
+      const size_t o = static_cast<size_t>(t * top_k + i);
+      const int e = hi[o];
+      if (e >= 0 && e < static_cast<int>(E)) hw[o] *= hscale[static_cast<size_t>(e)];
+    }
+  }
+}
+
 inline void Gemma4IndexedHostSerialRef(const float* x, const int32_t* idx, const float* wts,
                                        float* y, int64_t T, int64_t H, int top_k) {
   for (int64_t t = 0; t < T; ++t) {
@@ -72,21 +123,8 @@ inline void Gemma4IndexedHostSerialRef(const float* x, const int32_t* idx, const
   }
 }
 
-inline void Gemma4IndexedHostIndexedLoop(const float* x, const int32_t* idx, const float* wts,
-                                         float* y, int64_t T, int64_t H, int top_k) {
-  for (int64_t t = 0; t < T; ++t) {
-    const auto off = Gemma4IndexedTokenOffsets(t, H, top_k);
-    for (int64_t h = 0; h < H; ++h) y[off.y_elems + h] = 0.f;
-    for (int g = 0; g < top_k; ++g) {
-      const int32_t e = idx[off.route + g];
-      const float w = wts[off.route + g];
-      const float s = (e + 1) * w;
-      for (int64_t h = 0; h < H; ++h) y[off.y_elems + h] += x[off.x_elems + h] * s;
-    }
-  }
-}
-
-inline bool Gemma4IndexedOracleClose(const float* cand, const float* ref, int64_t n, float* max_abs_out) {
+inline bool Gemma4IndexedOracleClose(const float* cand, const float* ref, int64_t n,
+                                     float* max_abs_out) {
   float max_abs_ref = 0.f;
   float max_abs_diff = 0.f;
   for (int64_t i = 0; i < n; ++i) {
