@@ -1,5 +1,6 @@
 // Gemma-4 MoE: BF16 fused or FP8 per-expert + optional device resident.
 #include "vllm/model_executor/models/gemma4_moe.h"
+#include "vllm/model_executor/models/gemma4_indexed_gate.h"
 
 #include <atomic>
 #include <algorithm>
@@ -727,9 +728,12 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
   const bool fp8_res_same = fp8_res && ex.dev_id == compute_dev;
   const bool fp8_res_peer = fp8_res && ex.dev_id != compute_dev;
 
-  // Decode T=1: fully device MoE — no router D2H, no host top-k gather.
-  if (T == 1 && fp8_res && top_k <= 8 && top_k > 0) {
-    // per-expert scale on device (once per layer/E).
+  // Device-indexed FP8 MoE for T=1..min(MAX, batch_min-1). No router D2H.
+  // T=1: hipGraph-stable TLS acc. T>1: owned [T,H] + per-token existing helpers.
+  // VT_GEMMA4_DECODE_INDEXED_MAX_T: default 63; =1 → T=1 only; clamp [1,63].
+  const int64_t indexed_max_t = Gemma4DecodeIndexedMaxT();
+  if (Gemma4IndexedOkT(T, indexed_max_t, top_k, fp8_res)) {
+    // per-expert scale on device (once per layer/E; apply each token — helper is G-wide).
     struct EscTls {
       int dev = -1;
       int64_t E = 0;
@@ -750,68 +754,97 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
         esc.host_key = hk;
       }
       escale_ptr = static_cast<float*>(esc.sc->ptr());
-      vt::ApplyExpertScaleRw(d.q, static_cast<float*>(rw.ptr()), static_cast<const int32_t*>(ri.ptr()),
-                             escale_ptr, top_k, static_cast<int>(E));
+      for (int64_t t = 0; t < T; ++t) {
+        const auto off = Gemma4IndexedTokenOffsets(t, H, top_k);
+        vt::ApplyExpertScaleRw(d.q, static_cast<float*>(rw.ptr()) + off.route,
+                               static_cast<const int32_t*>(ri.ptr()) + off.route, escale_ptr, top_k,
+                               static_cast<int>(E));
+      }
     }
 
-    // Stable T=1 acc for hipGraph (do not pool-Release).
-    struct AccFastTls {
-      int dev = -1;
-      int64_t H = 0;
-      std::optional<DBuf> acc;
-    };
-    static thread_local AccFastTls aft;
-    if (aft.dev != d.q.device.index || aft.H != H || !aft.acc) {
-      aft.acc.emplace(d, DType::kBF16, std::vector<int64_t>{T, H});
-      aft.dev = d.q.device.index;
-      aft.H = H;
-    }
-    DBuf& acc_fast = *aft.acc;
-    // expert_in is already [1,H] bf16 on device
-    const void* xin = expert_in.data;
-    void* yout = acc_fast.ptr();
-    bool ok = false;
-    if (fp8_res_same) {
-      ok = vt::ExpertGeGLUFp8TopKIndexed(
-          d.q, yout, xin, ex.fp8_gu_base, ex.fp8_dn_base, ex.fp8_sgu_base, ex.fp8_sdn_base,
-          static_cast<const int32_t*>(ri.ptr()), static_cast<const float*>(rw.ptr()), top_k,
-          static_cast<int>(I), static_cast<int>(H));
-    } else if (fp8_res_peer) {
-      ok = RunGemma4Fp8TopKIndexedOnExpertDevice(
-          d.q, ex.dev_id, yout, xin, ex.fp8_gu_base, ex.fp8_dn_base, ex.fp8_sgu_base,
-          ex.fp8_sdn_base, static_cast<const int32_t*>(ri.ptr()),
-          static_cast<const float*>(rw.ptr()), top_k, static_cast<int>(I), static_cast<int>(H));
-    }
-    if (ok) {
-      const auto t_router1 = profile ? clock::now() : clock::time_point{};
-      Gemma4MoeScratch r;
-      r.tensor = acc_fast.t();
-      r.storage = std::shared_ptr<void>(acc_fast.ptr(), [](void*) {});
-      if (profile) {
-        d.b.Synchronize(d.q);
-        const auto t_all1 = clock::now();
-        static std::atomic<uint64_t> ncalls{0};
-        static std::atomic<uint64_t> us_router{0};
-        static std::atomic<uint64_t> us_total{0};
-        const auto ur =
-            std::chrono::duration_cast<std::chrono::microseconds>(t_router1 - t_all0).count();
-        const auto ut =
-            std::chrono::duration_cast<std::chrono::microseconds>(t_all1 - t_all0).count();
-        us_router.fetch_add(static_cast<uint64_t>(ur), std::memory_order_relaxed);
-        us_total.fetch_add(static_cast<uint64_t>(ut), std::memory_order_relaxed);
-        const uint64_t c = ncalls.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (c == 1 || c % 64 == 0) {
-          const uint64_t tr = us_router.load(std::memory_order_relaxed);
-          const uint64_t tt = us_total.load(std::memory_order_relaxed);
-          std::fprintf(stderr,
-                       "gemma4 moe profile: calls=%llu router_us/call=%.1f expert+rest_us/call=%.1f "
-                       "total_us/call=%.1f (router%%=%.0f) [indexed-device]\n",
-                       static_cast<unsigned long long>(c), static_cast<double>(tr) / c,
-                       static_cast<double>(tt - tr) / c, static_cast<double>(tt) / c,
-                       tt ? 100.0 * static_cast<double>(tr) / static_cast<double>(tt) : 0.0);
-        }
+    auto run_one = [&](void* yout, const void* xin, const int32_t* ri_t, const float* rw_t) -> bool {
+      if (fp8_res_same) {
+        return vt::ExpertGeGLUFp8TopKIndexed(
+            d.q, yout, xin, ex.fp8_gu_base, ex.fp8_dn_base, ex.fp8_sgu_base, ex.fp8_sdn_base, ri_t,
+            rw_t, top_k, static_cast<int>(I), static_cast<int>(H));
       }
-      return r;
+      if (fp8_res_peer) {
+        return RunGemma4Fp8TopKIndexedOnExpertDevice(
+            d.q, ex.dev_id, yout, xin, ex.fp8_gu_base, ex.fp8_dn_base, ex.fp8_sgu_base,
+            ex.fp8_sdn_base, ri_t, rw_t, top_k, static_cast<int>(I), static_cast<int>(H));
+      }
+      return false;
+    };
+
+    if (T == 1) {
+      // Stable T=1 acc for hipGraph (do not pool-Release).
+      struct AccFastTls {
+        int dev = -1;
+        int64_t H = 0;
+        std::optional<DBuf> acc;
+      };
+      static thread_local AccFastTls aft;
+      if (aft.dev != d.q.device.index || aft.H != H || !aft.acc) {
+        aft.acc.emplace(d, DType::kBF16, std::vector<int64_t>{1, H});
+        aft.dev = d.q.device.index;
+        aft.H = H;
+      }
+      DBuf& acc_fast = *aft.acc;
+      const bool ok =
+          run_one(acc_fast.ptr(), expert_in.data, static_cast<const int32_t*>(ri.ptr()),
+                  static_cast<const float*>(rw.ptr()));
+      if (ok) {
+        Gemma4IndexedHelperHits().fetch_add(1, std::memory_order_relaxed);
+        const auto t_router1 = profile ? clock::now() : clock::time_point{};
+        Gemma4MoeScratch r;
+        r.tensor = acc_fast.t();
+        r.storage = std::shared_ptr<void>(acc_fast.ptr(), [](void*) {});
+        if (profile) {
+          d.b.Synchronize(d.q);
+          const auto t_all1 = clock::now();
+          static std::atomic<uint64_t> ncalls{0};
+          static std::atomic<uint64_t> us_router{0};
+          static std::atomic<uint64_t> us_total{0};
+          const auto ur =
+              std::chrono::duration_cast<std::chrono::microseconds>(t_router1 - t_all0).count();
+          const auto ut =
+              std::chrono::duration_cast<std::chrono::microseconds>(t_all1 - t_all0).count();
+          us_router.fetch_add(static_cast<uint64_t>(ur), std::memory_order_relaxed);
+          us_total.fetch_add(static_cast<uint64_t>(ut), std::memory_order_relaxed);
+          const uint64_t c = ncalls.fetch_add(1, std::memory_order_relaxed) + 1;
+          if (c == 1 || c % 64 == 0) {
+            const uint64_t tr = us_router.load(std::memory_order_relaxed);
+            const uint64_t tt = us_total.load(std::memory_order_relaxed);
+            std::fprintf(stderr,
+                         "gemma4 moe profile: calls=%llu router_us/call=%.1f expert+rest_us/call=%.1f "
+                         "total_us/call=%.1f (router%%=%.0f) [indexed-device]\n",
+                         static_cast<unsigned long long>(c), static_cast<double>(tr) / c,
+                         static_cast<double>(tt - tr) / c, static_cast<double>(tt) / c,
+                         tt ? 100.0 * static_cast<double>(tr) / static_cast<double>(tt) : 0.0);
+          }
+        }
+        return r;
+      }
+    } else {
+      std::optional<DBuf> acc_idx;
+      acc_idx.emplace(d, DType::kBF16, std::vector<int64_t>{T, H});
+      bool ok = true;
+      auto* x_base = static_cast<const uint16_t*>(expert_in.data);
+      auto* y_base = static_cast<uint16_t*>(acc_idx->ptr());
+      auto* ri_base = static_cast<const int32_t*>(ri.ptr());
+      auto* rw_base = static_cast<const float*>(rw.ptr());
+      for (int64_t t = 0; t < T && ok; ++t) {
+        const auto off = Gemma4IndexedTokenOffsets(t, H, top_k);
+        ok = run_one(y_base + off.y_elems, x_base + off.x_elems, ri_base + off.route,
+                     rw_base + off.route);
+        if (ok) Gemma4IndexedHelperHits().fetch_add(1, std::memory_order_relaxed);
+      }
+      if (ok) {
+        Gemma4MoeScratch r;
+        r.tensor = acc_idx->t();
+        r.storage = acc_idx->ReleaseShared();
+        return r;
+      }
     }
     // fall through to legacy host-gather path
   }
@@ -977,7 +1010,7 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
   // Prefer fused M=1 FP8 for short T (decode + tiny prefills). Batch dequant+GEMM
   // only pays off once enough tokens share experts (lab: T=818 ~3×, T=6k ~6×;
   // T=13 was slower than fused M=1).
-  constexpr int64_t kPrefillBatchMinT = 64;
+  constexpr int64_t kPrefillBatchMinT = kGemma4PrefillBatchMinT;
   const bool prefill_batch_moe =
       (T >= kPrefillBatchMinT) && !host_axpy &&
       ((prefill_batch_env == 1) ||
