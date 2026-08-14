@@ -882,6 +882,13 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
         return r;
       }
     }
+    // Fail after possible enqueue: retire peer/compute work before pooled
+    // rw_idx / acc_idx destructors return those bytes to DevicePool.
+    if (fp8_res_peer) {
+      (void)RetireGemma4Fp8TopKIndexedPeer(d.q, ex.dev_id);
+    } else {
+      d.b.Synchronize(d.q);
+    }
     // fall through to legacy host-gather path
   }
 
@@ -1679,6 +1686,7 @@ bool RunGemma4Fp8TopKIndexedOnExpertDevice(vt::Queue&, int, void*, const void*, 
                                            const float*, int, int, int) {
   return false;
 }
+bool RetireGemma4Fp8TopKIndexedPeer(vt::Queue&, int) { return true; }
 void PinGemma4Fp8ExpertHostCache(const Gemma4Fp8ExpertMats&) {}
 void UnpinGemma4Fp8ExpertHostCache(const Gemma4Fp8ExpertMats&) {}
 #endif  // VLLM_CPP_HIP
