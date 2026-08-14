@@ -2938,8 +2938,9 @@ interval does.
 Dual-GPU resident FP8 MoE and SharedK-WMMA prefill are controlled via
 ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`, `VT_GEMMA4_DECODE_INDEXED_MAX_T`).
 Unset indexed-max defaults to 63 (T=2..63 uses the existing per-token indexed
-helpers on a scratch-scaled weight copy; helper failure restores compute_dev and
-falls back with a single host scale). `=1` restores T=1-only. Defaults stay safe off RDNA4.
+helpers on a scratch-scaled weight copy; helper failure retires peer/compute
+streams before pooled scratch returns, then falls back with a single host scale).
+`=1` restores T=1-only. Defaults stay safe off RDNA4.
 This PR does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
 (those stay lab-only until a CUDA token-exact gate can land them).
 

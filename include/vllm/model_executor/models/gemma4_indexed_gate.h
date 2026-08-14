@@ -1,5 +1,6 @@
 // #838: widen Gemma-4 FP8 indexed MoE from T==1 to T<=63.
-// Host-injectable dispatch + single-scale fallback. No HIP.
+// Host-injectable dispatch, tensor oracle, single-scale fallback, scratch retire.
+// No HIP.
 #pragma once
 
 #include <atomic>
@@ -16,7 +17,7 @@ constexpr int64_t kGemma4PrefillBatchMinT = 64;
 constexpr int64_t kGemma4DecodeIndexedMaxTDefault = 63;
 constexpr int64_t kGemma4DecodeIndexedMaxTLo = 1;
 constexpr int64_t kGemma4DecodeIndexedMaxTHi = 63;
-constexpr float kGemma4IndexedOraclePow2 = 7.0f;
+constexpr float kGemma4IndexedOraclePow2 = 7.0f;  // abs_tol = 2^-7 * max_abs(ref)
 
 inline int64_t ParseGemma4DecodeIndexedMaxT(const char* e) {
   if (e == nullptr || e[0] == '\0') return kGemma4DecodeIndexedMaxTDefault;
@@ -53,12 +54,13 @@ inline std::atomic<uint64_t>& Gemma4IndexedHelperHits() {
   return n;
 }
 
+template <typename YT = uint16_t, typename XT = uint16_t>
 struct Gemma4IndexedCall {
   int64_t t = 0;
   Gemma4IndexedTokenOff off{};
   bool peer = false;
-  const uint16_t* x = nullptr;
-  uint16_t* y = nullptr;
+  const XT* x = nullptr;
+  YT* y = nullptr;
   const int32_t* ri = nullptr;
   const float* rw = nullptr;
 };
@@ -67,23 +69,25 @@ struct Gemma4IndexedDispatchResult {
   bool ok = false;
   uint64_t hits = 0;
   int restores = 0;
-  uint16_t* y_owner = nullptr;
+  void* y_owner = nullptr;
+  bool enqueued = false;
 };
 
 // Production T-loop. `fn(call)` is the same-dev or peer helper. `restore()` runs
 // after every helper return (success or fail). Does not free `y`.
-template <typename Fn, typename Restore>
+template <typename YT, typename XT, typename Fn, typename Restore>
 inline Gemma4IndexedDispatchResult Gemma4IndexedDispatchTokens(
-    int64_t T, int64_t H, int top_k, bool peer, uint16_t* y, const uint16_t* x, const int32_t* ri,
+    int64_t T, int64_t H, int top_k, bool peer, YT* y, const XT* x, const int32_t* ri,
     const float* rw, Fn fn, Restore restore) {
   Gemma4IndexedDispatchResult r;
   r.y_owner = y;
   if (T <= 0 || !y || !x || !ri || !rw) return r;
   for (int64_t t = 0; t < T; ++t) {
     const auto off = Gemma4IndexedTokenOffsets(t, H, top_k);
-    const Gemma4IndexedCall c{t, off, peer, x + off.x_elems, y + off.y_elems, ri + off.route,
-                              rw + off.route};
+    const Gemma4IndexedCall<YT, XT> c{t, off, peer, x + off.x_elems, y + off.y_elems,
+                                      ri + off.route, rw + off.route};
     const bool one = fn(c);
+    r.enqueued = true;
     restore();
     ++r.restores;
     if (!one) {
@@ -110,16 +114,21 @@ inline void Gemma4ApplyHostExpertScaleOnce(float* hw, const int32_t* hi, const f
   }
 }
 
+// Independent serial / product-loop token math (host oracle).
+inline void Gemma4IndexedHostApplyToken(float* y, const float* x, const int32_t* ri, const float* rw,
+                                        int64_t H, int top_k) {
+  for (int64_t h = 0; h < H; ++h) y[h] = 0.f;
+  for (int g = 0; g < top_k; ++g) {
+    const int32_t e = ri[g];
+    const float s = static_cast<float>(e + 1) * rw[g];
+    for (int64_t h = 0; h < H; ++h) y[h] += x[h] * s;
+  }
+}
+
 inline void Gemma4IndexedHostSerialRef(const float* x, const int32_t* idx, const float* wts,
                                        float* y, int64_t T, int64_t H, int top_k) {
   for (int64_t t = 0; t < T; ++t) {
-    for (int64_t h = 0; h < H; ++h) y[t * H + h] = 0.f;
-    for (int g = 0; g < top_k; ++g) {
-      const int32_t e = idx[t * top_k + g];
-      const float w = wts[t * top_k + g];
-      const float s = (e + 1) * w;
-      for (int64_t h = 0; h < H; ++h) y[t * H + h] += x[t * H + h] * s;
-    }
+    Gemma4IndexedHostApplyToken(y + t * H, x + t * H, idx + t * top_k, wts + t * top_k, H, top_k);
   }
 }
 
@@ -136,6 +145,28 @@ inline bool Gemma4IndexedOracleClose(const float* cand, const float* ref, int64_
   if (max_abs_out) *max_abs_out = max_abs_diff;
   const float tol = std::ldexp(max_abs_ref, -static_cast<int>(kGemma4IndexedOraclePow2));
   return max_abs_diff <= tol;
+}
+
+// Scratch may not return to a reusable pool until peer/compute work is retired.
+struct Gemma4IndexedScratchLedger {
+  bool enqueued = false;
+  bool retired = false;
+  bool released_to_pool = false;
+};
+
+inline void Gemma4IndexedRetireScratch(Gemma4IndexedScratchLedger& L) { L.retired = true; }
+
+inline bool Gemma4IndexedReleaseScratchToPool(Gemma4IndexedScratchLedger& L) {
+  if (L.enqueued && !L.retired) return false;
+  L.released_to_pool = true;
+  return true;
+}
+
+template <typename Retire, typename Release>
+inline bool Gemma4IndexedOnHelperFail(bool enqueued, Retire retire, Release release) {
+  if (enqueued) retire();
+  release();
+  return true;
 }
 
 }  // namespace vllm
