@@ -784,12 +784,21 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
         esc.host_key = hk;
       }
       escale_ptr = static_cast<float*>(esc.sc->ptr());
+    }
+
+    // Never mutate router `rw` in place — fallback must still see unscaled weights.
+    std::optional<DBuf> rw_idx;
+    const float* helper_rw = static_cast<const float*>(rw.ptr());
+    if (escale_ptr) {
+      rw_idx.emplace(d, DType::kF32, std::vector<int64_t>{T, top_k});
+      d.b.Copy(d.q, rw_idx->ptr(), rw.ptr(), static_cast<size_t>(T * top_k) * sizeof(float));
       for (int64_t t = 0; t < T; ++t) {
         const auto off = Gemma4IndexedTokenOffsets(t, H, top_k);
-        vt::ApplyExpertScaleRw(d.q, static_cast<float*>(rw.ptr()) + off.route,
+        vt::ApplyExpertScaleRw(d.q, static_cast<float*>(rw_idx->ptr()) + off.route,
                                static_cast<const int32_t*>(ri.ptr()) + off.route, escale_ptr, top_k,
                                static_cast<int>(E));
       }
+      helper_rw = static_cast<const float*>(rw_idx->ptr());
     }
 
     auto run_one = [&](void* yout, const void* xin, const int32_t* ri_t, const float* rw_t) -> bool {
@@ -805,6 +814,7 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
       }
       return false;
     };
+    auto restore_compute = [] {};
 
     if (T == 1) {
       // Stable T=1 acc for hipGraph (do not pool-Release).
@@ -820,11 +830,12 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
         aft.H = H;
       }
       DBuf& acc_fast = *aft.acc;
-      const bool ok =
-          run_one(acc_fast.ptr(), expert_in.data, static_cast<const int32_t*>(ri.ptr()),
-                  static_cast<const float*>(rw.ptr()));
-      if (ok) {
-        Gemma4IndexedHelperHits().fetch_add(1, std::memory_order_relaxed);
+      const auto disp = Gemma4IndexedDispatchTokens(
+          1, H, top_k, fp8_res_peer, static_cast<uint16_t*>(acc_fast.ptr()),
+          static_cast<const uint16_t*>(expert_in.data), static_cast<const int32_t*>(ri.ptr()),
+          helper_rw, [&](const Gemma4IndexedCall& c) { return run_one(c.y, c.x, c.ri, c.rw); },
+          restore_compute);
+      if (disp.ok) {
         const auto t_router1 = profile ? clock::now() : clock::time_point{};
         Gemma4MoeScratch r;
         r.tensor = acc_fast.t();
@@ -858,18 +869,13 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     } else {
       std::optional<DBuf> acc_idx;
       acc_idx.emplace(d, DType::kBF16, std::vector<int64_t>{T, H});
-      bool ok = true;
       auto* x_base = static_cast<const uint16_t*>(expert_in.data);
       auto* y_base = static_cast<uint16_t*>(acc_idx->ptr());
       auto* ri_base = static_cast<const int32_t*>(ri.ptr());
-      auto* rw_base = static_cast<const float*>(rw.ptr());
-      for (int64_t t = 0; t < T && ok; ++t) {
-        const auto off = Gemma4IndexedTokenOffsets(t, H, top_k);
-        ok = run_one(y_base + off.y_elems, x_base + off.x_elems, ri_base + off.route,
-                     rw_base + off.route);
-        if (ok) Gemma4IndexedHelperHits().fetch_add(1, std::memory_order_relaxed);
-      }
-      if (ok) {
+      const auto disp = Gemma4IndexedDispatchTokens(
+          T, H, top_k, fp8_res_peer, y_base, x_base, ri_base, helper_rw,
+          [&](const Gemma4IndexedCall& c) { return run_one(c.y, c.x, c.ri, c.rw); }, restore_compute);
+      if (disp.ok) {
         Gemma4MoeScratch r;
         r.tensor = acc_idx->t();
         r.storage = acc_idx->ReleaseShared();
@@ -892,14 +898,9 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     const auto* pe = reinterpret_cast<const uint16_t*>(moe.per_expert_scale.bytes.data());
     for (int64_t e = 0; e < E; ++e) hscale[static_cast<size_t>(e)] = vt::BF16ToF32(pe[e]);
   }
-  // Apply per-expert scale to selected weights.
-  for (int64_t t = 0; t < T; ++t) {
-    for (int i = 0; i < top_k; ++i) {
-      const size_t o = static_cast<size_t>(t * top_k + i);
-      const int e = hi[o];
-      if (e >= 0 && e < static_cast<int>(E)) hw[o] *= hscale[static_cast<size_t>(e)];
-    }
-  }
+  // Apply per-expert scale to selected weights (once; indexed scratch is a copy).
+  Gemma4ApplyHostExpertScaleOnce(hw.data(), hi.data(), hscale.data(), T, top_k, E,
+                                 /*already_scaled=*/false);
   const bool need_peer_sc = (!same_dev && ex.gate_up_dev && ex.down_dev && ex.dev_id >= 0) ||
                             fp8_res_peer;
 

@@ -558,6 +558,15 @@ bool RunGemma4Fp8TopKIndexedOnExpertDevice(vt::Queue& compute_q, int expert_dev,
                                          sgu_base, sdn_base, idx_compute, wts_compute, G, I, H);
   }
 
+  struct RestoreComputeDev {
+    int dev;
+    explicit RestoreComputeDev(int d) : dev(d) {}
+    ~RestoreComputeDev() {
+      if (dev >= 0) (void)hipSetDevice(dev);
+    }
+  };
+  RestoreComputeDev restore(compute_dev);
+
   struct Tls {
     int cdev = -1, edev = -1, H = 0, Gcap = 0;
     vt::Queue eq{};

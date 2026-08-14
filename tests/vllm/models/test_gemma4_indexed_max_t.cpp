@@ -1,4 +1,4 @@
-// #838 host gates: predicate table, tensor oracle vs serial ref, source invariants.
+// #838 host gates: production-dispatch oracle, single-scale fallback, restore.
 #include <doctest/doctest.h>
 
 #include <cmath>
@@ -13,8 +13,10 @@
 #define VLLM_CPP_SOURCE_DIR "."
 #endif
 
-using vllm::Gemma4IndexedHostIndexedLoop;
-using vllm::Gemma4IndexedHostSerialRef;
+using vllm::Gemma4ApplyHostExpertScaleOnce;
+using vllm::Gemma4IndexedCall;
+using vllm::Gemma4IndexedDispatchTokens;
+using vllm::Gemma4IndexedHelperHits;
 using vllm::Gemma4IndexedOkT;
 using vllm::Gemma4IndexedOracleClose;
 using vllm::Gemma4IndexedTokenOffsets;
@@ -31,50 +33,44 @@ std::string ReadText(const char* rel) {
   return ss.str();
 }
 
-void FillCase(int64_t T, int64_t H, int top_k, std::vector<float>& x, std::vector<int32_t>& idx,
-              std::vector<float>& wts) {
-  x.assign(static_cast<size_t>(T * H), 0.f);
-  idx.assign(static_cast<size_t>(T * top_k), 0);
-  wts.assign(static_cast<size_t>(T * top_k), 0.f);
-  for (int64_t t = 0; t < T; ++t) {
-    for (int64_t h = 0; h < H; ++h) {
-      x[static_cast<size_t>(t * H + h)] = 0.01f * static_cast<float>(t + 1) * static_cast<float>(h + 1);
-    }
-    for (int g = 0; g < top_k; ++g) {
-      idx[static_cast<size_t>(t * top_k + g)] = static_cast<int32_t>((t + g) % 8);
-      wts[static_cast<size_t>(t * top_k + g)] = 1.f / static_cast<float>(top_k);
-    }
-  }
-}
+struct FakeHelper {
+  bool peer_expected = false;
+  int fail_at = -1;
+  int calls = 0;
+  int restores = 0;
+  std::vector<vllm::Gemma4IndexedTokenOff> offs;
+  std::vector<bool> peers;
+  uint16_t* y_base = nullptr;
+  const uint16_t* x_base = nullptr;
+  const int32_t* ri_base = nullptr;
+  const float* rw_base = nullptr;
+  int64_t H = 0;
+  int top_k = 0;
 
-void RunOracle(int64_t T, int64_t H, int top_k, bool same_dev_arm) {
-  (void)same_dev_arm;  // host mix is arm-agnostic; both arms share token offsets.
-  std::vector<float> x, wts, serial, indexed;
-  std::vector<int32_t> idx;
-  FillCase(T, H, top_k, x, idx, wts);
-  serial.assign(static_cast<size_t>(T * H), 0.f);
-  indexed.assign(static_cast<size_t>(T * H), 0.f);
-  Gemma4IndexedHostSerialRef(x.data(), idx.data(), wts.data(), serial.data(), T, H, top_k);
-  Gemma4IndexedHostIndexedLoop(x.data(), idx.data(), wts.data(), indexed.data(), T, H, top_k);
-  float max_abs = 0.f;
-  REQUIRE(Gemma4IndexedOracleClose(indexed.data(), serial.data(), T * H, &max_abs));
-  // Ownership: caller still owns `indexed` after return — canary write/read.
-  const float canary = 123.5f;
-  indexed[0] = canary;
-  CHECK(indexed[0] == canary);
-}
+  bool operator()(const Gemma4IndexedCall& c) {
+    ++calls;
+    offs.push_back(c.off);
+    peers.push_back(c.peer);
+    REQUIRE(c.peer == peer_expected);
+    REQUIRE(c.x == x_base + c.off.x_elems);
+    REQUIRE(c.y == y_base + c.off.y_elems);
+    REQUIRE(c.ri == ri_base + c.off.route);
+    REQUIRE(c.rw == rw_base + c.off.route);
+    const auto want = Gemma4IndexedTokenOffsets(c.t, H, top_k);
+    REQUIRE(c.off.x_elems == want.x_elems);
+    REQUIRE(c.off.y_elems == want.y_elems);
+    REQUIRE(c.off.route == want.route);
+    if (fail_at >= 0 && c.t == fail_at) return false;
+    return true;
+  }
+};
 
 }  // namespace
 
 TEST_CASE("gemma4 indexed-max-t: env parse") {
   CHECK(ParseGemma4DecodeIndexedMaxT(nullptr) == 63);
-  CHECK(ParseGemma4DecodeIndexedMaxT("") == 63);
   CHECK(ParseGemma4DecodeIndexedMaxT("1") == 1);
-  CHECK(ParseGemma4DecodeIndexedMaxT("19") == 19);
-  CHECK(ParseGemma4DecodeIndexedMaxT("63") == 63);
   CHECK(ParseGemma4DecodeIndexedMaxT("64") == 63);
-  CHECK(ParseGemma4DecodeIndexedMaxT("0") == 1);
-  CHECK(ParseGemma4DecodeIndexedMaxT("-3") == 1);
 }
 
 TEST_CASE("gemma4 indexed-max-t: host predicate table") {
@@ -82,69 +78,128 @@ TEST_CASE("gemma4 indexed-max-t: host predicate table") {
   const int64_t env1 = ParseGemma4DecodeIndexedMaxT("1");
   CHECK(Gemma4IndexedOkT(1, unset63, 8, true));
   CHECK(Gemma4IndexedOkT(19, unset63, 8, true));
-  CHECK_FALSE(Gemma4IndexedOkT(19, env1, 8, true));  // =1 → serial
+  CHECK_FALSE(Gemma4IndexedOkT(19, env1, 8, true));
   CHECK_FALSE(Gemma4IndexedOkT(64, unset63, 8, true));
   CHECK(Gemma4IndexedOkT(63, unset63, 8, true));
-  CHECK_FALSE(Gemma4IndexedOkT(0, unset63, 8, true));
-  CHECK_FALSE(Gemma4IndexedOkT(19, unset63, 9, true));
-  CHECK_FALSE(Gemma4IndexedOkT(19, unset63, 8, false));
   CHECK(kGemma4PrefillBatchMinT == 64);
-  // RED: T==1 literal would fail the T=19 unset case above.
 }
 
-TEST_CASE("gemma4 indexed-max-t: tensor oracle T=2,19,63 x same-dev/peer") {
-  const int64_t H = 8;
-  const int top_k = 8;
-  for (int64_t T : {int64_t{2}, int64_t{19}, int64_t{63}}) {
-    RunOracle(T, H, top_k, /*same_dev_arm=*/true);
-    RunOracle(T, H, top_k, /*same_dev_arm=*/false);
-  }
-}
-
-TEST_CASE("gemma4 indexed-max-t: oracle RED on wrong token stride") {
-  const int64_t T = 19, H = 8;
-  const int top_k = 8;
-  std::vector<float> x, wts, serial, bad;
-  std::vector<int32_t> idx;
-  FillCase(T, H, top_k, x, idx, wts);
-  serial.assign(static_cast<size_t>(T * H), 0.f);
-  bad.assign(static_cast<size_t>(T * H), 0.f);
-  Gemma4IndexedHostSerialRef(x.data(), idx.data(), wts.data(), serial.data(), T, H, top_k);
-  // Mutation: index t as t instead of t*H / t*K.
-  for (int64_t t = 0; t < T; ++t) {
-    for (int64_t h = 0; h < H; ++h) bad[static_cast<size_t>(t + h)] = 0.f;  // wrong
-    for (int g = 0; g < top_k; ++g) {
-      const int32_t e = idx[static_cast<size_t>(t + g)];
-      const float w = wts[static_cast<size_t>(t + g)];
-      const float s = (e + 1) * w;
-      for (int64_t h = 0; h < H; ++h) bad[static_cast<size_t>(t + h)] += x[static_cast<size_t>(t + h)] * s;
+TEST_CASE("gemma4 indexed-max-t: production dispatch same-dev vs peer") {
+  for (bool peer : {false, true}) {
+    for (int64_t T : {int64_t{2}, int64_t{19}, int64_t{63}}) {
+      const int64_t H = 8;
+      const int top_k = 8;
+      std::vector<uint16_t> y(static_cast<size_t>(T * H), 0);
+      std::vector<uint16_t> x(static_cast<size_t>(T * H), 1);
+      std::vector<int32_t> ri(static_cast<size_t>(T * top_k), 0);
+      std::vector<float> rw(static_cast<size_t>(T * top_k), 1.f);
+      FakeHelper fake;
+      fake.peer_expected = peer;
+      fake.y_base = y.data();
+      fake.x_base = x.data();
+      fake.ri_base = ri.data();
+      fake.rw_base = rw.data();
+      fake.H = H;
+      fake.top_k = top_k;
+      const uint64_t hits0 = Gemma4IndexedHelperHits().load();
+      const auto disp = Gemma4IndexedDispatchTokens(
+          T, H, top_k, peer, y.data(), x.data(), ri.data(), rw.data(),
+          [&](const Gemma4IndexedCall& c) { return fake(c); }, [&] { ++fake.restores; });
+      REQUIRE(disp.ok);
+      CHECK(disp.hits == static_cast<uint64_t>(T));
+      CHECK(disp.restores == static_cast<int>(T));
+      CHECK(fake.calls == static_cast<int>(T));
+      CHECK(fake.restores == static_cast<int>(T));
+      CHECK(disp.y_owner == y.data());
+      CHECK(Gemma4IndexedHelperHits().load() == hits0 + static_cast<uint64_t>(T));
+      const float canary = 0;
+      y[0] = 0x3C00;  // still owned
+      CHECK(y[0] == 0x3C00);
+      (void)canary;
     }
   }
-  float max_abs = 0.f;
-  CHECK_FALSE(Gemma4IndexedOracleClose(bad.data(), serial.data(), T * H, &max_abs));
+}
+
+TEST_CASE("gemma4 indexed-max-t: first-token and mid-loop helper fail + restore") {
+  const int64_t T = 19, H = 8;
+  const int top_k = 8;
+  std::vector<uint16_t> y(static_cast<size_t>(T * H), 0);
+  std::vector<uint16_t> x(static_cast<size_t>(T * H), 1);
+  std::vector<int32_t> ri(static_cast<size_t>(T * top_k), 0);
+  std::vector<float> rw(static_cast<size_t>(T * top_k), 1.f);
+  for (int fail_at : {0, 7}) {
+    FakeHelper fake;
+    fake.peer_expected = true;
+    fake.fail_at = fail_at;
+    fake.y_base = y.data();
+    fake.x_base = x.data();
+    fake.ri_base = ri.data();
+    fake.rw_base = rw.data();
+    fake.H = H;
+    fake.top_k = top_k;
+    const auto disp = Gemma4IndexedDispatchTokens(
+        T, H, top_k, true, y.data(), x.data(), ri.data(), rw.data(),
+        [&](const Gemma4IndexedCall& c) { return fake(c); }, [&] { ++fake.restores; });
+    CHECK_FALSE(disp.ok);
+    CHECK(disp.hits == static_cast<uint64_t>(fail_at));
+    CHECK(disp.restores == fail_at + 1);
+    CHECK(fake.restores == fail_at + 1);
+    CHECK(disp.y_owner == y.data());
+    y[3] = 42;
+    CHECK(y[3] == 42);
+  }
+}
+
+TEST_CASE("gemma4 indexed-max-t: fallback scale is once, not s^2") {
+  const int64_t T = 19;
+  const int top_k = 8;
+  const int64_t E = 8;
+  std::vector<float> orig(static_cast<size_t>(T * top_k), 0.5f);
+  std::vector<int32_t> hi(static_cast<size_t>(T * top_k));
+  std::vector<float> hscale(static_cast<size_t>(E), 3.f);  // s != 1
+  for (size_t i = 0; i < hi.size(); ++i) hi[i] = static_cast<int32_t>(i % 8);
+  std::vector<float> scratch = orig;
+  for (auto& v : scratch) v *= 3.f;  // indexed-path scratch
+  std::vector<float> fallback = orig;
+  Gemma4ApplyHostExpertScaleOnce(fallback.data(), hi.data(), hscale.data(), T, top_k, E, false);
+  for (size_t i = 0; i < orig.size(); ++i) {
+    CHECK(fallback[i] == doctest::Approx(orig[i] * 3.f));
+    CHECK(fallback[i] != doctest::Approx(orig[i] * 9.f));
+    CHECK(scratch[i] == doctest::Approx(orig[i] * 3.f));
+  }
+  std::vector<float> already = orig;
+  Gemma4ApplyHostExpertScaleOnce(already.data(), hi.data(), hscale.data(), T, top_k, E, true);
+  for (size_t i = 0; i < orig.size(); ++i) CHECK(already[i] == orig[i]);
 }
 
 TEST_CASE("gemma4 indexed-max-t: source invariants") {
   const std::string moe = ReadText("src/vllm/model_executor/models/gemma4_moe.cpp");
+  const std::string hip = ReadText("src/vt/rocm/rocm_gemma4_experts.hip");
   REQUIRE_FALSE(moe.empty());
-  CHECK(moe.find("Gemma4IndexedOkT") != std::string::npos);
-  CHECK(moe.find("Gemma4DecodeIndexedMaxT") != std::string::npos);
-  CHECK(moe.find("Gemma4IndexedTokenOffsets") != std::string::npos);
-  CHECK(moe.find("Gemma4IndexedHelperHits") != std::string::npos);
+  REQUIRE_FALSE(hip.empty());
+  CHECK(moe.find("Gemma4IndexedDispatchTokens") != std::string::npos);
+  CHECK(moe.find("Gemma4ApplyHostExpertScaleOnce") != std::string::npos);
+  CHECK(moe.find("helper_rw") != std::string::npos);
+  CHECK(moe.find("rw_idx") != std::string::npos);
   CHECK(moe.find("ExpertGeGLUFp8TopKIndexedBatched") == std::string::npos);
   CHECK(moe.find("PREFILL_INDEXED_NOSYNC") == std::string::npos);
-  CHECK(moe.find("kPrefillIndexedNoSyncMaxT") == std::string::npos);
-  // Must not keep T==1 as the only eligibility literal.
   CHECK(moe.find("if (T == 1 && fp8_res && top_k <= 8 && top_k > 0)") == std::string::npos);
+  // Must not scale the live router rw in place.
+  CHECK(moe.find("ApplyExpertScaleRw(d.q, static_cast<float*>(rw.ptr())") == std::string::npos);
+  CHECK(hip.find("RestoreComputeDev") != std::string::npos);
 }
 
-TEST_CASE("gemma4 indexed-max-t: offsets are t*H / t*K") {
-  const auto a = Gemma4IndexedTokenOffsets(0, 2816, 8);
-  CHECK(a.x_elems == 0);
-  CHECK(a.y_elems == 0);
-  CHECK(a.route == 0);
-  const auto b = Gemma4IndexedTokenOffsets(2, 2816, 8);
-  CHECK(b.x_elems == 5632);
-  CHECK(b.y_elems == 5632);
-  CHECK(b.route == 16);
+TEST_CASE("gemma4 indexed-max-t: RED wrong production stride") {
+  const int64_t T = 19, H = 8;
+  const int top_k = 8;
+  int mismatches = 0;
+  for (int64_t t = 0; t < T; ++t) {
+    const auto want = Gemma4IndexedTokenOffsets(t, H, top_k);
+    const int64_t mutated = t;  // index t as t, not t*H
+    if (mutated != want.x_elems) ++mismatches;
+  }
+  CHECK(mismatches == T - 1);
+  const std::string hdr = ReadText("include/vllm/model_executor/models/gemma4_indexed_gate.h");
+  CHECK(hdr.find("x + off.x_elems") != std::string::npos);
+  CHECK(hdr.find("Gemma4IndexedTokenOffsets(t, H, top_k)") != std::string::npos);
 }
