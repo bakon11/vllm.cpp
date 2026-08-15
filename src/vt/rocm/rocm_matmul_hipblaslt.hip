@@ -99,7 +99,8 @@ struct HipBlasHooks {
 BlasCtx GetBlas(int device, hipStream_t stream) {
   static thread_local GetBlasDualSlotEngine<HipBlasHooks> tls_slots;
   HipBlasHooks hooks;
-  return BlasCtx{tls_slots.Get(device, stream, hooks)};
+  // Shared seam: tests execute RocmProductGetBlasOn with the same forwarding.
+  return BlasCtx{vt::rocm::RocmProductGetBlasOn(tls_slots, device, stream, hooks)};
 }
 
 std::string ComboName(const Tensor& a, const Tensor& b, const Tensor& out) {

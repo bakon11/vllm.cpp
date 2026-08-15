@@ -1,6 +1,6 @@
 // #837 GetBlas dual-slot TLS — slot index + hookable lifetime engine.
-// Product GetBlas in rocm_matmul_hipblaslt.hip instantiates this with HIP hooks.
-// Host tests instantiate the same engine with a recorder (no GPU).
+// Product GetBlas and host tests both execute RocmProductGetBlasOn
+// (research c24b: substring wiring is not a load-bearing seam).
 #pragma once
 
 namespace vt::rocm {
@@ -54,5 +54,22 @@ struct GetBlasDualSlotEngine {
     return tls.handle;
   }
 };
+
+// Product-call seam: production GetBlas and host tests both execute this.
+// Forwards device + stream unchanged. Mutating either argument is RED.
+struct RocmGetBlasForward {
+  template <class Engine, class Hooks>
+  static typename Engine::handle_t apply(Engine& engine, int device,
+                                         typename Engine::stream_t stream,
+                                         Hooks& hooks) {
+    return engine.Get(device, stream, hooks);
+  }
+};
+
+template <class Engine, class Hooks, class Forward = RocmGetBlasForward>
+inline typename Engine::handle_t RocmProductGetBlasOn(
+    Engine& engine, int device, typename Engine::stream_t stream, Hooks& hooks) {
+  return Forward::apply(engine, device, stream, hooks);
+}
 
 }  // namespace vt::rocm
