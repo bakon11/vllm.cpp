@@ -20,6 +20,14 @@ std::string ReadHip() {
   return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
+std::string ReadHeader() {
+  const std::string path =
+      std::string(VLLM_CPP_SOURCE_DIR) + "/include/vt/rocm/rocm_gemma4_prefill_dequant_cache.h";
+  std::ifstream in(path);
+  REQUIRE(in.good());
+  return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
 }  // namespace
 
 TEST_CASE("prefill peer source has Launch/Finish and shared cache") {
@@ -154,7 +162,7 @@ TEST_CASE("prefill peer partial Ensure alloc is freed") {
   }
 }
 
-TEST_CASE("prefill peer failed ready record unpublishes victim") {
+TEST_CASE("prefill peer failed ready record keeps fill lease (no cross-stream reuse)") {
   vt::rocm::PrefillDequantCacheHost cache;
   const char ka = 'a';
   const char kb = 'b';
@@ -167,14 +175,21 @@ TEST_CASE("prefill peer failed ready record unpublishes victim") {
     REQUIRE(cache.GetLocked(&ka, &gu, &dn, &pin));
     cache.UnpinLocked(pin);
     cache.hooks.fail_record = true;
-    CHECK_FALSE(cache.GetLocked(&kb, &gu, &dn, &pin));
+    int fail_pin = -1;
+    CHECK_FALSE(cache.GetLocked(&kb, &gu, &dn, &fail_pin));
+    CHECK(fail_pin >= 0);
     CHECK(cache.slots[0].key == nullptr);
     CHECK_FALSE(cache.slots[0].ready);
-    CHECK_FALSE(cache.slots[0].filling);
-    cache.hooks.fail_record = false;
-    REQUIRE(cache.GetLocked(&ka, &gu, &dn, &pin));
-    CHECK(cache.slots[0].key == &ka);
-    CHECK(cache.slots[0].ready);
+    CHECK(cache.slots[0].filling);
+    CHECK(cache.slots[0].fill_failed);
+    CHECK(cache.LivePins() >= 1);
+    CHECK(cache.hooks.fill_calls >= 1);
+    int reuse = -1;
+    CHECK_FALSE(cache.GetLocked(&ka, &gu, &dn, &reuse));
+    CHECK(cache.slots[0].key == nullptr);
+    REQUIRE_FALSE(cache.RetireFillLocked(fail_pin, /*retire_ok=*/false));
+    CHECK(cache.slots[0].fill_failed);
+    CHECK(cache.LivePins() >= 1);
   }
 }
 
@@ -184,9 +199,13 @@ TEST_CASE("prefill peer stale prior ev_e is not current rollback target") {
   life.this_gen_ev_e = false;
   life.rollback_armed = true;
   life.cache_pin = -1;
-  CHECK(vt::rocm::ChoosePrefillRetire(life) == vt::rocm::PrefillRetireTarget::CurrentStream);
+  CHECK(vt::rocm::ChoosePrefillRetire(life) == vt::rocm::PrefillRetireTarget::ComputeStream);
   life.this_gen_ev_e = true;
   CHECK(vt::rocm::ChoosePrefillRetire(life) == vt::rocm::PrefillRetireTarget::RecordedEvent);
+  life.this_gen_ev_e = false;
+  life.rollback_armed = false;
+  life.work_on_expert = true;
+  CHECK(vt::rocm::ChoosePrefillRetire(life) == vt::rocm::PrefillRetireTarget::ExpertStream);
 }
 
 TEST_CASE("prefill peer two-invocation: second enqueue fail syncs current stream") {
@@ -200,6 +219,7 @@ TEST_CASE("prefill peer two-invocation: second enqueue fail syncs current stream
   REQUIRE_FALSE(
       vt::rocm::HostLaunch(cache, slot, 0, &key, 8, vt::rocm::PrefillPeerFailAt::AfterFirstEnqueue));
   CHECK(vt::rocm::ChoosePrefillRetire(slot) != vt::rocm::PrefillRetireTarget::RecordedEvent);
+  CHECK(slot.work_enqueued);
 }
 
 TEST_CASE("prefill peer restore failure is fatal not false") {
@@ -223,13 +243,81 @@ TEST_CASE("prefill peer same-dev quarantine blocks reenter and reconfigure") {
   CHECK(life.CanEnter());
 }
 
+TEST_CASE("prefill peer same-dev pin held through GEMM readers") {
+  vt::rocm::PrefillDequantCacheHost cache;
+  vt::rocm::SameDevLife life;
+  vt::rocm::SameDevSession sess;
+  sess.cache = &cache;
+  sess.life = &life;
+  const char key = 'k';
+  REQUIRE(sess.Acquire(&key, 0));
+  CHECK(cache.LivePins() == 1);
+  CHECK(life.cache_pin >= 0);
+  REQUIRE(sess.RunGemmReaders());
+  CHECK_FALSE(sess.unpinned_before_gemm);
+  CHECK(cache.LivePins() == 1);
+  REQUIRE(sess.Retire(/*sync_ok=*/true));
+  CHECK(cache.LivePins() == 0);
+}
+
+TEST_CASE("prefill peer same-dev early unpin before GEMM is RED") {
+  vt::rocm::PrefillDequantCacheHost cache;
+  vt::rocm::SameDevLife life;
+  vt::rocm::SameDevSession sess;
+  sess.cache = &cache;
+  sess.life = &life;
+  const char key = 'k';
+  REQUIRE(sess.Acquire(&key, 0));
+  {
+    std::lock_guard<std::mutex> lk(cache.mu);
+    cache.UnpinLocked(sess.pin);  // product mutation analogue
+  }
+  CHECK_FALSE(sess.RunGemmReaders());
+  CHECK(sess.unpinned_before_gemm);
+}
+
+TEST_CASE("prefill peer LifeFromSlot does not remap this_gen to ev_e_recorded") {
+  struct FakeSlot {
+    int cache_pin = 3;
+    int cache_dev = 1;
+    bool this_gen_ev_e = false;
+    bool ev_e_recorded = true;
+    bool rollback_armed = true;
+    bool quarantined = false;
+    bool work_on_compute = true;
+    bool work_on_expert = false;
+  } tls;
+  const auto life = vt::rocm::LifeFromSlot(tls);
+  CHECK_FALSE(life.this_gen_ev_e);
+  CHECK(life.ev_e_recorded);
+  CHECK(vt::rocm::ChoosePrefillRetire(life) == vt::rocm::PrefillRetireTarget::ComputeStream);
+}
+
+TEST_CASE("prefill peer restore no-op mutation is RED") {
+  vt::rocm::PrefillDequantCacheHost cache;
+  vt::rocm::PrefillPeerLife slot;
+  const char key = 'k';
+  auto mutated_restore = [](int) { return true; };  // no-op success
+  (void)mutated_restore;
+  CHECK_THROWS_AS(
+      vt::rocm::HostLaunch(cache, slot, 0, &key, 8, vt::rocm::PrefillPeerFailAt::None,
+                           /*retire_ok=*/true, /*restore_ok=*/false),
+      vt::rocm::RestoreFailed);
+  const std::string hdr = ReadHeader();
+  CHECK(hdr.find("if (std::uncaught_exceptions() > 0) return;") == std::string::npos);
+  CHECK(hdr.find("if (!set(dev)) std::terminate();") != std::string::npos);
+}
+
 TEST_CASE("prefill peer source: product uses shared retire/restore policy") {
   const std::string hip = ReadHip();
   CHECK(hip.find("ChoosePrefillRetire(PeerLifeView") != std::string::npos);
+  CHECK(hip.find("LifeFromSlot") != std::string::npos);
   CHECK(hip.find("RestoreComputeOrThrow") != std::string::npos);
   CHECK(hip.find("bool RestoreComputeDevOrFatal") == std::string::npos);
-  CHECK(hip.find("this_gen_ev_e = false") != std::string::npos);
   CHECK(hip.find("life.Quarantine") != std::string::npos);
+  CHECK(hip.find("life.PersistPin") != std::string::npos);
+  CHECK(hip.find("work_on_compute = true") != std::string::npos);
+  CHECK(hip.find("FailLaunchRestore(tls, est, cst, compute_dev)") != std::string::npos);
   const auto ret = hip.find("bool RetirePinThenUnpin");
   REQUIRE(ret != std::string::npos);
   const auto ret_end = hip.find("void FailLaunchRestore", ret);
@@ -237,4 +325,36 @@ TEST_CASE("prefill peer source: product uses shared retire/restore policy") {
   const std::string retire = hip.substr(ret, ret_end - ret);
   CHECK(retire.find("(void)hipEventSynchronize") == std::string::npos);
   CHECK(retire.find("ChoosePrefillRetire") != std::string::npos);
+  CHECK(retire.find("PrefillRetireTarget::ComputeStream") != std::string::npos);
+  CHECK(retire.find("PrefillRetireTarget::ExpertStream") != std::string::npos);
+
+  // After first successful enqueue is armed, bare restore-return is forbidden.
+  const auto armed = hip.find("tls.rollback_armed = true");
+  REQUIRE(armed != std::string::npos);
+  const auto rec_end = hip.find("tls.pending_M = M;", armed);
+  REQUIRE(rec_end != std::string::npos);
+  const std::string after = hip.substr(armed, rec_end - armed);
+  CHECK(after.find("RestoreComputeOrThrow(compute_dev); return false;") == std::string::npos);
+  CHECK(after.find("FailLaunchRestore(tls, est, cst, compute_dev)") != std::string::npos);
+
+  // Same-dev: no UnpinLocked between GetLocked and MatmulBT.
+  const auto sd = hip.find("if (expert_dev == compute_dev)");
+  REQUIRE(sd != std::string::npos);
+  const auto launch = hip.find("LaunchGemma4Fp8ExpertGeGLUPrefillPeer(compute_q, /*slot=*/0", sd);
+  REQUIRE(launch != std::string::npos);
+  const std::string same = hip.substr(sd, launch - sd);
+  const auto gl = same.find("GetLocked");
+  const auto mm = same.find("MatmulBT");
+  REQUIRE(gl != std::string::npos);
+  REQUIRE(mm != std::string::npos);
+  const auto unpin = same.find("UnpinLocked", gl);
+  const bool unpin_after_gemm = unpin == std::string::npos || unpin > mm;
+  CHECK(unpin_after_gemm);
+}
+
+TEST_CASE("prefill peer this_gen remap mutation is RED") {
+  const std::string hip = ReadHip();
+  CHECK(hip.find("life.this_gen_ev_e = tls.ev_e_recorded") == std::string::npos);
+  CHECK(hip.find("PeerLifeView(const PeerSlot& tls) { return vt::rocm::LifeFromSlot(tls); }") !=
+        std::string::npos);
 }

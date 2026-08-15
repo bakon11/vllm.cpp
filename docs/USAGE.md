@@ -3998,7 +3998,7 @@ GetBlas keeps two per-thread hipBLAS handles (`tls_slots[2]`, device 1 → slot 
 so a 0→1 hop does not destroy GPU0's handle. `ProductGetBlasHandle` is the
 test accessor for that file-local `GetBlas`. HIP live probe is a separate CTest
 target (exit 77 if `HIP_VISIBLE_DEVICES` empty); it enters capture so production `StreamIsCapturing` is load-bearing. No new env.
-Prefill peer (#839) unpins dequant cache only after observed retirement; failed retire quarantines the pin.
+Prefill peer (#839) unpins dequant cache only after observed retirement; failed fill/ready keeps a fill lease; failed retire quarantines the pin; rollback syncs the stream that received work.
 This PR does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
 (those stay lab-only until a CUDA token-exact gate can land them).
 

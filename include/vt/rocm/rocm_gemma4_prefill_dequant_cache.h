@@ -4,8 +4,8 @@
 
 #include <cstdint>
 #include <cstdlib>
-#include <mutex>
 #include <exception>
+#include <mutex>
 #include <stdexcept>
 #include <utility>
 
@@ -15,7 +15,7 @@ inline int PrefillDequantCacheSlots() { return 1; }
 inline constexpr int kPrefillDequantCacheMaxSlots = 128;
 
 enum class PrefillRetireOutcome { None, Unpinned, Quarantined };
-enum class PrefillRetireTarget { None, CurrentStream, RecordedEvent };
+enum class PrefillRetireTarget { None, ComputeStream, ExpertStream, RecordedEvent };
 
 struct PrefillPeerLife {
   int cache_pin = -1;
@@ -24,15 +24,20 @@ struct PrefillPeerLife {
   bool ev_e_recorded = false;
   bool this_gen_ev_e = false;
   bool work_enqueued = false;
+  bool work_on_compute = false;
+  bool work_on_expert = false;
   bool rollback_armed = false;
   bool quarantined = false;
   bool compute_restored = false;
 
+  // Arm after the first successful current-generation enqueue.
   void ArmRollback() {
     rollback_armed = true;
     work_enqueued = true;
     this_gen_ev_e = false;
   }
+  void MarkComputeWork() { work_on_compute = true; }
+  void MarkExpertWork() { work_on_expert = true; }
   void MarkThisGenEvent() {
     this_gen_ev_e = true;
     ev_e_recorded = true;
@@ -44,18 +49,37 @@ struct PrefillPeerLife {
     ev_e_recorded = false;
     this_gen_ev_e = false;
     rollback_armed = false;
+    work_on_compute = false;
+    work_on_expert = false;
   }
 };
+
+// Map any slot-like object that carries the product flags.
+template <typename Slot>
+PrefillPeerLife LifeFromSlot(const Slot& tls) {
+  PrefillPeerLife life;
+  life.cache_pin = tls.cache_pin;
+  life.cache_dev = tls.cache_dev;
+  life.this_gen_ev_e = tls.this_gen_ev_e;
+  life.ev_e_recorded = tls.ev_e_recorded;
+  life.rollback_armed = tls.rollback_armed;
+  life.quarantined = tls.quarantined;
+  life.work_on_compute = tls.work_on_compute;
+  life.work_on_expert = tls.work_on_expert;
+  return life;
+}
 
 inline bool SlotReusable(bool pending, bool rollback_armed, bool quarantined) {
   return !pending && !rollback_armed && !quarantined;
 }
 
-// Rollback armed before this generation recorded ev_e must sync the current
-// owning stream, never a leftover prior event.
+// this_gen ev_e wins. Else expert-stream work, else compute-stream work.
+// Never treat a leftover ev_e_recorded as the current rollback target.
 inline PrefillRetireTarget ChoosePrefillRetire(const PrefillPeerLife& life) {
   if (life.this_gen_ev_e) return PrefillRetireTarget::RecordedEvent;
-  if (life.rollback_armed || life.cache_pin >= 0) return PrefillRetireTarget::CurrentStream;
+  if (life.work_on_expert) return PrefillRetireTarget::ExpertStream;
+  if (life.work_on_compute || life.rollback_armed || life.cache_pin >= 0)
+    return PrefillRetireTarget::ComputeStream;
   return PrefillRetireTarget::None;
 }
 
@@ -75,18 +99,16 @@ struct ComputeDevGuard {
 
   void RestoreOrThrow() {
     if (done) return;
-    if (!set(dev)) throw RestoreFailed{};
-    done = true;
+    const bool ok = set(dev);
+    done = true;  // failure is thrown; dtor must not terminate on the same attempt
+    if (!ok) throw RestoreFailed{};
   }
 
+  // Failed restore is fatal even during exception unwind (c2ae).
   ~ComputeDevGuard() noexcept {
-    if (!done) {
-      if (!set(dev)) {
-        if (std::uncaught_exceptions() > 0) return;
-        std::terminate();
-      }
-      done = true;
-    }
+    if (done) return;
+    if (!set(dev)) std::terminate();
+    done = true;
   }
 };
 
@@ -96,6 +118,10 @@ struct SameDevLife {
   bool quarantined = false;
   bool CanEnter() const { return !quarantined; }
   bool CanReconfigure() const { return !quarantined && cache_pin < 0; }
+  void PersistPin(int pin, int dev) {
+    cache_pin = pin;
+    cache_dev = dev;
+  }
   void Quarantine(int pin, int dev) {
     cache_pin = pin;
     cache_dev = dev;
@@ -118,6 +144,7 @@ struct PrefillDequantCacheT {
     int pins = 0;
     bool ready = false;
     bool filling = false;
+    bool fill_failed = false;
     typename Hooks::Event ready_ev{};
   };
 
@@ -163,6 +190,10 @@ struct PrefillDequantCacheT {
     return n;
   }
 
+  bool SlotNonReusable(int i) const {
+    return slots[i].filling || slots[i].fill_failed || slots[i].pins > 0;
+  }
+
   bool Ensure(int device, int i_dim, int h_dim) {
     const int want = PrefillDequantCacheSlots();
     if (dev == device && I == i_dim && H == h_dim && nslots == want) return true;
@@ -192,18 +223,19 @@ struct PrefillDequantCacheT {
     return true;
   }
 
+  // pin_out is written as soon as a fill lease or hit pin is taken, including
+  // failed Fill/RecordReady — caller must persist/retire that pin.
   bool GetLocked(const void* key, void** gu_out, void** dn_out, int* pin_out) {
     if (!key || !gu_out || !dn_out || nslots <= 0) return false;
     int hit = -1;
     int victim = -1;
     uint64_t oldest = UINT64_MAX;
     for (int i = 0; i < nslots; ++i) {
-      if (slots[i].filling) continue;
-      if (slots[i].key == key && slots[i].ready) {
+      if (slots[i].key == key && slots[i].ready && !slots[i].filling && !slots[i].fill_failed) {
         hit = i;
         break;
       }
-      if (slots[i].pins > 0) continue;
+      if (SlotNonReusable(i)) continue;
       if (slots[i].key == nullptr) {
         if (victim < 0) victim = i;
       } else if (slots[i].lru < oldest) {
@@ -223,7 +255,7 @@ struct PrefillDequantCacheT {
     }
     if (victim < 0) {
       for (int i = 0; i < nslots; ++i) {
-        if (slots[i].pins == 0 && !slots[i].filling) {
+        if (!SlotNonReusable(i)) {
           victim = i;
           break;
         }
@@ -231,15 +263,18 @@ struct PrefillDequantCacheT {
       if (victim < 0) return false;
     }
     Slot& s = slots[victim];
-    s.key = nullptr;
+    s.key = nullptr;  // unpublish before fill
     s.ready = false;
     s.filling = true;
+    s.fill_failed = false;
+    s.pins++;  // fill lease from first enqueue
+    if (pin_out) *pin_out = victim;
     if (!hooks.Fill(s.gu, s.dn)) {
-      s.filling = false;
+      s.fill_failed = true;
       return false;
     }
     if (!hooks.RecordReady(s.ready_ev)) {
-      s.filling = false;
+      s.fill_failed = true;
       return false;
     }
     s.ready = true;
@@ -247,10 +282,8 @@ struct PrefillDequantCacheT {
     s.filling = false;
     ++misses;
     s.lru = ++clock;
-    s.pins++;
     *gu_out = s.gu;
     *dn_out = s.dn;
-    if (pin_out) *pin_out = victim;
     return true;
   }
 
@@ -258,16 +291,31 @@ struct PrefillDequantCacheT {
     if (idx < 0 || idx >= nslots) return;
     if (slots[idx].pins > 0) slots[idx].pins--;
   }
+
+  // Producer-stream retirement of a failed fill lease.
+  bool RetireFillLocked(int idx, bool retire_ok) {
+    if (idx < 0 || idx >= nslots) return false;
+    if (!retire_ok) {
+      slots[idx].fill_failed = true;
+      return false;
+    }
+    slots[idx].filling = false;
+    slots[idx].fill_failed = false;
+    if (slots[idx].pins > 0) slots[idx].pins--;
+    return true;
+  }
 };
 
 struct HostAlloc {
   int next = 1;
   int mallocs = 0;
   int frees = 0;
+  int fill_calls = 0;
   int fail_malloc_at = -1;
   bool fail_record = false;
   bool fail_wait = false;
   bool fail_set_device = false;
+  bool fail_fill = false;
   struct Event {
     bool recorded = false;
   };
@@ -281,7 +329,10 @@ struct HostAlloc {
     if (p) ++frees;
   }
   void DestroyEvent(Event& e) { e.recorded = false; }
-  bool Fill(void*, void*) { return true; }
+  bool Fill(void*, void*) {
+    ++fill_calls;
+    return !fail_fill;
+  }
   bool RecordReady(Event& e) {
     if (fail_record) return false;
     e.recorded = true;
@@ -310,6 +361,8 @@ enum class PrefillPeerFailAt {
   AfterRecord,
   AfterWait,
   AfterCopy,
+  AfterSameDevAcquire,
+  AfterSameDevGemm,
 };
 
 using PrefillPeerSlotHost = PrefillPeerLife;
@@ -331,6 +384,8 @@ inline bool HostRetireThenUnpin(PrefillDequantCacheHost& cache, PrefillPeerLife&
   return false;
 }
 
+// Product-shaped Launch: arm rollback only after the first enqueue, then every
+// later failure retires the streams that actually received work.
 inline bool HostLaunch(PrefillDequantCacheHost& cache, PrefillPeerLife& slot, int device,
                        const void* key, int M, PrefillPeerFailAt fail, bool retire_ok = true,
                        bool restore_ok = true) {
@@ -338,7 +393,10 @@ inline bool HostLaunch(PrefillDequantCacheHost& cache, PrefillPeerLife& slot, in
   auto set = [restore_ok](int) { return restore_ok; };
   ComputeDevGuard<decltype(set)> guard(device, set);
   slot.compute_restored = false;
+
+  // First current-generation enqueue (compute-stream ev_c analogue).
   slot.ArmRollback();
+  slot.MarkComputeWork();
   if (fail == PrefillPeerFailAt::AfterFirstEnqueue) {
     if (!HostRetireThenUnpin(cache, slot, retire_ok)) {
       slot.compute_restored = true;
@@ -349,12 +407,16 @@ inline bool HostLaunch(PrefillDequantCacheHost& cache, PrefillPeerLife& slot, in
     slot.compute_restored = true;
     return false;
   }
+  slot.MarkExpertWork();
+
   int pin = -1;
   void* gu = nullptr;
   void* dn = nullptr;
   {
     std::lock_guard<std::mutex> lk(cache.mu);
     if (!cache.Ensure(device, 4, 8) || !cache.GetLocked(key, &gu, &dn, &pin)) {
+      if (pin >= 0) slot.cache_pin = pin;
+      slot.cache_dev = device;
       if (!HostRetireThenUnpin(cache, slot, retire_ok)) {
         slot.compute_restored = true;
         guard.RestoreOrThrow();
@@ -365,7 +427,7 @@ inline bool HostLaunch(PrefillDequantCacheHost& cache, PrefillPeerLife& slot, in
       return false;
     }
   }
-  slot.cache_pin = pin;
+  slot.cache_pin = pin;  // persist immediately on acquisition
   slot.cache_dev = device;
   if (fail == PrefillPeerFailAt::AfterPinEnqueue || fail == PrefillPeerFailAt::RecordEvE) {
     if (!HostRetireThenUnpin(cache, slot, retire_ok)) {
@@ -420,5 +482,54 @@ inline bool HostFinish(PrefillDequantCacheHost& cache, PrefillPeerLife& slot, in
   slot.compute_restored = true;
   return true;
 }
+
+// Same-device product seam: persist pin on acquire; GEMM readers run while
+// pinned; unpin only after observed retire. Early UnpinLocked is a RED mutation.
+struct SameDevSession {
+  PrefillDequantCacheHost* cache = nullptr;
+  SameDevLife* life = nullptr;
+  int pin = -1;
+  bool gemm_readers_ran = false;
+  bool unpinned_before_gemm = false;
+
+  bool Acquire(const void* key, int device) {
+    if (!cache || !life || !life->CanEnter()) return false;
+    void* gu = nullptr;
+    void* dn = nullptr;
+    std::lock_guard<std::mutex> lk(cache->mu);
+    if (!cache->Ensure(device, 4, 8) || !cache->GetLocked(key, &gu, &dn, &pin)) {
+      if (pin >= 0) life->PersistPin(pin, device);
+      return false;
+    }
+    life->PersistPin(pin, device);
+    return true;
+  }
+
+  bool RunGemmReaders() {
+    if (!cache || pin < 0) return false;
+    if (cache->slots[pin].pins <= 0) {
+      unpinned_before_gemm = true;
+      return false;
+    }
+    gemm_readers_ran = true;
+    return true;
+  }
+
+  bool Retire(bool sync_ok) {
+    if (!cache || !life) return false;
+    if (pin < 0) return true;
+    if (!sync_ok) {
+      life->Quarantine(pin, life->cache_dev);
+      return false;
+    }
+    {
+      std::lock_guard<std::mutex> lk(cache->mu);
+      cache->UnpinLocked(pin);
+    }
+    life->ClearPin();
+    pin = -1;
+    return true;
+  }
+};
 
 }  // namespace vt::rocm
