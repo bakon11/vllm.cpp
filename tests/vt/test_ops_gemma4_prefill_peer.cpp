@@ -1,4 +1,5 @@
 // #839 host lifetime + product-policy mutations for prefill peer.
+#include <cstdlib>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -26,6 +27,74 @@ std::string ReadHeader() {
   std::ifstream in(path);
   REQUIRE(in.good());
   return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+std::string ExtractFinish(const std::string& hip) {
+  const auto a = hip.rfind("bool FinishGemma4Fp8ExpertGeGLUPrefillPeer");
+  REQUIRE(a != std::string::npos);
+  const auto b = hip.find("void PinGemma4Fp8ExpertHostCache", a);
+  REQUIRE(b != std::string::npos);
+  return hip.substr(a, b - a);
+}
+
+bool ProductFinishRetiresCstBeforeReuse(const std::string& finish) {
+  const auto sync = finish.find("hipStreamSynchronize(cst)");
+  const auto success =
+      finish.find("tls.pending_M = 0;\n  RestoreComputeOrThrow(compute_dev); return true;");
+  return sync != std::string::npos && success != std::string::npos && sync < success;
+}
+
+int CompileFinishCatchTu(const std::string& finish, const std::string& compiler) {
+  const auto c1 = finish.find("} catch (const vt::rocm::RestoreFailed&)");
+  if (c1 == std::string::npos) return 127;
+  const std::string catches = finish.substr(c1);  // includes function closer
+  const std::string path = "/tmp/vllm_prefill_peer_finish_catch_gate.cpp";
+  std::ofstream out(path);
+  if (!out.good()) return 126;
+  out << R"GATE(
+#include <exception>
+namespace vt {
+struct Queue {
+  struct {
+    int index = 0;
+  } device;
+  void* handle = nullptr;
+};
+namespace rocm {
+struct RestoreFailed : std::exception {};
+}
+}
+struct PeerSlot {
+  int cache_pin = -1;
+  bool rollback_armed = false;
+  int pending_M = 0;
+  bool eq_live = false;
+  struct {
+    void* handle = nullptr;
+  } eq;
+};
+struct PeerTls {
+  PeerSlot s[2];
+};
+PeerTls& PeerPipeTls() {
+  static PeerTls t;
+  return t;
+}
+using hipStream_t = void*;
+bool RetirePinThenUnpin(PeerSlot&, hipStream_t, hipStream_t) { return true; }
+void RestoreComputeOrThrow(int) {}
+bool gate(vt::Queue& compute_q, int slot) {
+  try {
+    hipStream_t cst = static_cast<hipStream_t>(compute_q.handle);
+    (void)cst;
+    throw vt::rocm::RestoreFailed{};
+  )GATE";
+  out << catches;
+  out.close();
+  const std::string cmd = std::string("HIP_VISIBLE_DEVICES= ") + compiler +
+                          " -fsyntax-only -std=c++17 " + path +
+                          " -o /tmp/vllm_prefill_peer_finish_catch_gate.o >/tmp/vllm_prefill_peer_finish_catch_gate.out 2>/tmp/vllm_prefill_peer_finish_catch_gate.err";
+  return std::system(cmd.c_str());
 }
 
 }  // namespace
@@ -360,17 +429,55 @@ TEST_CASE("prefill peer two-compute-stream output-copy retirement") {
   vt::rocm::OutputCopyGate gate;
   gate.Enqueue(1);
   CHECK_FALSE(gate.CanReuseScratch());
-  CHECK_FALSE(gate.Retire(2));  // other compute stream
+  CHECK_FALSE(gate.Retire(2));
   CHECK_FALSE(gate.CanReuseScratch());
   REQUIRE(gate.Retire(1));
   CHECK(gate.CanReuseScratch());
+
   vt::rocm::PrefillDequantCacheHost cache;
   vt::rocm::PrefillPeerLife slot;
   const char key = 'k';
   REQUIRE(vt::rocm::HostLaunch(cache, slot, 0, &key, 8, vt::rocm::PrefillPeerFailAt::None));
-  REQUIRE(vt::rocm::HostFinish(cache, slot, 8, vt::rocm::PrefillPeerFailAt::None));
+  // Copy on stream 1, retire on stream 2: product mutation analogue is RED.
+  CHECK_FALSE(vt::rocm::HostFinish(cache, slot, 8, vt::rocm::PrefillPeerFailAt::None, true, true, 1, 2));
+  CHECK_FALSE(slot.output_copy.CanReuseScratch());
+  CHECK(slot.pending_M == 8);
+  vt::rocm::PrefillPeerLife reuse;
+  reuse.output_copy = slot.output_copy;
+  CHECK_FALSE(vt::rocm::HostLaunch(cache, reuse, 0, &key, 8, vt::rocm::PrefillPeerFailAt::None));
+  REQUIRE(vt::rocm::HostFinish(cache, slot, 8, vt::rocm::PrefillPeerFailAt::None, true, true, 1, 1));
   CHECK(slot.output_copy.CanReuseScratch());
   CHECK(slot.pending_M == 0);
+}
+
+TEST_CASE("prefill peer Finish catch HIP/C++ compile gate") {
+  const std::string finish = ExtractFinish(ReadHip());
+  CHECK(CompileFinishCatchTu(finish, "g++") == 0);
+  CHECK(CompileFinishCatchTu(finish, "/opt/rocm-7.2.4/core-7.14/bin/hipcc -x c++") == 0);
+  std::string mut_cst = finish;
+  const std::string decl = "    hipStream_t cst = static_cast<hipStream_t>(compute_q.handle);\n";
+  auto p1 = mut_cst.find(decl);
+  REQUIRE(p1 != std::string::npos);
+  mut_cst.erase(p1, decl.size());
+  auto p2 = mut_cst.find(decl);
+  if (p2 != std::string::npos) mut_cst.erase(p2, decl.size());
+  CHECK(CompileFinishCatchTu(mut_cst, "g++") != 0);
+  CHECK(CompileFinishCatchTu(mut_cst, "/opt/rocm-7.2.4/core-7.14/bin/hipcc -x c++") != 0);
+}
+
+TEST_CASE("prefill peer product two-stream output-copy mutation is RED") {
+  const std::string finish = ExtractFinish(ReadHip());
+  CHECK(ProductFinishRetiresCstBeforeReuse(finish));
+  const std::string block =
+      "  if (hipStreamSynchronize(cst) != hipSuccess) {\n"
+      "    tls.quarantined = true;\n"
+      "    RestoreComputeOrThrow(compute_dev); return false;\n"
+      "  }\n";
+  std::string mut = finish;
+  const auto pos = mut.find(block);
+  REQUIRE(pos != std::string::npos);
+  mut.erase(pos, block.size());
+  CHECK_FALSE(ProductFinishRetiresCstBeforeReuse(mut));
 }
 
 TEST_CASE("prefill peer source: product uses shared retire/restore policy") {
