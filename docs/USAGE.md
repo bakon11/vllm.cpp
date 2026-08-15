@@ -3619,3 +3619,7 @@ length is the one the request's duration implies, and that it is **real audio** 
 non-zero, unclipped, non-constant, and with two channels that differ (the stereo
 fold is a contiguous split of the 128 latent channels, and an interleave produces
 a correctly shaped, correctly ranged, wrong song).
+
+Gemma-4 FP8 xdev prefill (`RunGemma4Fp8ExpertGeGLUPrefillOnExpertDevice`) is a
+Launch/Finish wrapper: cache pins stay live until host-observed `ev_e` retirement.
+Peer-pipe overlap stays off (slot 0 only).

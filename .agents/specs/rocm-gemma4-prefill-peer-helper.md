@@ -12,7 +12,13 @@
 
 ## Now
 
-`SPIKE` — spec for review. No product code in this commit.
+`IMPLEMENTING` — Launch/Finish + pin-until-retire on this row.
+
+## Adjacent upstream (not this row)
+
+- **#785**: `VT_ROCWMMA_OK` / #697 landing-order only. Do not touch `rocm_paged_attn.hip`.
+- **#523 / #509**: custom keep-quant grouped GEMM + `rocm_moe_chain.hip`. No GetBlas/Launch/Finish overlap; docs-only if FEATURES/USAGE touch.
+- **#834**: router-lookahead prefetch — adjacent cache policy, not this pin lifetime.
 
 **Not a confirmed fix.** Hypothesis (C) only. `9772` does not isolate Launch/Finish vs dequant-cache vs GetBlas. Repeated invocation is **observed** to wedge after matched BEGIN/END. Cause (single-slot TLS vs cache eviction vs GetBlas destroy) is **unconfirmed**. Do not say repeated invocation "exhausts" single-slot state.
 
