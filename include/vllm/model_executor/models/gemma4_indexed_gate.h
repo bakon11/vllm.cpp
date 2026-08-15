@@ -125,10 +125,20 @@ inline void Gemma4IndexedHostApplyToken(float* y, const float* x, const int32_t*
   }
 }
 
+// Independent of Gemma4IndexedHostApplyToken — do not call it here.
 inline void Gemma4IndexedHostSerialRef(const float* x, const int32_t* idx, const float* wts,
                                        float* y, int64_t T, int64_t H, int top_k) {
   for (int64_t t = 0; t < T; ++t) {
-    Gemma4IndexedHostApplyToken(y + t * H, x + t * H, idx + t * top_k, wts + t * top_k, H, top_k);
+    float* yt = y + t * H;
+    const float* xt = x + t * H;
+    const int32_t* idt = idx + t * top_k;
+    const float* wt = wts + t * top_k;
+    for (int64_t h = 0; h < H; ++h) yt[h] = 0.f;
+    for (int g = 0; g < top_k; ++g) {
+      const int32_t e = idt[g];
+      const float s = static_cast<float>(e + 1) * wt[g];
+      for (int64_t h = 0; h < H; ++h) yt[h] += xt[h] * s;
+    }
   }
 }
 
@@ -147,25 +157,75 @@ inline bool Gemma4IndexedOracleClose(const float* cand, const float* ref, int64_
   return max_abs_diff <= tol;
 }
 
-// Scratch may not return to a reusable pool until peer/compute work is retired.
-struct Gemma4IndexedScratchLedger {
-  bool enqueued = false;
-  bool retired = false;
-  bool released_to_pool = false;
-};
+enum class Gemma4IndexedArm { SameDev, Peer, None };
 
-inline void Gemma4IndexedRetireScratch(Gemma4IndexedScratchLedger& L) { L.retired = true; }
-
-inline bool Gemma4IndexedReleaseScratchToPool(Gemma4IndexedScratchLedger& L) {
-  if (L.enqueued && !L.retired) return false;
-  L.released_to_pool = true;
-  return true;
+inline Gemma4IndexedArm Gemma4IndexedSelectArm(bool fp8_res_same, bool fp8_res_peer) {
+  if (fp8_res_same) return Gemma4IndexedArm::SameDev;
+  if (fp8_res_peer) return Gemma4IndexedArm::Peer;
+  return Gemma4IndexedArm::None;
 }
 
-template <typename Retire, typename Release>
-inline bool Gemma4IndexedOnHelperFail(bool enqueued, Retire retire, Release release) {
-  if (enqueued) retire();
-  release();
+template <typename SameFn, typename PeerFn>
+inline bool Gemma4IndexedRunSelectedArm(Gemma4IndexedArm arm, SameFn same, PeerFn peer) {
+  if (arm == Gemma4IndexedArm::SameDev) return same();
+  if (arm == Gemma4IndexedArm::Peer) return peer();
+  return false;
+}
+
+struct Gemma4IndexedHelperArgs {
+  void* y = nullptr;
+  const void* x = nullptr;
+  const int32_t* ri = nullptr;
+  const float* rw = nullptr;
+};
+
+inline Gemma4IndexedHelperArgs Gemma4IndexedPackArgs(void* y, const void* x, const int32_t* ri,
+                                                     const float* rw) {
+  return Gemma4IndexedHelperArgs{y, x, ri, rw};
+}
+
+inline bool Gemma4IndexedArgsEq(const Gemma4IndexedHelperArgs& a, const Gemma4IndexedHelperArgs& b) {
+  return a.y == b.y && a.x == b.x && a.ri == b.ri && a.rw == b.rw;
+}
+
+enum class Gemma4IndexedScratchKind { TlsT1, OwnedTH };
+
+inline Gemma4IndexedScratchKind Gemma4IndexedScratchKindFor(int64_t T) {
+  return T == 1 ? Gemma4IndexedScratchKind::TlsT1 : Gemma4IndexedScratchKind::OwnedTH;
+}
+
+struct Gemma4IndexedScratchChoice {
+  Gemma4IndexedScratchKind kind = Gemma4IndexedScratchKind::OwnedTH;
+  void* y = nullptr;
+  int64_t elems = 0;
+};
+
+inline bool Gemma4IndexedScratchValidForT(const Gemma4IndexedScratchChoice& c, int64_t T, int64_t H) {
+  if (T <= 0 || H <= 0 || c.y == nullptr) return false;
+  if (T == 1) return c.kind == Gemma4IndexedScratchKind::TlsT1 && c.elems >= H;
+  return c.kind == Gemma4IndexedScratchKind::OwnedTH && c.elems >= T * H;
+}
+
+// Release to pool is illegal unless retirement was observed.
+inline bool Gemma4IndexedMayReleaseToPool(bool enqueued, bool retire_observed) {
+  return !enqueued || retire_observed;
+}
+
+// Host model of the production fail path: retire while buffer is still owned,
+// then release only if retirement was observed. Release-before-retire is RED.
+template <typename Retire>
+inline bool Gemma4IndexedFailPathRetireThenMaybeRelease(bool enqueued, bool& owned, bool& released,
+                                                        bool& retire_ok, Retire retire) {
+  if (!owned) return false;
+  retire_ok = true;
+  if (enqueued) retire_ok = retire();
+  if (!Gemma4IndexedMayReleaseToPool(enqueued, retire_ok)) {
+    owned = true;  // quarantine: keep ownership, do not release
+    released = false;
+    return false;
+  }
+  owned = false;
+  released = true;
   return true;
 }
 

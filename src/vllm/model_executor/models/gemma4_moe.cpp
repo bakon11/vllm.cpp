@@ -801,22 +801,37 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
       helper_rw = static_cast<const float*>(rw_idx->ptr());
     }
 
+    const auto indexed_arm = Gemma4IndexedSelectArm(fp8_res_same, fp8_res_peer);
     auto run_one = [&](void* yout, const void* xin, const int32_t* ri_t, const float* rw_t) -> bool {
-      if (fp8_res_same) {
-        return vt::ExpertGeGLUFp8TopKIndexed(
-            d.q, yout, xin, ex.fp8_gu_base, ex.fp8_dn_base, ex.fp8_sgu_base, ex.fp8_sdn_base, ri_t,
-            rw_t, top_k, static_cast<int>(I), static_cast<int>(H));
-      }
-      if (fp8_res_peer) {
-        return RunGemma4Fp8TopKIndexedOnExpertDevice(
-            d.q, ex.dev_id, yout, xin, ex.fp8_gu_base, ex.fp8_dn_base, ex.fp8_sgu_base,
-            ex.fp8_sdn_base, ri_t, rw_t, top_k, static_cast<int>(I), static_cast<int>(H));
-      }
-      return false;
+      const auto args = Gemma4IndexedPackArgs(yout, xin, ri_t, rw_t);
+      return Gemma4IndexedRunSelectedArm(
+          indexed_arm,
+          [&] {
+            return vt::ExpertGeGLUFp8TopKIndexed(d.q, args.y, args.x, ex.fp8_gu_base, ex.fp8_dn_base,
+                                                 ex.fp8_sgu_base, ex.fp8_sdn_base, args.ri, args.rw,
+                                                 top_k, static_cast<int>(I), static_cast<int>(H));
+          },
+          [&] {
+            return RunGemma4Fp8TopKIndexedOnExpertDevice(
+                d.q, ex.dev_id, args.y, args.x, ex.fp8_gu_base, ex.fp8_dn_base, ex.fp8_sgu_base,
+                ex.fp8_sdn_base, args.ri, args.rw, top_k, static_cast<int>(I), static_cast<int>(H));
+          });
     };
     auto restore_compute = [] {};
+    bool indexed_retired = false;
+    auto retire_indexed = [&]() -> bool {
+      if (indexed_retired) return true;
+      bool ok = true;
+      if (fp8_res_peer) {
+        ok = RetireGemma4Fp8TopKIndexedPeer(d.q, ex.dev_id);
+      } else {
+        d.b.Synchronize(d.q);
+      }
+      indexed_retired = ok;
+      return ok;
+    };
 
-    if (T == 1) {
+    if (Gemma4IndexedScratchKindFor(T) == Gemma4IndexedScratchKind::TlsT1) {
       // Stable T=1 acc for hipGraph (do not pool-Release).
       struct AccFastTls {
         int dev = -1;
@@ -866,29 +881,35 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
         }
         return r;
       }
+      (void)retire_indexed();  // T=1 TLS is not pooled; still retire before rw_idx dtor
     } else {
       std::optional<DBuf> acc_idx;
       acc_idx.emplace(d, DType::kBF16, std::vector<int64_t>{T, H});
       auto* x_base = static_cast<const uint16_t*>(expert_in.data);
       auto* y_base = static_cast<uint16_t*>(acc_idx->ptr());
       auto* ri_base = static_cast<const int32_t*>(ri.ptr());
-      const auto disp = Gemma4IndexedDispatchTokens(
-          T, H, top_k, fp8_res_peer, y_base, x_base, ri_base, helper_rw,
-          [&](const Gemma4IndexedCall& c) { return run_one(c.y, c.x, c.ri, c.rw); }, restore_compute);
-      if (disp.ok) {
-        Gemma4MoeScratch r;
-        r.tensor = acc_idx->t();
-        r.storage = acc_idx->ReleaseShared();
-        return r;
+      const Gemma4IndexedScratchChoice scratch_choice{Gemma4IndexedScratchKindFor(T), y_base,
+                                                      T * H};
+      if (!Gemma4IndexedScratchValidForT(scratch_choice, T, H)) {
+        if (!retire_indexed()) (void)acc_idx->Release();  // quarantine
+        // fall through with acc_idx still in scope until this block ends
+      } else {
+        const auto disp = Gemma4IndexedDispatchTokens(
+            T, H, top_k, fp8_res_peer, y_base, x_base, ri_base, helper_rw,
+            [&](const Gemma4IndexedCall& c) { return run_one(c.y, c.x, c.ri, c.rw); },
+            restore_compute);
+        if (disp.ok) {
+          Gemma4MoeScratch r;
+          r.tensor = acc_idx->t();
+          r.storage = acc_idx->ReleaseShared();
+          return r;
+        }
+        // retire-before-acc_idx-dtor: still lexically inside acc_idx scope
+        if (!retire_indexed()) (void)acc_idx->Release();  // quarantine, do not Put
       }
     }
-    // Fail after possible enqueue: retire peer/compute work before pooled
-    // rw_idx / acc_idx destructors return those bytes to DevicePool.
-    if (fp8_res_peer) {
-      (void)RetireGemma4Fp8TopKIndexedPeer(d.q, ex.dev_id);
-    } else {
-      d.b.Synchronize(d.q);
-    }
+    if (!indexed_retired) (void)retire_indexed();
+    if (!indexed_retired && rw_idx) (void)rw_idx->Release();
     // fall through to legacy host-gather path
   }
 

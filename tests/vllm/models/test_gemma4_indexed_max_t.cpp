@@ -20,11 +20,19 @@ using vllm::Gemma4IndexedHelperHits;
 using vllm::Gemma4IndexedHostApplyToken;
 using vllm::Gemma4IndexedHostSerialRef;
 using vllm::Gemma4IndexedOkT;
-using vllm::Gemma4IndexedOnHelperFail;
+using vllm::Gemma4IndexedArgsEq;
+using vllm::Gemma4IndexedArm;
+using vllm::Gemma4IndexedFailPathRetireThenMaybeRelease;
+using vllm::Gemma4IndexedHelperArgs;
+using vllm::Gemma4IndexedMayReleaseToPool;
 using vllm::Gemma4IndexedOracleClose;
-using vllm::Gemma4IndexedReleaseScratchToPool;
-using vllm::Gemma4IndexedRetireScratch;
-using vllm::Gemma4IndexedScratchLedger;
+using vllm::Gemma4IndexedPackArgs;
+using vllm::Gemma4IndexedRunSelectedArm;
+using vllm::Gemma4IndexedScratchChoice;
+using vllm::Gemma4IndexedScratchKind;
+using vllm::Gemma4IndexedScratchKindFor;
+using vllm::Gemma4IndexedScratchValidForT;
+using vllm::Gemma4IndexedSelectArm;
 using vllm::Gemma4IndexedTokenOffsets;
 using vllm::ParseGemma4DecodeIndexedMaxT;
 using vllm::kGemma4PrefillBatchMinT;
@@ -159,65 +167,95 @@ TEST_CASE("gemma4 indexed-max-t: RED wrong stride corrupts output") {
   CHECK_FALSE(Gemma4IndexedOracleClose(y.data(), ref.data(), T * H, &mad));
 }
 
-TEST_CASE("gemma4 indexed-max-t: RED wrong ownership is T=1 TLS not [T,H]") {
+TEST_CASE("gemma4 indexed-max-t: RED T=1 TLS owner is invalid for T>1") {
   const int64_t T = 19, H = 8;
-  const int top_k = 8;
-  std::vector<float> y(static_cast<size_t>(T * H), 0.f);
-  std::vector<float> x(static_cast<size_t>(T * H), 0.f);
-  std::vector<int32_t> ri(static_cast<size_t>(T * top_k), 0);
-  std::vector<float> rw(static_cast<size_t>(T * top_k), 0.f);
-  FillNontrivial(x, ri, rw, T, H, top_k);
-  WritingHelper fake;
-  fake.H = H;
-  fake.top_k = top_k;
-  const auto disp = Gemma4IndexedDispatchTokens(
-      T, H, top_k, false, y.data(), x.data(), ri.data(), rw.data(),
-      [&](const Gemma4IndexedCall<float, float>& c) { return fake(c); }, [] {});
-  REQUIRE(disp.ok);
   float tls1[8] = {};
-  CHECK(disp.y_owner == static_cast<void*>(y.data()));
-  CHECK(disp.y_owner != static_cast<void*>(tls1));
-  CHECK(sizeof(tls1) < static_cast<size_t>(T * H) * sizeof(float));
-  y[3] = 7.f;
-  CHECK(y[3] == 7.f);
+  std::vector<float> owned(static_cast<size_t>(T * H), 0.f);
+  CHECK(Gemma4IndexedScratchKindFor(1) == Gemma4IndexedScratchKind::TlsT1);
+  CHECK(Gemma4IndexedScratchKindFor(T) == Gemma4IndexedScratchKind::OwnedTH);
+  Gemma4IndexedScratchChoice tls{Gemma4IndexedScratchKind::TlsT1, tls1, H};
+  CHECK_FALSE(Gemma4IndexedScratchValidForT(tls, T, H));
+  Gemma4IndexedScratchChoice good{Gemma4IndexedScratchKindFor(T), owned.data(), T * H};
+  CHECK(Gemma4IndexedScratchValidForT(good, T, H));
+  CHECK(good.y != static_cast<void*>(tls1));
 }
 
-TEST_CASE("gemma4 indexed-max-t: fail-at-0/mid after enqueue retires before pool") {
+TEST_CASE("gemma4 indexed-max-t: release-before-retire is RED; fail-path retires while owned") {
+  CHECK_FALSE(Gemma4IndexedMayReleaseToPool(/*enqueued=*/true, /*retire_observed=*/false));
+  CHECK(Gemma4IndexedMayReleaseToPool(true, true));
+  CHECK(Gemma4IndexedMayReleaseToPool(false, false));
+  bool owned = true, released = false, retire_ok = false;
+  CHECK(Gemma4IndexedFailPathRetireThenMaybeRelease(true, owned, released, retire_ok,
+                                                    [] { return true; }));
+  CHECK(retire_ok);
+  CHECK(released);
+  CHECK_FALSE(owned);
+  owned = true;
+  released = false;
+  retire_ok = true;
+  CHECK_FALSE(Gemma4IndexedFailPathRetireThenMaybeRelease(true, owned, released, retire_ok,
+                                                          [] { return false; }));
+  CHECK_FALSE(retire_ok);
+  CHECK_FALSE(released);
+  CHECK(owned);  // quarantined
+}
+
+TEST_CASE("gemma4 indexed-max-t: independent serial ref RED on candidate arithmetic/route") {
   const int64_t T = 19, H = 8;
   const int top_k = 8;
-  std::vector<float> y(static_cast<size_t>(T * H), 0.f);
   std::vector<float> x(static_cast<size_t>(T * H), 0.f);
   std::vector<int32_t> ri(static_cast<size_t>(T * top_k), 0);
   std::vector<float> rw(static_cast<size_t>(T * top_k), 0.f);
+  std::vector<float> ref(static_cast<size_t>(T * H), 0.f);
+  std::vector<float> bad(static_cast<size_t>(T * H), 0.f);
   FillNontrivial(x, ri, rw, T, H, top_k);
-  for (int fail_at : {0, 7}) {
-    WritingHelper fake;
-    fake.peer_expected = true;
-    fake.fail_at = fail_at;
-    fake.fail_after_enqueue = true;
-    fake.H = H;
-    fake.top_k = top_k;
-    const auto disp = Gemma4IndexedDispatchTokens(
-        T, H, top_k, true, y.data(), x.data(), ri.data(), rw.data(),
-        [&](const Gemma4IndexedCall<float, float>& c) { return fake(c); }, [&] { ++fake.restores; });
-    CHECK_FALSE(disp.ok);
-    CHECK(disp.enqueued);
-    Gemma4IndexedScratchLedger L;
-    L.enqueued = disp.enqueued;
-    CHECK_FALSE(Gemma4IndexedReleaseScratchToPool(L));
-    bool retired = false, released = false;
-    Gemma4IndexedOnHelperFail(
-        disp.enqueued, [&] { retired = true; Gemma4IndexedRetireScratch(L); },
-        [&] {
-          REQUIRE(retired);
-          REQUIRE(Gemma4IndexedReleaseScratchToPool(L));
-          released = true;
-        });
-    CHECK(retired);
-    CHECK(released);
-    CHECK(L.released_to_pool);
-    CHECK(disp.y_owner == static_cast<void*>(y.data()));
+  Gemma4IndexedHostSerialRef(x.data(), ri.data(), rw.data(), ref.data(), T, H, top_k);
+  for (int64_t t = 0; t < T; ++t) {
+    // mutated candidate: extra *2, does not go through SerialRef
+    Gemma4IndexedHostApplyToken(bad.data() + t * H, x.data() + t * H, ri.data() + t * top_k,
+                                rw.data() + t * top_k, H, top_k);
+    for (int64_t h = 0; h < H; ++h) bad[static_cast<size_t>(t * H + h)] *= 2.f;
   }
+  float mad = 0.f;
+  CHECK_FALSE(Gemma4IndexedOracleClose(bad.data(), ref.data(), T * H, &mad));
+}
+
+TEST_CASE("gemma4 indexed-max-t: production selector arm/args identity; swap is RED") {
+  int same_n = 0, peer_n = 0;
+  float same_out = 0.f, peer_out = 0.f;
+  auto same = [&] {
+    ++same_n;
+    same_out = 1.f;
+    return true;
+  };
+  auto peer = [&] {
+    ++peer_n;
+    peer_out = 2.f;
+    return true;
+  };
+  CHECK(Gemma4IndexedSelectArm(true, false) == Gemma4IndexedArm::SameDev);
+  CHECK(Gemma4IndexedSelectArm(false, true) == Gemma4IndexedArm::Peer);
+  REQUIRE(Gemma4IndexedRunSelectedArm(Gemma4IndexedArm::SameDev, same, peer));
+  CHECK(same_n == 1);
+  CHECK(peer_n == 0);
+  CHECK(same_out == 1.f);
+  REQUIRE(Gemma4IndexedRunSelectedArm(Gemma4IndexedArm::Peer, same, peer));
+  CHECK(peer_n == 1);
+  CHECK(peer_out == 2.f);
+  auto swapped = [&](Gemma4IndexedArm arm) {
+    return Gemma4IndexedRunSelectedArm(arm, peer, same);
+  };
+  same_n = peer_n = 0;
+  REQUIRE(swapped(Gemma4IndexedArm::SameDev));
+  CHECK(peer_n == 1);
+  CHECK(same_n == 0);
+  CHECK(peer_out == 2.f);
+  float y = 0, x = 0, rw = 0;
+  int32_t ri = 0;
+  const auto want = Gemma4IndexedPackArgs(&y, &x, &ri, &rw);
+  const auto swapped_args = Gemma4IndexedPackArgs(&x, &y, &ri, &rw);
+  CHECK(Gemma4IndexedArgsEq(want, Gemma4IndexedPackArgs(&y, &x, &ri, &rw)));
+  CHECK_FALSE(Gemma4IndexedArgsEq(want, swapped_args));
 }
 
 TEST_CASE("gemma4 indexed-max-t: fallback scale is once, not s^2") {
@@ -242,10 +280,28 @@ TEST_CASE("gemma4 indexed-max-t: source invariants") {
   REQUIRE_FALSE(moe.empty());
   REQUIRE_FALSE(hip.empty());
   CHECK(moe.find("Gemma4IndexedDispatchTokens") != std::string::npos);
+  CHECK(moe.find("Gemma4IndexedSelectArm") != std::string::npos);
+  CHECK(moe.find("Gemma4IndexedRunSelectedArm") != std::string::npos);
+  CHECK(moe.find("Gemma4IndexedScratchKindFor") != std::string::npos);
+  CHECK(moe.find("retire-before-acc_idx-dtor") != std::string::npos);
   CHECK(moe.find("RetireGemma4Fp8TopKIndexedPeer") != std::string::npos);
   CHECK(moe.find("rw_idx") != std::string::npos);
   CHECK(moe.find("ExpertGeGLUFp8TopKIndexedBatched") == std::string::npos);
+  const auto serial = ReadText("include/vllm/model_executor/models/gemma4_indexed_gate.h");
+  const auto sref = serial.find("Gemma4IndexedHostSerialRef");
+  REQUIRE(sref != std::string::npos);
+  const auto sref_end = serial.find("Gemma4IndexedOracleClose", sref);
+  REQUIRE(sref_end != std::string::npos);
+  CHECK(serial.substr(sref, sref_end - sref).find("Gemma4IndexedHostApplyToken") == std::string::npos);
   CHECK(hip.find("retire_fail") != std::string::npos);
   CHECK(hip.find("RetireGemma4Fp8TopKIndexedPeer") != std::string::npos);
   CHECK(hip.find("RestoreComputeDev") != std::string::npos);
+  const auto ret = hip.find("bool RetireGemma4Fp8TopKIndexedPeer");
+  REQUIRE(ret != std::string::npos);
+  const auto ret_end = hip.find("RunGemma4Fp8ExpertGeGLUPrefillOnExpertDevice", ret);
+  REQUIRE(ret_end != std::string::npos);
+  const std::string retire = hip.substr(ret, ret_end - ret);
+  CHECK(retire.find("(void)hipStreamSynchronize") == std::string::npos);
+  CHECK(retire.find("return true;") == std::string::npos);
+  CHECK(retire.find("return ok;") != std::string::npos);
 }
