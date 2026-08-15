@@ -84,7 +84,7 @@ struct HipBlasHooks {
     if (hipGetDevice(&cur) != hipSuccess) return -1;
     return cur;
   }
-  static void SetDevice(int d) { (void)hipSetDevice(d); }
+  static void SetDevice(int d) { CheckHip(hipSetDevice(d), "hipSetDevice"); }
   static handle_t Create() {
     handle_t h = nullptr;
     CheckBlas(hipblasCreate(&h), "hipblasCreate");
@@ -99,9 +99,17 @@ struct HipBlasHooks {
 BlasCtx GetBlas(int device, hipStream_t stream) {
   static thread_local GetBlasDualSlotEngine<HipBlasHooks> tls_slots;
   HipBlasHooks hooks;
-  // Shared seam: tests execute RocmProductGetBlasOn with the same forwarding.
-  return BlasCtx{vt::rocm::RocmProductGetBlasOn(tls_slots, device, stream, hooks)};
+  return BlasCtx{RocmProductGetBlasOn(tls_slots, device, stream, hooks)};
 }
+
+}  // namespace
+
+hipblasHandle_t ProductGetBlasHandle(int device, hipStream_t stream) {
+  // Same-TU call into file-local GetBlas (HipBlasHooks + tls_slots).
+  return GetBlas(device, stream).handle;
+}
+
+namespace {
 
 std::string ComboName(const Tensor& a, const Tensor& b, const Tensor& out) {
   return std::string("(") + Name(a.dtype) + "," + Name(b.dtype) + ")->" + Name(out.dtype);

@@ -10,10 +10,6 @@
 
 #include "vt/rocm/rocm_getblas_dualslot.h"
 
-#if defined(VLLM_CPP_HIP)
-#include <hip/hip_runtime.h>
-#include <hipblas/hipblas.h>
-#endif
 
 #ifndef VLLM_CPP_SOURCE_DIR
 #define VLLM_CPP_SOURCE_DIR "."
@@ -333,65 +329,25 @@ TEST_CASE("getblas product source uses RocmProductGetBlasOn with device+stream")
   CHECK(hip.find("static thread_local Tls tls;") == std::string::npos);
 }
 
-TEST_CASE("getblas product 0-1-0-1 handle identity") {
-  const char* env = std::getenv("HIP_VISIBLE_DEVICES");
-#if defined(VLLM_CPP_HIP)
-  if (env == nullptr || env[0] == '\0') return;
-  // Live hipblas probe: same RocmProductGetBlasOn + real hooks.
-  // Compiled only into the HIP test binary; coord runs it on dual devices.
-  struct HipBlasHooks {
-    using handle_t = void*;
-    using stream_t = void*;
-    static handle_t NullHandle() { return nullptr; }
-    static stream_t NullStream() { return nullptr; }
-    static bool IsNull(handle_t h) { return h == nullptr; }
-    bool StreamIsCapturing(stream_t) const { return false; }
-    int GetDevice() const {
-      int cur = -1;
-      (void)hipGetDevice(&cur);
-      return cur;
-    }
-    void SetDevice(int d) { (void)hipSetDevice(d); }
-    handle_t Create() {
-      hipblasHandle_t h = nullptr;
-      if (hipblasCreate(&h) != HIPBLAS_STATUS_SUCCESS) return nullptr;
-      return static_cast<handle_t>(h);
-    }
-    void Destroy(handle_t h) {
-      if (h) (void)hipblasDestroy(static_cast<hipblasHandle_t>(h));
-    }
-    void SetStream(handle_t h, stream_t s) {
-      (void)hipblasSetStream(static_cast<hipblasHandle_t>(h),
-                             static_cast<hipStream_t>(s));
-    }
-  };
-  int ndev = 0;
-  REQUIRE(hipGetDeviceCount(&ndev) == hipSuccess);
-  REQUIRE(ndev >= 2);
-  hipStream_t s0 = nullptr;
-  hipStream_t s1 = nullptr;
-  REQUIRE(hipSetDevice(0) == hipSuccess);
-  REQUIRE(hipStreamCreate(&s0) == hipSuccess);
-  REQUIRE(hipSetDevice(1) == hipSuccess);
-  REQUIRE(hipStreamCreate(&s1) == hipSuccess);
-  using Eng = vt::rocm::GetBlasDualSlotEngine<HipBlasHooks>;
+TEST_CASE("getblas hop 0-1-0-1 restores device on revisit") {
+  using Eng = vt::rocm::GetBlasDualSlotEngine<TrackingHooks>;
   Eng eng;
-  HipBlasHooks hooks;
-  const auto h0a = vt::rocm::RocmProductGetBlasOn(eng, 0, static_cast<void*>(s0), hooks);
-  const auto h1a = vt::rocm::RocmProductGetBlasOn(eng, 1, static_cast<void*>(s1), hooks);
-  const auto h0b = vt::rocm::RocmProductGetBlasOn(eng, 0, static_cast<void*>(s0), hooks);
-  const auto h1b = vt::rocm::RocmProductGetBlasOn(eng, 1, static_cast<void*>(s1), hooks);
-  CHECK(h0a != nullptr);
-  CHECK(h1a != nullptr);
-  CHECK(h0a == h0b);
-  CHECK(h1a == h1b);
-  CHECK(h0a != h1a);
-  (void)hipSetDevice(0);
-  (void)hipStreamDestroy(s0);
-  (void)hipSetDevice(1);
-  (void)hipStreamDestroy(s1);
-#else
-  (void)env;
+  TrackingHooks hooks;
+  Rec rec;
+  hooks.rec = &rec;
+  (void)vt::rocm::RocmProductGetBlasOn(eng, 0, 1, hooks);
+  CHECK(rec.cur_dev == 0);
+  (void)vt::rocm::RocmProductGetBlasOn(eng, 1, 2, hooks);
+  CHECK(rec.cur_dev == 1);
+  (void)vt::rocm::RocmProductGetBlasOn(eng, 0, 1, hooks);
+  CHECK(rec.cur_dev == 0);
+  CHECK(rec.last_set_device == 0);
+  (void)vt::rocm::RocmProductGetBlasOn(eng, 1, 2, hooks);
+  CHECK(rec.cur_dev == 1);
+  CHECK(rec.last_set_device == 1);
+}
+
+TEST_CASE("getblas product 0-1-0-1 handle identity") {
   using Eng = vt::rocm::GetBlasDualSlotEngine<TrackingHooks>;
   Eng eng;
   TrackingHooks hooks;
@@ -406,5 +362,5 @@ TEST_CASE("getblas product 0-1-0-1 handle identity") {
   CHECK(h0a != h1a);
   CHECK(rec.destroy[0] == 0);
   CHECK(rec.destroy[1] == 0);
-#endif
+  CHECK(rec.cur_dev == 1);
 }
