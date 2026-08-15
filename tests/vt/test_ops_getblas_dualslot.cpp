@@ -1,6 +1,5 @@
-// #837 GetBlas dual-slot host lifetime seam. No GPU required.
-// Product engine (GetBlasDualSlotEngine + GetBlasSlotIndex) vs mutants that
-// must violate the same table (research 64cb stop-ship 5).
+// #837 GetBlas dual-slot host lifetime + product-call seam (research c24b).
+// Production GetBlas and these tests both execute RocmProductGetBlasOn.
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -10,6 +9,11 @@
 #include <doctest/doctest.h>
 
 #include "vt/rocm/rocm_getblas_dualslot.h"
+
+#if defined(VLLM_CPP_HIP)
+#include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
+#endif
 
 #ifndef VLLM_CPP_SOURCE_DIR
 #define VLLM_CPP_SOURCE_DIR "."
@@ -84,12 +88,8 @@ struct FakeHooks {
   }
 };
 
-// Tag Create with the slot the engine is about to fill. The engine calls
-// Create after selecting the slot; we infer slot from which handle is still 0
-// and which device is current — set by a thin wrapper.
 struct TrackingHooks : FakeHooks {
   handle_t Create() {
-    // Slot = last SetDevice target when it is 0 or 1; else 0 (devices ≥2).
     last_create_slot = (rec->last_set_device == 1) ? 1 : 0;
     return FakeHooks::Create();
   }
@@ -103,14 +103,17 @@ struct Table {
   uintptr_t h1 = 0;
 };
 
-template <class Eng, class Hooks>
-void RunHops(Eng& eng, Hooks& hooks, Table* t, bool change_s0_stream) {
+// Product hops go through RocmProductGetBlasOn — same function as GetBlas.
+template <class Eng, class Hooks, class Forward = vt::rocm::RocmGetBlasForward>
+void RunProductHops(Eng& eng, Hooks& hooks, Table* t, bool change_s0_stream) {
   hooks.rec = &t->rec;
-  t->h0 = eng.Get(0, /*s0=*/1, hooks);
-  t->h1 = eng.Get(1, /*s1=*/2, hooks);
-  t->h0 = eng.Get(0, /*s0=*/1, hooks);  // second visit; product keeps identity
-  t->h1 = eng.Get(1, /*s1=*/2, hooks);
-  if (change_s0_stream) (void)eng.Get(0, /*s0'=*/3, hooks);
+  t->h0 = vt::rocm::RocmProductGetBlasOn<Eng, Hooks, Forward>(eng, 0, /*s0=*/1, hooks);
+  t->h1 = vt::rocm::RocmProductGetBlasOn<Eng, Hooks, Forward>(eng, 1, /*s1=*/2, hooks);
+  t->h0 = vt::rocm::RocmProductGetBlasOn<Eng, Hooks, Forward>(eng, 0, /*s0=*/1, hooks);
+  t->h1 = vt::rocm::RocmProductGetBlasOn<Eng, Hooks, Forward>(eng, 1, /*s1=*/2, hooks);
+  if (change_s0_stream) {
+    (void)vt::rocm::RocmProductGetBlasOn<Eng, Hooks, Forward>(eng, 0, /*s0'=*/3, hooks);
+  }
 }
 
 bool ProductTableHolds(const Table& t, bool after_stream_change) {
@@ -128,7 +131,6 @@ bool ProductTableHolds(const Table& t, bool after_stream_change) {
   return true;
 }
 
-// Old single-TLS: destroy on device hop.
 struct SingleTlsEngine {
   using handle_t = uintptr_t;
   using stream_t = int;
@@ -167,9 +169,27 @@ struct NoStreamHooks : TrackingHooks {
 struct CaptureAlwaysSetEngine {
   vt::rocm::GetBlasDualSlotEngine<TrackingHooks> inner;
   uintptr_t Get(int device, int stream, TrackingHooks& hooks) {
-    // Mutant: ignore capture, always SetDevice.
     hooks.SetDevice(device);
     return inner.Get(device, stream, hooks);
+  }
+};
+
+// c24b mutants: product call forwards the wrong device or a null stream.
+struct ForwardDev0 {
+  template <class Engine, class Hooks>
+  static typename Engine::handle_t apply(Engine& engine, int /*device*/,
+                                         typename Engine::stream_t stream,
+                                         Hooks& hooks) {
+    return engine.Get(0, stream, hooks);
+  }
+};
+
+struct ForwardNullStream {
+  template <class Engine, class Hooks>
+  static typename Engine::handle_t apply(Engine& engine, int device,
+                                         typename Engine::stream_t /*stream*/,
+                                         Hooks& hooks) {
+    return engine.Get(device, Hooks::NullStream(), hooks);
   }
 };
 
@@ -188,7 +208,7 @@ TEST_CASE("getblas first use fills slot 0 only") {
   TrackingHooks hooks;
   Rec rec;
   hooks.rec = &rec;
-  const auto h0 = eng.Get(0, 1, hooks);
+  const auto h0 = vt::rocm::RocmProductGetBlasOn(eng, 0, 1, hooks);
   CHECK(h0 != 0);
   CHECK(eng.tls_slots[0].handle == h0);
   CHECK(eng.tls_slots[1].handle == 0);
@@ -196,12 +216,12 @@ TEST_CASE("getblas first use fills slot 0 only") {
   CHECK(rec.create[1] == 0);
 }
 
-TEST_CASE("getblas product lifetime table") {
+TEST_CASE("getblas product lifetime table via product-call seam") {
   using Eng = vt::rocm::GetBlasDualSlotEngine<TrackingHooks>;
   Eng eng;
   TrackingHooks hooks;
   Table t;
-  RunHops(eng, hooks, &t, /*change_s0_stream=*/true);
+  RunProductHops(eng, hooks, &t, /*change_s0_stream=*/true);
   CHECK(ProductTableHolds(t, /*after_stream_change=*/true));
   CHECK(eng.tls_slots[0].handle == t.h0);
   CHECK(eng.tls_slots[1].handle == t.h1);
@@ -219,10 +239,10 @@ TEST_CASE("getblas hop 1->0->1 keeps both handles") {
   TrackingHooks hooks;
   Rec rec;
   hooks.rec = &rec;
-  const auto h0 = eng.Get(0, 1, hooks);
-  const auto h1 = eng.Get(1, 2, hooks);
-  CHECK(eng.Get(0, 1, hooks) == h0);
-  CHECK(eng.Get(1, 2, hooks) == h1);
+  const auto h0 = vt::rocm::RocmProductGetBlasOn(eng, 0, 1, hooks);
+  const auto h1 = vt::rocm::RocmProductGetBlasOn(eng, 1, 2, hooks);
+  CHECK(vt::rocm::RocmProductGetBlasOn(eng, 0, 1, hooks) == h0);
+  CHECK(vt::rocm::RocmProductGetBlasOn(eng, 1, 2, hooks) == h1);
   CHECK(rec.destroy[0] == 0);
   CHECK(rec.destroy[1] == 0);
   CHECK(rec.create[0] == 1);
@@ -237,7 +257,7 @@ TEST_CASE("getblas capture path does not SetDevice") {
   rec.capturing = true;
   rec.cur_dev = 0;
   hooks.rec = &rec;
-  (void)eng.Get(1, 9, hooks);
+  (void)vt::rocm::RocmProductGetBlasOn(eng, 1, 9, hooks);
   CHECK(rec.set_device_n == 0);
   CHECK(rec.last_set_device == -999);
 }
@@ -248,7 +268,7 @@ TEST_CASE("getblas RED swapped selector fills the wrong slot") {
   TrackingHooks hooks;
   Rec rec;
   hooks.rec = &rec;
-  const auto h = eng.Get(0, 1, hooks);
+  const auto h = vt::rocm::RocmProductGetBlasOn(eng, 0, 1, hooks);
   CHECK(eng.tls_slots[0].handle == 0);
   CHECK(eng.tls_slots[1].handle == h);
 }
@@ -257,7 +277,7 @@ TEST_CASE("getblas RED destroy-on-hop fails table") {
   SingleTlsEngine eng;
   TrackingHooks hooks;
   Table t;
-  RunHops(eng, hooks, &t, /*change_s0_stream=*/false);
+  RunProductHops(eng, hooks, &t, /*change_s0_stream=*/false);
   CHECK(t.rec.destroy[0] >= 1);
   CHECK_FALSE(ProductTableHolds(t, /*after_stream_change=*/false));
 }
@@ -267,7 +287,7 @@ TEST_CASE("getblas RED missing stream rebind fails table") {
   Eng eng;
   NoStreamHooks hooks;
   Table t;
-  RunHops(eng, hooks, &t, /*change_s0_stream=*/true);
+  RunProductHops(eng, hooks, &t, /*change_s0_stream=*/true);
   CHECK(t.rec.stream[0] != 3);
   CHECK_FALSE(ProductTableHolds(t, /*after_stream_change=*/true));
 }
@@ -283,19 +303,108 @@ TEST_CASE("getblas RED capture SetDevice fails capture invariant") {
   CHECK(rec.set_device_n >= 1);
 }
 
-TEST_CASE("getblas product source uses dual-slot engine") {
+TEST_CASE("getblas RED product call forwards device 0") {
+  using Eng = vt::rocm::GetBlasDualSlotEngine<TrackingHooks>;
+  Eng eng;
+  TrackingHooks hooks;
+  Table t;
+  RunProductHops<Eng, TrackingHooks, ForwardDev0>(eng, hooks, &t, false);
+  CHECK(t.h0 == t.h1);
+  CHECK_FALSE(ProductTableHolds(t, false));
+}
+
+TEST_CASE("getblas RED product call forwards null stream") {
+  using Eng = vt::rocm::GetBlasDualSlotEngine<TrackingHooks>;
+  Eng eng;
+  TrackingHooks hooks;
+  Table t;
+  RunProductHops<Eng, TrackingHooks, ForwardNullStream>(eng, hooks, &t, true);
+  CHECK(t.rec.stream[0] != 3);
+  CHECK_FALSE(ProductTableHolds(t, true));
+}
+
+TEST_CASE("getblas product source uses RocmProductGetBlasOn with device+stream") {
   const std::string hip = ReadText("src/vt/rocm/rocm_matmul_hipblaslt.hip");
-  CHECK(hip.find("GetBlasDualSlotEngine") != std::string::npos);
-  CHECK(hip.find("tls_slots") != std::string::npos);
-  CHECK(hip.find("rocm_getblas_dualslot.h") != std::string::npos);
+  CHECK(hip.find("RocmProductGetBlasOn") != std::string::npos);
+  CHECK(hip.find("RocmProductGetBlasOn(tls_slots, device, stream, hooks)") !=
+        std::string::npos);
+  CHECK(hip.find("tls_slots.Get(0,") == std::string::npos);
+  CHECK(hip.find("Get(device, nullptr") == std::string::npos);
   CHECK(hip.find("static thread_local Tls tls;") == std::string::npos);
 }
 
-TEST_CASE("getblas GPU probe skipped without HIP_VISIBLE_DEVICES") {
+TEST_CASE("getblas product 0-1-0-1 handle identity") {
   const char* env = std::getenv("HIP_VISIBLE_DEVICES");
+#if defined(VLLM_CPP_HIP)
   if (env == nullptr || env[0] == '\0') return;
-#if !defined(VLLM_CPP_HIP)
-  // Host binary cannot call product GetBlas. Coord owns the live gfx1201 probe.
-  return;
+  // Live hipblas probe: same RocmProductGetBlasOn + real hooks.
+  // Compiled only into the HIP test binary; coord runs it on dual devices.
+  struct HipBlasHooks {
+    using handle_t = void*;
+    using stream_t = void*;
+    static handle_t NullHandle() { return nullptr; }
+    static stream_t NullStream() { return nullptr; }
+    static bool IsNull(handle_t h) { return h == nullptr; }
+    bool StreamIsCapturing(stream_t) const { return false; }
+    int GetDevice() const {
+      int cur = -1;
+      (void)hipGetDevice(&cur);
+      return cur;
+    }
+    void SetDevice(int d) { (void)hipSetDevice(d); }
+    handle_t Create() {
+      hipblasHandle_t h = nullptr;
+      if (hipblasCreate(&h) != HIPBLAS_STATUS_SUCCESS) return nullptr;
+      return static_cast<handle_t>(h);
+    }
+    void Destroy(handle_t h) {
+      if (h) (void)hipblasDestroy(static_cast<hipblasHandle_t>(h));
+    }
+    void SetStream(handle_t h, stream_t s) {
+      (void)hipblasSetStream(static_cast<hipblasHandle_t>(h),
+                             static_cast<hipStream_t>(s));
+    }
+  };
+  int ndev = 0;
+  REQUIRE(hipGetDeviceCount(&ndev) == hipSuccess);
+  REQUIRE(ndev >= 2);
+  hipStream_t s0 = nullptr;
+  hipStream_t s1 = nullptr;
+  REQUIRE(hipSetDevice(0) == hipSuccess);
+  REQUIRE(hipStreamCreate(&s0) == hipSuccess);
+  REQUIRE(hipSetDevice(1) == hipSuccess);
+  REQUIRE(hipStreamCreate(&s1) == hipSuccess);
+  using Eng = vt::rocm::GetBlasDualSlotEngine<HipBlasHooks>;
+  Eng eng;
+  HipBlasHooks hooks;
+  const auto h0a = vt::rocm::RocmProductGetBlasOn(eng, 0, static_cast<void*>(s0), hooks);
+  const auto h1a = vt::rocm::RocmProductGetBlasOn(eng, 1, static_cast<void*>(s1), hooks);
+  const auto h0b = vt::rocm::RocmProductGetBlasOn(eng, 0, static_cast<void*>(s0), hooks);
+  const auto h1b = vt::rocm::RocmProductGetBlasOn(eng, 1, static_cast<void*>(s1), hooks);
+  CHECK(h0a != nullptr);
+  CHECK(h1a != nullptr);
+  CHECK(h0a == h0b);
+  CHECK(h1a == h1b);
+  CHECK(h0a != h1a);
+  (void)hipSetDevice(0);
+  (void)hipStreamDestroy(s0);
+  (void)hipSetDevice(1);
+  (void)hipStreamDestroy(s1);
+#else
+  (void)env;
+  using Eng = vt::rocm::GetBlasDualSlotEngine<TrackingHooks>;
+  Eng eng;
+  TrackingHooks hooks;
+  Rec rec;
+  hooks.rec = &rec;
+  const auto h0a = vt::rocm::RocmProductGetBlasOn(eng, 0, 1, hooks);
+  const auto h1a = vt::rocm::RocmProductGetBlasOn(eng, 1, 2, hooks);
+  const auto h0b = vt::rocm::RocmProductGetBlasOn(eng, 0, 1, hooks);
+  const auto h1b = vt::rocm::RocmProductGetBlasOn(eng, 1, 2, hooks);
+  CHECK(h0a == h0b);
+  CHECK(h1a == h1b);
+  CHECK(h0a != h1a);
+  CHECK(rec.destroy[0] == 0);
+  CHECK(rec.destroy[1] == 0);
 #endif
 }
