@@ -21,22 +21,22 @@ std::string ReadHip() {
 
 }  // namespace
 
-TEST_CASE("prefill peer source has Launch/Finish and PeerSlot cache_pin") {
+TEST_CASE("prefill peer source has Launch/Finish and shared cache") {
   const std::string hip = ReadHip();
   CHECK(hip.find("LaunchGemma4Fp8ExpertGeGLUPrefillPeer") != std::string::npos);
   CHECK(hip.find("FinishGemma4Fp8ExpertGeGLUPrefillPeer") != std::string::npos);
   CHECK(hip.find("cache_pin") != std::string::npos);
   CHECK(hip.find("PeerSlot") != std::string::npos);
+  CHECK(hip.find("PrefillDequantCacheT<HipPrefillCacheHooks>") != std::string::npos);
+  CHECK(hip.find("rollback_armed") != std::string::npos);
+  CHECK(hip.find("RestoreComputeDevOrFatal") != std::string::npos);
   const auto prefill = hip.find("bool RunGemma4Fp8ExpertGeGLUPrefillOnExpertDevice");
   const auto pinhost = hip.find("void PinGemma4Fp8ExpertHostCache");
   REQUIRE(prefill != std::string::npos);
   REQUIRE(pinhost != std::string::npos);
   const std::string region = hip.substr(prefill, pinhost - prefill);
   CHECK(region.find("static thread_local Tls tls;") == std::string::npos);
-  // Prefill wrapper must call Launch, not be the only peer storage.
-  const auto wrap = hip.find("RunGemma4Fp8ExpertGeGLUPrefillOnExpertDevice");
-  REQUIRE(wrap != std::string::npos);
-  CHECK(hip.find("LaunchGemma4Fp8ExpertGeGLUPrefillPeer", wrap) != std::string::npos);
+  CHECK(hip.find("LaunchGemma4Fp8ExpertGeGLUPrefillPeer", prefill) != std::string::npos);
 }
 
 TEST_CASE("prefill peer Ensure rejects live pin instead of FreeAll") {
@@ -87,7 +87,7 @@ TEST_CASE("prefill peer pinned slot cannot be rewritten by second worker") {
   }
 }
 
-TEST_CASE("prefill peer Launch/Finish pairing and fail-after-enqueue unpins") {
+TEST_CASE("prefill peer Launch/Finish pairing and fail-after-enqueue retires") {
   using vt::rocm::PrefillPeerFailAt;
   vt::rocm::PrefillDequantCacheHost cache;
   vt::rocm::PrefillPeerSlotHost slot;
@@ -131,4 +131,82 @@ TEST_CASE("prefill peer wrapper uses slot 0 only") {
   const std::string hip = ReadHip();
   CHECK(hip.find("LaunchGemma4Fp8ExpertGeGLUPrefillPeer(compute_q, /*slot=*/0") != std::string::npos);
   CHECK(hip.find("FinishGemma4Fp8ExpertGeGLUPrefillPeer(compute_q, /*slot=*/0") != std::string::npos);
+}
+
+TEST_CASE("prefill peer failed retirement quarantines pin") {
+  vt::rocm::PrefillDequantCacheHost cache;
+  vt::rocm::PrefillPeerSlotHost slot;
+  const char key = 'k';
+  REQUIRE(vt::rocm::HostLaunch(cache, slot, 0, &key, 8, vt::rocm::PrefillPeerFailAt::None));
+  CHECK(cache.LivePins() == 1);
+  REQUIRE_FALSE(vt::rocm::HostFinish(cache, slot, 8, vt::rocm::PrefillPeerFailAt::None,
+                                     /*retire_ok=*/false));
+  CHECK(slot.quarantined);
+  CHECK(slot.cache_pin >= 0);
+  CHECK(cache.LivePins() == 1);
+  {
+    std::lock_guard<std::mutex> lk(cache.mu);
+    CHECK_FALSE(cache.Ensure(0, 5, 8));
+  }
+  CHECK_FALSE(vt::rocm::SlotReusable(slot.pending_M > 0, slot.rollback_armed, slot.quarantined));
+}
+
+TEST_CASE("prefill peer partial Ensure alloc is freed") {
+  vt::rocm::PrefillDequantCacheHost cache;
+  cache.hooks.fail_malloc_at = 2;  // gu ok, dn fails
+  {
+    std::lock_guard<std::mutex> lk(cache.mu);
+    CHECK_FALSE(cache.Ensure(0, 4, 8));
+    CHECK(cache.nslots == 0);
+    CHECK(cache.LiveAllocs() == 0);
+    CHECK(cache.hooks.frees >= 1);
+  }
+}
+
+TEST_CASE("prefill peer hit waits for ready; unpublished key is RED") {
+  vt::rocm::PrefillDequantCacheHost cache;
+  const char key = 'k';
+  void* gu = nullptr;
+  void* dn = nullptr;
+  int pin = -1;
+  {
+    std::lock_guard<std::mutex> lk(cache.mu);
+    REQUIRE(cache.Ensure(0, 4, 8));
+    REQUIRE(cache.GetLocked(&key, &gu, &dn, &pin));
+    CHECK(cache.slots[pin].ready);
+    cache.UnpinLocked(pin);
+    cache.hooks.fail_wait = true;
+    CHECK_FALSE(cache.GetLocked(&key, &gu, &dn, &pin));
+    cache.hooks.fail_wait = false;
+    cache.slots[0].ready = false;
+    CHECK_FALSE(cache.GetLocked(&key, &gu, &dn, &pin));
+  }
+}
+
+TEST_CASE("prefill peer first-enqueue rollback blocks reuse until retired") {
+  vt::rocm::PrefillDequantCacheHost cache;
+  vt::rocm::PrefillPeerSlotHost slot;
+  const char key = 'k';
+  REQUIRE_FALSE(
+      vt::rocm::HostLaunch(cache, slot, 0, &key, 8, vt::rocm::PrefillPeerFailAt::AfterFirstEnqueue,
+                           /*retire_ok=*/false));
+  CHECK(slot.rollback_armed);
+  CHECK(slot.quarantined);
+  CHECK_FALSE(vt::rocm::SlotReusable(false, slot.rollback_armed, slot.quarantined));
+}
+
+TEST_CASE("prefill peer source: retire checks status; no discarded sync") {
+  const std::string hip = ReadHip();
+  const auto ret = hip.find("bool RetirePinThenUnpin");
+  REQUIRE(ret != std::string::npos);
+  const auto ret_end = hip.find("bool LaunchGemma4Fp8ExpertGeGLUPrefillPeer", ret + 4);
+  REQUIRE(ret_end != std::string::npos);
+  const std::string retire = hip.substr(ret, ret_end - ret);
+  CHECK(retire.find("(void)hipEventSynchronize") == std::string::npos);
+  CHECK(retire.find("(void)hipStreamSynchronize") == std::string::npos);
+  CHECK(retire.find("quarantined") != std::string::npos);
+  CHECK(hip.find("rollback_armed = true") != std::string::npos);
+  CHECK(hip.find("RestoreComputeDevOrFatal") != std::string::npos);
+  CHECK(hip.find("WaitReady") != std::string::npos);
+  CHECK(hip.find("RecordReady") != std::string::npos);
 }

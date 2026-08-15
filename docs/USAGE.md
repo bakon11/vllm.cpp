@@ -2937,6 +2937,7 @@ interval does.
 
 Dual-GPU resident FP8 MoE and SharedK-WMMA prefill are controlled via
 ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`). Defaults stay safe off RDNA4.
+Prefill peer (#839) unpins dequant cache only after observed retirement; failed retire quarantines the pin.
 This PR does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
 (those stay lab-only until a CUDA token-exact gate can land them).
 
