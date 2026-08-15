@@ -12,7 +12,7 @@
 
 ## Now
 
-`IMPLEMENTING` — 584e+978a: fill-lease retire, Finish cst catch, output-copy stream retire.
+`IMPLEMENTING` — 6350: Finish catch HIP compile gate + two-stream product mutation RED.
 
 ## Adjacent upstream (not this row)
 
@@ -162,4 +162,4 @@ GPU (coord, after #837):
 
 Bus: `0384`, `713f`, `9772`, `25c9`, `5071`, `64cb`, `4954`. Donor bytes hashed in `.agents/evidence/rocm-gemma4-prefill-peer/MANIFEST.md` (cache core 60–209 required).
 
-Now: `IMPLEMENTING` — 584e+978a repair. `8f66af43` is not a review target.
+Now: `IMPLEMENTING` — 6350/978a HIP compile + two-stream product mutation. `8f66af43` is not a review target.

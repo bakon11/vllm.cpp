@@ -440,7 +440,9 @@ inline bool HostRetireThenUnpin(PrefillDequantCacheHost& cache, PrefillPeerLife&
 inline bool HostLaunch(PrefillDequantCacheHost& cache, PrefillPeerLife& slot, int device,
                        const void* key, int M, PrefillPeerFailAt fail, bool retire_ok = true,
                        bool restore_ok = true) {
-  if (!SlotReusable(slot.pending_M > 0, slot.rollback_armed, slot.quarantined)) return false;
+  if (!SlotReusable(slot.pending_M > 0, slot.rollback_armed, slot.quarantined) ||
+      !slot.output_copy.CanReuseScratch())
+    return false;
   auto set = [restore_ok](int) { return restore_ok; };
   ComputeDevGuard<decltype(set)> guard(device, set);
   slot.compute_restored = false;
@@ -515,7 +517,8 @@ inline bool HostLaunch(PrefillDequantCacheHost& cache, PrefillPeerLife& slot, in
 }
 
 inline bool HostFinish(PrefillDequantCacheHost& cache, PrefillPeerLife& slot, int M,
-                       PrefillPeerFailAt fail, bool retire_ok = true, bool restore_ok = true) {
+                       PrefillPeerFailAt fail, bool retire_ok = true, bool restore_ok = true,
+                       int copy_stream = 0, int retire_stream = 0) {
   if (slot.pending_M <= 0 || M > slot.pending_M) return false;
   auto set = [restore_ok](int) { return restore_ok; };
   ComputeDevGuard<decltype(set)> guard(0, set);
@@ -530,22 +533,20 @@ inline bool HostFinish(PrefillDequantCacheHost& cache, PrefillPeerLife& slot, in
     slot.compute_restored = true;
     return false;
   }
-  // Output copy is on the caller compute stream (id 0 in the host seam).
-  slot.output_copy.Enqueue(0);
+  slot.output_copy.Enqueue(copy_stream);
   if (fail == PrefillPeerFailAt::AfterCopy) {
     if (!HostRetireThenUnpin(cache, slot, retire_ok)) {
       slot.compute_restored = true;
       guard.RestoreOrThrow();
       return false;
     }
-    // copy failed: no successful enqueue to retire, but do not reuse until cleared
-    (void)slot.output_copy.Retire(0);
+    (void)slot.output_copy.Retire(copy_stream);
     slot.pending_M = 0;
     guard.RestoreOrThrow();
     slot.compute_restored = true;
     return false;
   }
-  if (!slot.output_copy.Retire(0)) {
+  if (!slot.output_copy.Retire(retire_stream)) {
     slot.compute_restored = true;
     guard.RestoreOrThrow();
     return false;
