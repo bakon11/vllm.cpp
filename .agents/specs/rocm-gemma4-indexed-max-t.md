@@ -11,7 +11,7 @@
 
 ## Now
 
-`SPIKE` — spec for review. No product code in this commit.
+`IMPLEMENTING` — d973/0f32 repair on this row. `7c416eb6` is not a review target.
 
 **Not a confirmed fix.** Hypothesis (A) only: small-T **routing**. `9772` does not make this the T=2029 root. T=19 is **observed** on today's serial M1 route. Cause (serial M1 vs anything else) is **unconfirmed**. Do not call the serial path "racy" and do not say the T=19 hang "is this path."
 

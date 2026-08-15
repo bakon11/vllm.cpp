@@ -2937,6 +2937,7 @@ interval does.
 
 Dual-GPU resident FP8 MoE and SharedK-WMMA prefill are controlled via
 ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`, `VT_GEMMA4_DECODE_INDEXED_MAX_T`).
+Indexed T=2..63 retires peer/compute work before pooled scratch is released.
 Unset indexed-max defaults to 63 (T=2..63 uses the existing per-token indexed
 helpers on a scratch-scaled weight copy; helper failure retires peer/compute
 streams before pooled scratch returns, then falls back with a single host scale).
