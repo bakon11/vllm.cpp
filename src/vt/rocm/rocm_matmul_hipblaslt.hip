@@ -109,6 +109,11 @@ hipblasHandle_t ProductGetBlasHandle(int device, hipStream_t stream) {
   return GetBlas(device, stream).handle;
 }
 
+bool ProductGetBlasStreamIsCapturing(hipStream_t stream) {
+  // Exact production hook. Always-false mutation must turn the HIP probe RED.
+  return HipBlasHooks::StreamIsCapturing(stream);
+}
+
 namespace {
 
 std::string ComboName(const Tensor& a, const Tensor& b, const Tensor& out) {

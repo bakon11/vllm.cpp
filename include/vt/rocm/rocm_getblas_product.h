@@ -11,5 +11,8 @@ namespace vt::rocm {
 // Executes production GetBlas: real HipBlasHooks + static thread_local tls_slots.
 hipblasHandle_t ProductGetBlasHandle(int device, hipStream_t stream);
 
+// Exact HipBlasHooks::StreamIsCapturing (not a parallel hipStreamIsCapturing).
+bool ProductGetBlasStreamIsCapturing(hipStream_t stream);
+
 }  // namespace vt::rocm
 #endif

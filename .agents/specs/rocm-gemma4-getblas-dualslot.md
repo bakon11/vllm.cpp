@@ -51,6 +51,14 @@ Keep the existing capture/`hipGetDevice`/`hipSetDevice`/`hipblasSetStream` body 
 - Diagnostic `STAGE_SYNC` / `PREFILL_TRACE`.
 - More than two slots; devices ≥2.
 
+
+## Adjacent upstream (not this row)
+
+- **#785** (joral, OPEN issue): host-dead `VT_ROCWMMA_OK` around SharedK launch. Hard same-hunk landing-order overlap with **#697**, not with GetBlas. Do not patch that guard here.
+- **#523 / #509** (VikashLoomba, OPEN drafts): custom keep-quant grouped GEMM + `rocm_moe_chain.hip`. Path intersection with this row is `docs/FEATURES.md` + `docs/USAGE.md` only. Their expert GEMM does not call `GetBlas` / `ProductGetBlasHandle`.
+- **#834** (unowned): router-lookahead prefetch. Adjacent cache policy only; not TLS lifetime.
+
+
 ## Design
 
 1. Two process-lifetime per-thread handles. Hop 0→1 must not destroy GPU0's handle while GPU0 GEMMs may still be queued (donor comment at `:74-75`).

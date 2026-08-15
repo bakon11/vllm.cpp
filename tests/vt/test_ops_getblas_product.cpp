@@ -80,3 +80,35 @@ TEST_CASE("getblas product GetBlas 0-1-0-1 handle identity") {
   RequireHip(hipSetDevice(1), "cleanup1");
   RequireHip(hipStreamDestroy(s1), "ds1");
 }
+
+TEST_CASE("getblas product capture hook is load-bearing") {
+  const char* env = std::getenv("HIP_VISIBLE_DEVICES");
+  if (env == nullptr || env[0] == '\0') {
+    SkipNotRun("HIP_VISIBLE_DEVICES empty");
+  }
+  int ndev = 0;
+  if (hipGetDeviceCount(&ndev) != hipSuccess || ndev < 1) {
+    SkipNotRun("need >= 1 HIP device");
+  }
+
+  hipStream_t s0 = nullptr;
+  RequireHip(hipSetDevice(0), "set0");
+  RequireHip(hipStreamCreate(&s0), "s0");
+  const hipblasHandle_t h0 = vt::rocm::ProductGetBlasHandle(0, s0);
+  REQUIRE(h0 != nullptr);
+  CHECK(vt::rocm::ProductGetBlasStreamIsCapturing(s0) == false);
+
+  RequireHip(hipStreamBeginCapture(s0, hipStreamCaptureModeGlobal), "begin capture");
+  CHECK(vt::rocm::ProductGetBlasStreamIsCapturing(s0) == true);
+  const hipblasHandle_t h0c = vt::rocm::ProductGetBlasHandle(0, s0);
+  CHECK(h0c == h0);
+  CHECK(vt::rocm::ProductGetBlasStreamIsCapturing(s0) == true);
+
+  hipGraph_t graph = nullptr;
+  RequireHip(hipStreamEndCapture(s0, &graph), "end capture");
+  CHECK(vt::rocm::ProductGetBlasStreamIsCapturing(s0) == false);
+  if (graph != nullptr) {
+    RequireHip(hipGraphDestroy(graph), "destroy graph");
+  }
+  RequireHip(hipStreamDestroy(s0), "ds0");
+}
