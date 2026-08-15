@@ -95,17 +95,17 @@ Rules:
 5. Every Launch/Finish error path after a successful `GetLocked` must retire GPU work **before** unpin:
    - If `ev_e` was successfully recorded: host-wait `ev_e` (or `hipStreamSynchronize` on the stream that recorded it), then unpin.
    - If pin is live and `ev_e` was **not** recorded (fail after pin, after dequant/GEMM enqueue, or `hipEventRecord(ev_e)` itself fails): **`hipStreamSynchronize` the expert stream** (same-dev: the compute/GEMM stream) **then** unpin. "Wait any recorded `ev_e` if valid" is not a retirement proof when the event does not exist.
-   - Then restore compute device. No live expert event left. Pin count → 0.
+   - Then restore compute device. No live expert event left. Pin count → 0 except failed-retirement quarantine (pin stays until later observed retire or fatal teardown).
 6. Mutex scope still mirrors donor for Get/Unpin (`GetLocked` under lock, GEMM outside, `UnpinLocked` under lock). Do not hold the mutex across `MatmulBT`.
 7. **`Ensure` must not reconfigure while any pin is live.** If `dev/I/H/nslots` already match, return true. If they differ and any `slots[i].pins > 0`, return false (reject; do not `FreeAll`). Only call `FreeAll` when pin-count is 0 across the cache. Do not copy donor `Ensure`→`FreeAll` on a live pin. Slot-count comes from `PrefillDequantCacheSlots()` (donor default 1).
 
 ### Lifetime invariants (mutation-proven)
 
 - every successful Launch has exactly one Finish;
-- Launch fail unpins (or never pinned) and does not leave a live expert event;
+- Launch fail unpins (or never pinned) after current-stream retire; leftover prior ev_e is never the rollback target; failed retire quarantines;
 - Finish restores compute device before return;
 - `ev_c` is recorded on compute stream, `ev_e` on expert stream; no cross-device event record;
-- cache pin count returns to 0 on both success and every error return;
+- cache pin count returns to 0 on success and on every error return where retirement was observed; failed retirement is the sole zero-pin exception (quarantine);
 - pin remains >0 from GetLocked until host-observed retirement (`ev_e` complete, or expert/compute stream sync on the pre-record error path);
 - a second worker cannot obtain a rewrite/evict of a still-pinned slot;
 - `Ensure` never `FreeAll`s a cache that has any `pins > 0`.

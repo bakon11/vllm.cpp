@@ -1,10 +1,13 @@
-// #839 shared prefill-peer lifetime. Product HIP instantiates this template;
-// host tests use the same functions. Do not unpin without observed retirement.
+// #839 shared prefill-peer lifetime. Product HIP and host tests execute these
+// transitions. Failed retirement quarantines the pin (sole zero-pin exception).
 #pragma once
 
 #include <cstdint>
 #include <cstdlib>
 #include <mutex>
+#include <exception>
+#include <stdexcept>
+#include <utility>
 
 namespace vt::rocm {
 
@@ -12,6 +15,98 @@ inline int PrefillDequantCacheSlots() { return 1; }
 inline constexpr int kPrefillDequantCacheMaxSlots = 128;
 
 enum class PrefillRetireOutcome { None, Unpinned, Quarantined };
+enum class PrefillRetireTarget { None, CurrentStream, RecordedEvent };
+
+struct PrefillPeerLife {
+  int cache_pin = -1;
+  int cache_dev = -1;
+  int pending_M = 0;
+  bool ev_e_recorded = false;
+  bool this_gen_ev_e = false;
+  bool work_enqueued = false;
+  bool rollback_armed = false;
+  bool quarantined = false;
+  bool compute_restored = false;
+
+  void ArmRollback() {
+    rollback_armed = true;
+    work_enqueued = true;
+    this_gen_ev_e = false;
+  }
+  void MarkThisGenEvent() {
+    this_gen_ev_e = true;
+    ev_e_recorded = true;
+    rollback_armed = false;
+  }
+  void OnSuccessfulRetire() {
+    cache_pin = -1;
+    cache_dev = -1;
+    ev_e_recorded = false;
+    this_gen_ev_e = false;
+    rollback_armed = false;
+  }
+};
+
+inline bool SlotReusable(bool pending, bool rollback_armed, bool quarantined) {
+  return !pending && !rollback_armed && !quarantined;
+}
+
+// Rollback armed before this generation recorded ev_e must sync the current
+// owning stream, never a leftover prior event.
+inline PrefillRetireTarget ChoosePrefillRetire(const PrefillPeerLife& life) {
+  if (life.this_gen_ev_e) return PrefillRetireTarget::RecordedEvent;
+  if (life.rollback_armed || life.cache_pin >= 0) return PrefillRetireTarget::CurrentStream;
+  return PrefillRetireTarget::None;
+}
+
+struct RestoreFailed : std::runtime_error {
+  RestoreFailed() : std::runtime_error("prefill-peer compute device restore failed") {}
+};
+
+template <typename SetDev>
+struct ComputeDevGuard {
+  int dev = -1;
+  SetDev set{};
+  bool done = false;
+
+  ComputeDevGuard(int d, SetDev s) : dev(d), set(std::move(s)) {}
+  ComputeDevGuard(const ComputeDevGuard&) = delete;
+  ComputeDevGuard& operator=(const ComputeDevGuard&) = delete;
+
+  void RestoreOrThrow() {
+    if (done) return;
+    if (!set(dev)) throw RestoreFailed{};
+    done = true;
+  }
+
+  ~ComputeDevGuard() noexcept {
+    if (!done) {
+      if (!set(dev)) {
+        if (std::uncaught_exceptions() > 0) return;
+        std::terminate();
+      }
+      done = true;
+    }
+  }
+};
+
+struct SameDevLife {
+  int cache_pin = -1;
+  int cache_dev = -1;
+  bool quarantined = false;
+  bool CanEnter() const { return !quarantined; }
+  bool CanReconfigure() const { return !quarantined && cache_pin < 0; }
+  void Quarantine(int pin, int dev) {
+    cache_pin = pin;
+    cache_dev = dev;
+    quarantined = true;
+  }
+  void ClearPin() {
+    cache_pin = -1;
+    cache_dev = -1;
+    quarantined = false;
+  }
+};
 
 template <typename Hooks>
 struct PrefillDequantCacheT {
@@ -22,6 +117,7 @@ struct PrefillDequantCacheT {
     uint64_t lru = 0;
     int pins = 0;
     bool ready = false;
+    bool filling = false;
     typename Hooks::Event ready_ev{};
   };
 
@@ -35,8 +131,6 @@ struct PrefillDequantCacheT {
   Hooks hooks{};
 
   void FreeAll() {
-    // Walk the full array so a failed Ensure that never published nslots
-    // still releases live gu/dn (partial-init leak).
     for (int i = 0; i < kPrefillDequantCacheMaxSlots; ++i) {
       if (slots[i].gu) {
         hooks.Free(slots[i].gu);
@@ -104,7 +198,8 @@ struct PrefillDequantCacheT {
     int victim = -1;
     uint64_t oldest = UINT64_MAX;
     for (int i = 0; i < nslots; ++i) {
-      if (slots[i].key == key) {
+      if (slots[i].filling) continue;
+      if (slots[i].key == key && slots[i].ready) {
         hit = i;
         break;
       }
@@ -117,7 +212,6 @@ struct PrefillDequantCacheT {
       }
     }
     if (hit >= 0) {
-      if (!slots[hit].ready) return false;
       if (!hooks.WaitReady(slots[hit].ready_ev)) return false;
       ++hits;
       slots[hit].lru = ++clock;
@@ -129,7 +223,7 @@ struct PrefillDequantCacheT {
     }
     if (victim < 0) {
       for (int i = 0; i < nslots; ++i) {
-        if (slots[i].pins == 0) {
+        if (slots[i].pins == 0 && !slots[i].filling) {
           victim = i;
           break;
         }
@@ -137,10 +231,20 @@ struct PrefillDequantCacheT {
       if (victim < 0) return false;
     }
     Slot& s = slots[victim];
-    if (!hooks.Fill(s.gu, s.dn)) return false;
-    if (!hooks.RecordReady(s.ready_ev)) return false;
+    s.key = nullptr;
+    s.ready = false;
+    s.filling = true;
+    if (!hooks.Fill(s.gu, s.dn)) {
+      s.filling = false;
+      return false;
+    }
+    if (!hooks.RecordReady(s.ready_ev)) {
+      s.filling = false;
+      return false;
+    }
     s.ready = true;
     s.key = key;
+    s.filling = false;
     ++misses;
     s.lru = ++clock;
     s.pins++;
@@ -163,10 +267,11 @@ struct HostAlloc {
   int fail_malloc_at = -1;
   bool fail_record = false;
   bool fail_wait = false;
+  bool fail_set_device = false;
   struct Event {
     bool recorded = false;
   };
-  bool SetDevice(int) { return true; }
+  bool SetDevice(int) { return !fail_set_device; }
   void* Malloc(size_t) {
     ++mallocs;
     if (fail_malloc_at >= 0 && mallocs == fail_malloc_at) return nullptr;
@@ -197,15 +302,6 @@ inline PrefillRetireOutcome RetirePinIfObserved(PrefillDequantCacheHost& cache, 
   return PrefillRetireOutcome::Unpinned;
 }
 
-inline bool SlotReusable(bool pending, bool rollback_armed, bool quarantined) {
-  return !pending && !rollback_armed && !quarantined;
-}
-
-inline bool RestoreComputeChecked(bool set_ok, bool& restored) {
-  restored = set_ok;
-  return set_ok;
-}
-
 enum class PrefillPeerFailAt {
   None,
   AfterFirstEnqueue,
@@ -216,50 +312,42 @@ enum class PrefillPeerFailAt {
   AfterCopy,
 };
 
-struct PrefillPeerSlotHost {
-  int cache_pin = -1;
-  int cache_dev = -1;
-  int pending_M = 0;
-  bool ev_e_recorded = false;
-  bool ev_e_retired = false;
-  bool work_enqueued = false;
-  bool rollback_armed = false;
-  bool quarantined = false;
-  bool compute_restored = false;
-};
+using PrefillPeerSlotHost = PrefillPeerLife;
 
-inline bool HostRetireThenUnpin(PrefillDequantCacheHost& cache, PrefillPeerSlotHost& slot,
+inline bool HostRetireThenUnpin(PrefillDequantCacheHost& cache, PrefillPeerLife& slot,
                                 bool retire_ok) {
-  if (slot.cache_pin < 0 && !slot.rollback_armed) return true;
-  if (slot.ev_e_recorded || slot.work_enqueued) {
-    if (!retire_ok) {
-      slot.quarantined = true;
-      return false;
-    }
-    slot.ev_e_retired = true;
+  const auto target = ChoosePrefillRetire(slot);
+  if (target == PrefillRetireTarget::None && slot.cache_pin < 0) return true;
+  if (!retire_ok) {
+    slot.quarantined = true;
+    return false;
   }
   const auto out = RetirePinIfObserved(cache, slot.cache_pin, /*retire_ok=*/true);
   if (out == PrefillRetireOutcome::Unpinned || out == PrefillRetireOutcome::None) {
-    slot.cache_dev = -1;
-    slot.rollback_armed = false;
+    slot.OnSuccessfulRetire();
     return true;
   }
   slot.quarantined = true;
   return false;
 }
 
-inline bool HostLaunch(PrefillDequantCacheHost& cache, PrefillPeerSlotHost& slot, int device,
-                       const void* key, int M, PrefillPeerFailAt fail, bool retire_ok = true) {
+inline bool HostLaunch(PrefillDequantCacheHost& cache, PrefillPeerLife& slot, int device,
+                       const void* key, int M, PrefillPeerFailAt fail, bool retire_ok = true,
+                       bool restore_ok = true) {
   if (!SlotReusable(slot.pending_M > 0, slot.rollback_armed, slot.quarantined)) return false;
+  auto set = [restore_ok](int) { return restore_ok; };
+  ComputeDevGuard<decltype(set)> guard(device, set);
   slot.compute_restored = false;
-  slot.work_enqueued = true;
-  slot.rollback_armed = true;
+  slot.ArmRollback();
   if (fail == PrefillPeerFailAt::AfterFirstEnqueue) {
     if (!HostRetireThenUnpin(cache, slot, retire_ok)) {
-      (void)RestoreComputeChecked(true, slot.compute_restored);
+      slot.compute_restored = true;
+      guard.RestoreOrThrow();
       return false;
     }
-    return RestoreComputeChecked(true, slot.compute_restored) && false;
+    guard.RestoreOrThrow();
+    slot.compute_restored = true;
+    return false;
   }
   int pin = -1;
   void* gu = nullptr;
@@ -268,51 +356,69 @@ inline bool HostLaunch(PrefillDequantCacheHost& cache, PrefillPeerSlotHost& slot
     std::lock_guard<std::mutex> lk(cache.mu);
     if (!cache.Ensure(device, 4, 8) || !cache.GetLocked(key, &gu, &dn, &pin)) {
       if (!HostRetireThenUnpin(cache, slot, retire_ok)) {
-        (void)RestoreComputeChecked(true, slot.compute_restored);
+        slot.compute_restored = true;
+        guard.RestoreOrThrow();
         return false;
       }
-      return RestoreComputeChecked(true, slot.compute_restored) && false;
+      guard.RestoreOrThrow();
+      slot.compute_restored = true;
+      return false;
     }
   }
   slot.cache_pin = pin;
   slot.cache_dev = device;
   if (fail == PrefillPeerFailAt::AfterPinEnqueue || fail == PrefillPeerFailAt::RecordEvE) {
     if (!HostRetireThenUnpin(cache, slot, retire_ok)) {
-      (void)RestoreComputeChecked(true, slot.compute_restored);
+      slot.compute_restored = true;
+      guard.RestoreOrThrow();
       return false;
     }
-    return RestoreComputeChecked(true, slot.compute_restored) && false;
+    guard.RestoreOrThrow();
+    slot.compute_restored = true;
+    return false;
   }
-  slot.ev_e_recorded = true;
+  slot.MarkThisGenEvent();
   if (fail == PrefillPeerFailAt::AfterRecord) {
     if (!HostRetireThenUnpin(cache, slot, retire_ok)) {
-      (void)RestoreComputeChecked(true, slot.compute_restored);
+      slot.compute_restored = true;
+      guard.RestoreOrThrow();
       return false;
     }
-    return RestoreComputeChecked(true, slot.compute_restored) && false;
+    guard.RestoreOrThrow();
+    slot.compute_restored = true;
+    return false;
   }
   slot.pending_M = M;
-  slot.rollback_armed = false;
-  return RestoreComputeChecked(true, slot.compute_restored);
+  guard.RestoreOrThrow();
+  slot.compute_restored = true;
+  return true;
 }
 
-inline bool HostFinish(PrefillDequantCacheHost& cache, PrefillPeerSlotHost& slot, int M,
-                       PrefillPeerFailAt fail, bool retire_ok = true) {
+inline bool HostFinish(PrefillDequantCacheHost& cache, PrefillPeerLife& slot, int M,
+                       PrefillPeerFailAt fail, bool retire_ok = true, bool restore_ok = true) {
   if (slot.pending_M <= 0 || M > slot.pending_M) return false;
+  auto set = [restore_ok](int) { return restore_ok; };
+  ComputeDevGuard<decltype(set)> guard(0, set);
   if (fail == PrefillPeerFailAt::AfterWait || fail == PrefillPeerFailAt::AfterCopy) {
     if (!HostRetireThenUnpin(cache, slot, retire_ok)) {
-      (void)RestoreComputeChecked(true, slot.compute_restored);
+      slot.compute_restored = true;
+      guard.RestoreOrThrow();
       return false;
     }
     slot.pending_M = 0;
-    return RestoreComputeChecked(true, slot.compute_restored) && false;
+    guard.RestoreOrThrow();
+    slot.compute_restored = true;
+    return false;
   }
   if (!HostRetireThenUnpin(cache, slot, retire_ok)) {
-    (void)RestoreComputeChecked(true, slot.compute_restored);
+    slot.compute_restored = true;
+    guard.RestoreOrThrow();
     return false;
   }
   slot.pending_M = 0;
-  return RestoreComputeChecked(true, slot.compute_restored);
+  guard.RestoreOrThrow();
+  slot.compute_restored = true;
+  return true;
 }
 
 }  // namespace vt::rocm
