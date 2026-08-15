@@ -1701,6 +1701,9 @@ vllm_cpp_add_test(test_ops_paged_attn vt/test_ops_paged_attn.cpp)
 vllm_cpp_add_test(test_ops_paged_attn_dtype vt/test_ops_paged_attn_dtype.cpp)
 vllm_cpp_add_test(test_ops_sample vt/test_ops_sample.cpp)
 vllm_cpp_add_test(test_gemma4_rocm_fp8_seams vt/test_gemma4_rocm_fp8_seams.cpp)
+vllm_cpp_add_test(test_ops_getblas_dualslot vt/test_ops_getblas_dualslot.cpp)
+target_compile_definitions(test_ops_getblas_dualslot PRIVATE
+  VLLM_CPP_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vllm_cpp_add_test(test_ops_penalties vt/test_ops_penalties.cpp)
 
 vllm_cpp_add_test(test_npy parity/test_npy.cpp)
