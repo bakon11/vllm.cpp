@@ -12,7 +12,7 @@
 
 ## Now
 
-`IMPLEMENTING` — 6350: Finish catch HIP compile gate + two-stream product mutation RED.
+`IMPLEMENTING` — ea9c: product RestoreComputeOrThrow no-op must RED via compile-and-run of the HIP body.
 
 ## Adjacent upstream (not this row)
 
@@ -162,4 +162,4 @@ GPU (coord, after #837):
 
 Bus: `0384`, `713f`, `9772`, `25c9`, `5071`, `64cb`, `4954`. Donor bytes hashed in `.agents/evidence/rocm-gemma4-prefill-peer/MANIFEST.md` (cache core 60–209 required).
 
-Now: `IMPLEMENTING` — 6350/978a HIP compile + two-stream product mutation. `8f66af43` is not a review target.
+Now: `IMPLEMENTING` — ea9c product RestoreComputeOrThrow no-op compile-and-run RED. `a007ec40` is not a review target.
