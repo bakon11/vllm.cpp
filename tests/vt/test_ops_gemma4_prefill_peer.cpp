@@ -355,6 +355,24 @@ TEST_CASE("prefill peer fill-lease failed retire quarantines") {
   CHECK(lease_held);
 }
 
+
+TEST_CASE("prefill peer two-compute-stream output-copy retirement") {
+  vt::rocm::OutputCopyGate gate;
+  gate.Enqueue(1);
+  CHECK_FALSE(gate.CanReuseScratch());
+  CHECK_FALSE(gate.Retire(2));  // other compute stream
+  CHECK_FALSE(gate.CanReuseScratch());
+  REQUIRE(gate.Retire(1));
+  CHECK(gate.CanReuseScratch());
+  vt::rocm::PrefillDequantCacheHost cache;
+  vt::rocm::PrefillPeerLife slot;
+  const char key = 'k';
+  REQUIRE(vt::rocm::HostLaunch(cache, slot, 0, &key, 8, vt::rocm::PrefillPeerFailAt::None));
+  REQUIRE(vt::rocm::HostFinish(cache, slot, 8, vt::rocm::PrefillPeerFailAt::None));
+  CHECK(slot.output_copy.CanReuseScratch());
+  CHECK(slot.pending_M == 0);
+}
+
 TEST_CASE("prefill peer source: product uses shared retire/restore policy") {
   const std::string hip = ReadHip();
   CHECK(hip.find("ChoosePrefillRetire(PeerLifeView") != std::string::npos);
@@ -368,6 +386,24 @@ TEST_CASE("prefill peer source: product uses shared retire/restore policy") {
   CHECK(hip.find("ReleaseObservedPinLocked") != std::string::npos);
   CHECK(hip.find("PublishThenRestoreOrThrow") != std::string::npos);
   CHECK(hip.find("tls.fill_lease = true") != std::string::npos);
+  const auto fin = hip.find("bool FinishGemma4Fp8ExpertGeGLUPrefillPeer");
+  REQUIRE(fin != std::string::npos);
+  const auto fin_def = hip.rfind("bool FinishGemma4Fp8ExpertGeGLUPrefillPeer");
+  REQUIRE(fin_def != std::string::npos);
+  const auto fin_end = hip.find("void PinGemma4Fp8ExpertHostCache", fin_def);
+  REQUIRE(fin_end != std::string::npos);
+  const std::string finish = hip.substr(fin_def, fin_end - fin_def);
+  const auto catch_all = finish.find("catch (...)");
+  REQUIRE(catch_all != std::string::npos);
+  const std::string catch_body = finish.substr(catch_all);
+  CHECK(catch_body.find("hipStream_t cst = static_cast<hipStream_t>(compute_q.handle);") !=
+        std::string::npos);
+  const auto sync_cst = finish.find("hipStreamSynchronize(cst)");
+  const auto success_clear =
+      finish.find("tls.pending_M = 0;\n  RestoreComputeOrThrow(compute_dev); return true;");
+  REQUIRE(sync_cst != std::string::npos);
+  REQUIRE(success_clear != std::string::npos);
+  CHECK(sync_cst < success_clear);
   const auto ret = hip.find("bool RetirePinThenUnpin");
   REQUIRE(ret != std::string::npos);
   const auto ret_end = hip.find("void FailLaunchRestore", ret);

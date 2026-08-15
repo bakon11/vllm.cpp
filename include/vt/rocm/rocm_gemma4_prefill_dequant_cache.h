@@ -17,6 +17,25 @@ inline constexpr int kPrefillDequantCacheMaxSlots = 128;
 enum class PrefillRetireOutcome { None, Unpinned, Quarantined };
 enum class PrefillRetireTarget { None, ComputeStream, ExpertStream, RecordedEvent };
 
+// Finish output copy on a specific compute stream. Reuse/reconfigure of tls.y
+// is forbidden until that stream is host-observed retired.
+struct OutputCopyGate {
+  int copy_stream = -1;
+  bool pending = false;
+  void Enqueue(int sid) {
+    copy_stream = sid;
+    pending = true;
+  }
+  bool Retire(int sid) {
+    if (!pending) return true;
+    if (sid != copy_stream) return false;
+    pending = false;
+    copy_stream = -1;
+    return true;
+  }
+  bool CanReuseScratch() const { return !pending; }
+};
+
 struct PrefillPeerLife {
   int cache_pin = -1;
   int cache_dev = -1;
@@ -30,6 +49,7 @@ struct PrefillPeerLife {
   bool quarantined = false;
   bool compute_restored = false;
   bool fill_lease = false;
+  OutputCopyGate output_copy{};
 
   // Arm after the first successful current-generation enqueue.
   void ArmRollback() {
@@ -499,7 +519,7 @@ inline bool HostFinish(PrefillDequantCacheHost& cache, PrefillPeerLife& slot, in
   if (slot.pending_M <= 0 || M > slot.pending_M) return false;
   auto set = [restore_ok](int) { return restore_ok; };
   ComputeDevGuard<decltype(set)> guard(0, set);
-  if (fail == PrefillPeerFailAt::AfterWait || fail == PrefillPeerFailAt::AfterCopy) {
+  if (fail == PrefillPeerFailAt::AfterWait) {
     if (!HostRetireThenUnpin(cache, slot, retire_ok)) {
       slot.compute_restored = true;
       guard.RestoreOrThrow();
@@ -508,6 +528,26 @@ inline bool HostFinish(PrefillDequantCacheHost& cache, PrefillPeerLife& slot, in
     slot.pending_M = 0;
     guard.RestoreOrThrow();
     slot.compute_restored = true;
+    return false;
+  }
+  // Output copy is on the caller compute stream (id 0 in the host seam).
+  slot.output_copy.Enqueue(0);
+  if (fail == PrefillPeerFailAt::AfterCopy) {
+    if (!HostRetireThenUnpin(cache, slot, retire_ok)) {
+      slot.compute_restored = true;
+      guard.RestoreOrThrow();
+      return false;
+    }
+    // copy failed: no successful enqueue to retire, but do not reuse until cleared
+    (void)slot.output_copy.Retire(0);
+    slot.pending_M = 0;
+    guard.RestoreOrThrow();
+    slot.compute_restored = true;
+    return false;
+  }
+  if (!slot.output_copy.Retire(0)) {
+    slot.compute_restored = true;
+    guard.RestoreOrThrow();
     return false;
   }
   if (!HostRetireThenUnpin(cache, slot, retire_ok)) {

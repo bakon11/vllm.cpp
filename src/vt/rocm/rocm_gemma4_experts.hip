@@ -1174,6 +1174,11 @@ bool FinishGemma4Fp8ExpertGeGLUPrefillPeer(vt::Queue& compute_q, int slot, void*
     RestoreComputeOrThrow(compute_dev); return false;
   }
   tls.ev_e_recorded = true;
+  // Output copy is on cst. Host-observe that stream before pending/reuse.
+  if (hipStreamSynchronize(cst) != hipSuccess) {
+    tls.quarantined = true;
+    RestoreComputeOrThrow(compute_dev); return false;
+  }
   if (!RetirePinThenUnpin(tls, est, cst)) {
     tls.quarantined = true;
     RestoreComputeOrThrow(compute_dev); return false;
@@ -1183,6 +1188,7 @@ bool FinishGemma4Fp8ExpertGeGLUPrefillPeer(vt::Queue& compute_q, int slot, void*
   } catch (const vt::rocm::RestoreFailed&) {
     PeerSlot& tls = PeerPipeTls().s[slot];
     hipStream_t est = tls.eq_live ? static_cast<hipStream_t>(tls.eq.handle) : nullptr;
+    hipStream_t cst = static_cast<hipStream_t>(compute_q.handle);
     if (tls.cache_pin >= 0 || tls.rollback_armed) (void)RetirePinThenUnpin(tls, est, cst);
     tls.pending_M = 0;
     throw;
@@ -1190,6 +1196,7 @@ bool FinishGemma4Fp8ExpertGeGLUPrefillPeer(vt::Queue& compute_q, int slot, void*
     const int compute_dev = compute_q.device.index;
     PeerSlot& tls = PeerPipeTls().s[slot];
     hipStream_t est = tls.eq_live ? static_cast<hipStream_t>(tls.eq.handle) : nullptr;
+    hipStream_t cst = static_cast<hipStream_t>(compute_q.handle);
     if (tls.cache_pin >= 0 || tls.rollback_armed) (void)RetirePinThenUnpin(tls, est, cst);
     RestoreComputeOrThrow(compute_dev);
     throw;
