@@ -29,6 +29,7 @@ struct PrefillPeerLife {
   bool rollback_armed = false;
   bool quarantined = false;
   bool compute_restored = false;
+  bool fill_lease = false;
 
   // Arm after the first successful current-generation enqueue.
   void ArmRollback() {
@@ -51,6 +52,7 @@ struct PrefillPeerLife {
     rollback_armed = false;
     work_on_compute = false;
     work_on_expert = false;
+    fill_lease = false;
   }
 };
 
@@ -66,6 +68,7 @@ PrefillPeerLife LifeFromSlot(const Slot& tls) {
   life.quarantined = tls.quarantined;
   life.work_on_compute = tls.work_on_compute;
   life.work_on_expert = tls.work_on_expert;
+  life.fill_lease = tls.fill_lease;
   return life;
 }
 
@@ -292,6 +295,20 @@ struct PrefillDequantCacheT {
     if (slots[idx].pins > 0) slots[idx].pins--;
   }
 
+  bool IsFillLease(int idx) const {
+    if (idx < 0 || idx >= nslots) return false;
+    return slots[idx].filling || slots[idx].fill_failed;
+  }
+
+  // After a successful owning-stream retire: fill-lease uses RetireFillLocked,
+  // ready pin uses UnpinLocked. Caller must not hold mu around the stream sync.
+  bool ReleaseObservedPinLocked(int idx, bool fill_lease) {
+    if (idx < 0 || idx >= nslots) return true;
+    if (fill_lease || IsFillLease(idx)) return RetireFillLocked(idx, true);
+    UnpinLocked(idx);
+    return true;
+  }
+
   // Producer-stream retirement of a failed fill lease.
   bool RetireFillLocked(int idx, bool retire_ok) {
     if (idx < 0 || idx >= nslots) return false;
@@ -344,13 +361,27 @@ struct HostAlloc {
 using PrefillDequantCacheHost = PrefillDequantCacheT<HostAlloc>;
 
 inline PrefillRetireOutcome RetirePinIfObserved(PrefillDequantCacheHost& cache, int& cache_pin,
-                                                bool retire_ok) {
+                                                bool retire_ok, bool fill_lease = false) {
   if (cache_pin < 0) return PrefillRetireOutcome::None;
   if (!retire_ok) return PrefillRetireOutcome::Quarantined;
   std::lock_guard<std::mutex> lk(cache.mu);
-  cache.UnpinLocked(cache_pin);
+  if (!cache.ReleaseObservedPinLocked(cache_pin, fill_lease)) return PrefillRetireOutcome::Quarantined;
   cache_pin = -1;
   return PrefillRetireOutcome::Unpinned;
+}
+
+// Product publish-then-restore: retire/quarantine before rethrowing RestoreFailed.
+template <typename Slot, typename Restore, typename Retire>
+void PublishThenRestoreOrThrow(Slot& slot, int M, Restore&& restore, Retire&& retire) {
+  slot.pending_M = M;
+  slot.rollback_armed = false;
+  try {
+    restore();
+  } catch (const RestoreFailed&) {
+    (void)retire();
+    slot.pending_M = 0;
+    throw;
+  }
 }
 
 enum class PrefillPeerFailAt {
@@ -375,7 +406,7 @@ inline bool HostRetireThenUnpin(PrefillDequantCacheHost& cache, PrefillPeerLife&
     slot.quarantined = true;
     return false;
   }
-  const auto out = RetirePinIfObserved(cache, slot.cache_pin, /*retire_ok=*/true);
+  const auto out = RetirePinIfObserved(cache, slot.cache_pin, /*retire_ok=*/true, slot.fill_lease);
   if (out == PrefillRetireOutcome::Unpinned || out == PrefillRetireOutcome::None) {
     slot.OnSuccessfulRetire();
     return true;
@@ -412,23 +443,29 @@ inline bool HostLaunch(PrefillDequantCacheHost& cache, PrefillPeerLife& slot, in
   int pin = -1;
   void* gu = nullptr;
   void* dn = nullptr;
+  bool got = false;
   {
     std::lock_guard<std::mutex> lk(cache.mu);
-    if (!cache.Ensure(device, 4, 8) || !cache.GetLocked(key, &gu, &dn, &pin)) {
-      if (pin >= 0) slot.cache_pin = pin;
+    got = cache.Ensure(device, 4, 8) && cache.GetLocked(key, &gu, &dn, &pin);
+    if (!got && pin >= 0) {
+      slot.cache_pin = pin;
       slot.cache_dev = device;
-      if (!HostRetireThenUnpin(cache, slot, retire_ok)) {
-        slot.compute_restored = true;
-        guard.RestoreOrThrow();
-        return false;
-      }
-      guard.RestoreOrThrow();
+      slot.fill_lease = true;
+    }
+  }
+  if (!got) {
+    if (!HostRetireThenUnpin(cache, slot, retire_ok)) {
       slot.compute_restored = true;
+      guard.RestoreOrThrow();
       return false;
     }
+    guard.RestoreOrThrow();
+    slot.compute_restored = true;
+    return false;
   }
   slot.cache_pin = pin;  // persist immediately on acquisition
   slot.cache_dev = device;
+  slot.fill_lease = false;
   if (fail == PrefillPeerFailAt::AfterPinEnqueue || fail == PrefillPeerFailAt::RecordEvE) {
     if (!HostRetireThenUnpin(cache, slot, retire_ok)) {
       slot.compute_restored = true;
@@ -450,8 +487,9 @@ inline bool HostLaunch(PrefillDequantCacheHost& cache, PrefillPeerLife& slot, in
     slot.compute_restored = true;
     return false;
   }
-  slot.pending_M = M;
-  guard.RestoreOrThrow();
+  PublishThenRestoreOrThrow(
+      slot, M, [&] { guard.RestoreOrThrow(); },
+      [&] { return HostRetireThenUnpin(cache, slot, retire_ok); });
   slot.compute_restored = true;
   return true;
 }
@@ -496,9 +534,19 @@ struct SameDevSession {
     if (!cache || !life || !life->CanEnter()) return false;
     void* gu = nullptr;
     void* dn = nullptr;
-    std::lock_guard<std::mutex> lk(cache->mu);
-    if (!cache->Ensure(device, 4, 8) || !cache->GetLocked(key, &gu, &dn, &pin)) {
-      if (pin >= 0) life->PersistPin(pin, device);
+    bool got = false;
+    {
+      std::lock_guard<std::mutex> lk(cache->mu);
+      got = cache->Ensure(device, 4, 8) && cache->GetLocked(key, &gu, &dn, &pin);
+      if (!got && pin >= 0) life->PersistPin(pin, device);
+    }
+    if (!got) {
+      if (pin >= 0) {
+        std::lock_guard<std::mutex> lk(cache->mu);
+        (void)cache->ReleaseObservedPinLocked(pin, /*fill_lease=*/true);
+        life->ClearPin();
+        pin = -1;
+      }
       return false;
     }
     life->PersistPin(pin, device);

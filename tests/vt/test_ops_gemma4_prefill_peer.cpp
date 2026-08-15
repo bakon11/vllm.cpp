@@ -230,6 +230,9 @@ TEST_CASE("prefill peer restore failure is fatal not false") {
       vt::rocm::HostLaunch(cache, slot, 0, &key, 8, vt::rocm::PrefillPeerFailAt::None,
                            /*retire_ok=*/true, /*restore_ok=*/false),
       vt::rocm::RestoreFailed);
+  CHECK(slot.pending_M == 0);
+  CHECK(slot.cache_pin < 0);
+  CHECK(cache.LivePins() == 0);
 }
 
 TEST_CASE("prefill peer same-dev quarantine blocks reenter and reconfigure") {
@@ -286,6 +289,7 @@ TEST_CASE("prefill peer LifeFromSlot does not remap this_gen to ev_e_recorded") 
     bool quarantined = false;
     bool work_on_compute = true;
     bool work_on_expert = false;
+    bool fill_lease = false;
   } tls;
   const auto life = vt::rocm::LifeFromSlot(tls);
   CHECK_FALSE(life.this_gen_ev_e);
@@ -303,9 +307,52 @@ TEST_CASE("prefill peer restore no-op mutation is RED") {
       vt::rocm::HostLaunch(cache, slot, 0, &key, 8, vt::rocm::PrefillPeerFailAt::None,
                            /*retire_ok=*/true, /*restore_ok=*/false),
       vt::rocm::RestoreFailed);
+  CHECK(slot.pending_M == 0);
+  CHECK(cache.LivePins() == 0);
   const std::string hdr = ReadHeader();
   CHECK(hdr.find("if (std::uncaught_exceptions() > 0) return;") == std::string::npos);
   CHECK(hdr.find("if (!set(dev)) std::terminate();") != std::string::npos);
+  CHECK(hdr.find("PublishThenRestoreOrThrow") != std::string::npos);
+  const auto pub = hdr.find("void PublishThenRestoreOrThrow");
+  REQUIRE(pub != std::string::npos);
+  const auto pub_end = hdr.find("enum class PrefillPeerFailAt", pub);
+  REQUIRE(pub_end != std::string::npos);
+  const std::string body = hdr.substr(pub, pub_end - pub);
+  CHECK(body.find("catch (const RestoreFailed&)") != std::string::npos);
+  CHECK(body.find("slot.pending_M = 0") != std::string::npos);
+  CHECK(body.find("(void)retire()") != std::string::npos);
+}
+
+
+TEST_CASE("prefill peer HostLaunch fill-lease fail retires outside lock") {
+  vt::rocm::PrefillDequantCacheHost cache;
+  vt::rocm::PrefillPeerLife slot;
+  const char key = 'k';
+  cache.hooks.fail_record = true;
+  REQUIRE_FALSE(vt::rocm::HostLaunch(cache, slot, 0, &key, 8, vt::rocm::PrefillPeerFailAt::None));
+  CHECK(slot.fill_lease == false);  // cleared on successful retire
+  CHECK(slot.cache_pin < 0);
+  CHECK(cache.LivePins() == 0);
+  CHECK_FALSE(cache.slots[0].filling);
+  CHECK_FALSE(cache.slots[0].fill_failed);
+  cache.hooks.fail_record = false;
+  vt::rocm::PrefillPeerLife s2;
+  REQUIRE(vt::rocm::HostLaunch(cache, s2, 0, &key, 8, vt::rocm::PrefillPeerFailAt::None));
+  CHECK(s2.cache_pin >= 0);
+}
+
+TEST_CASE("prefill peer fill-lease failed retire quarantines") {
+  vt::rocm::PrefillDequantCacheHost cache;
+  vt::rocm::PrefillPeerLife slot;
+  const char key = 'k';
+  cache.hooks.fail_record = true;
+  REQUIRE_FALSE(vt::rocm::HostLaunch(cache, slot, 0, &key, 8, vt::rocm::PrefillPeerFailAt::None,
+                                     /*retire_ok=*/false));
+  CHECK(slot.quarantined);
+  CHECK(slot.cache_pin >= 0);
+  CHECK(cache.LivePins() >= 1);
+  const bool lease_held = cache.slots[0].filling || cache.slots[0].fill_failed;
+  CHECK(lease_held);
 }
 
 TEST_CASE("prefill peer source: product uses shared retire/restore policy") {
@@ -318,6 +365,9 @@ TEST_CASE("prefill peer source: product uses shared retire/restore policy") {
   CHECK(hip.find("life.PersistPin") != std::string::npos);
   CHECK(hip.find("work_on_compute = true") != std::string::npos);
   CHECK(hip.find("FailLaunchRestore(tls, est, cst, compute_dev)") != std::string::npos);
+  CHECK(hip.find("ReleaseObservedPinLocked") != std::string::npos);
+  CHECK(hip.find("PublishThenRestoreOrThrow") != std::string::npos);
+  CHECK(hip.find("tls.fill_lease = true") != std::string::npos);
   const auto ret = hip.find("bool RetirePinThenUnpin");
   REQUIRE(ret != std::string::npos);
   const auto ret_end = hip.find("void FailLaunchRestore", ret);
@@ -327,11 +377,13 @@ TEST_CASE("prefill peer source: product uses shared retire/restore policy") {
   CHECK(retire.find("ChoosePrefillRetire") != std::string::npos);
   CHECK(retire.find("PrefillRetireTarget::ComputeStream") != std::string::npos);
   CHECK(retire.find("PrefillRetireTarget::ExpertStream") != std::string::npos);
+  CHECK(retire.find("ReleaseObservedPinLocked") != std::string::npos);
+  CHECK(retire.find("UnpinLocked(tls.cache_pin)") == std::string::npos);
 
   // After first successful enqueue is armed, bare restore-return is forbidden.
   const auto armed = hip.find("tls.rollback_armed = true");
   REQUIRE(armed != std::string::npos);
-  const auto rec_end = hip.find("tls.pending_M = M;", armed);
+  const auto rec_end = hip.find("PublishThenRestoreOrThrow", armed);
   REQUIRE(rec_end != std::string::npos);
   const std::string after = hip.substr(armed, rec_end - armed);
   CHECK(after.find("RestoreComputeOrThrow(compute_dev); return false;") == std::string::npos);
