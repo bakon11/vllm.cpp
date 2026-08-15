@@ -37,6 +37,67 @@ std::string ExtractFinish(const std::string& hip) {
   return hip.substr(a, b - a);
 }
 
+std::string ExtractRestoreComputeOrThrow(const std::string& hip) {
+  const auto a = hip.find("void RestoreComputeOrThrow(int compute_dev)");
+  REQUIRE(a != std::string::npos);
+  const auto b = hip.find("\nbool RetirePinThenUnpin", a);
+  REQUIRE(b != std::string::npos);
+  return hip.substr(a, b - a);
+}
+
+struct RestoreGateRc {
+  int compile = 127;
+  int run = 127;
+};
+
+RestoreGateRc CompileAndRunProductRestore(const std::string& restore_fn, const std::string& compiler) {
+  const std::string path = "/tmp/vllm_prefill_peer_restore_gate.cpp";
+  const std::string bin = "/tmp/vllm_prefill_peer_restore_gate.bin";
+  std::ofstream out(path);
+  if (!out.good()) return {126, 126};
+  out << R"GATE(
+#include <stdexcept>
+namespace vt {
+namespace rocm {
+struct RestoreFailed : std::runtime_error {
+  RestoreFailed() : std::runtime_error("restore failed") {}
+};
+}
+}
+using hipError_t = int;
+constexpr hipError_t hipSuccess = 0;
+static hipError_t g_set_rc = 1;
+hipError_t hipSetDevice(int) { return g_set_rc; }
+)GATE";
+  out << restore_fn << '\n';
+  out << R"GATE(
+int probe() {
+  try {
+    RestoreComputeOrThrow(3);
+    return 0;
+  } catch (const vt::rocm::RestoreFailed&) {
+    return 1;
+  } catch (...) {
+    return 2;
+  }
+}
+int main() {
+  g_set_rc = 1;
+  if (probe() != 1) return 10;
+  g_set_rc = 0;
+  if (probe() != 0) return 11;
+  return 0;
+}
+)GATE";
+  out.close();
+  const std::string cmd = std::string("HIP_VISIBLE_DEVICES= ") + compiler + " -std=c++17 " + path +
+                          " -o " + bin +
+                          " >/tmp/vllm_prefill_peer_restore_gate.out 2>/tmp/vllm_prefill_peer_restore_gate.err";
+  const int crc = std::system(cmd.c_str());
+  if (crc != 0) return {crc, 127};
+  return {0, std::system(bin.c_str())};
+}
+
 bool ProductFinishRetiresCstBeforeReuse(const std::string& finish) {
   const auto sync = finish.find("hipStreamSynchronize(cst)");
   const auto success =
@@ -366,32 +427,37 @@ TEST_CASE("prefill peer LifeFromSlot does not remap this_gen to ev_e_recorded") 
   CHECK(vt::rocm::ChoosePrefillRetire(life) == vt::rocm::PrefillRetireTarget::ComputeStream);
 }
 
-TEST_CASE("prefill peer restore no-op mutation is RED") {
-  vt::rocm::PrefillDequantCacheHost cache;
-  vt::rocm::PrefillPeerLife slot;
-  const char key = 'k';
-  auto mutated_restore = [](int) { return true; };  // no-op success
-  (void)mutated_restore;
-  CHECK_THROWS_AS(
-      vt::rocm::HostLaunch(cache, slot, 0, &key, 8, vt::rocm::PrefillPeerFailAt::None,
-                           /*retire_ok=*/true, /*restore_ok=*/false),
-      vt::rocm::RestoreFailed);
-  CHECK(slot.pending_M == 0);
-  CHECK(cache.LivePins() == 0);
+TEST_CASE("prefill peer product RestoreComputeOrThrow no-op mutation is RED") {
+  const std::string restore = ExtractRestoreComputeOrThrow(ReadHip());
+  CHECK(restore.find("if (hipSetDevice(compute_dev) != hipSuccess) throw vt::rocm::RestoreFailed{}") !=
+        std::string::npos);
+  const auto gxx = CompileAndRunProductRestore(restore, "g++");
+  CHECK(gxx.compile == 0);
+  CHECK(gxx.run == 0);
+  const auto hipcc =
+      CompileAndRunProductRestore(restore, "/opt/rocm-7.2.4/core-7.14/bin/hipcc -x c++");
+  CHECK(hipcc.compile == 0);
+  CHECK(hipcc.run == 0);
+
+  const std::string line =
+      "  if (hipSetDevice(compute_dev) != hipSuccess) throw vt::rocm::RestoreFailed{};\n";
+  std::string mut = restore;
+  const auto pos = mut.find(line);
+  REQUIRE(pos != std::string::npos);
+  mut.replace(pos, line.size(), "  (void)compute_dev;\n");
+  const auto mut_gxx = CompileAndRunProductRestore(mut, "g++");
+  CHECK(mut_gxx.compile == 0);
+  CHECK(mut_gxx.run != 0);
+  const auto mut_hipcc =
+      CompileAndRunProductRestore(mut, "/opt/rocm-7.2.4/core-7.14/bin/hipcc -x c++");
+  CHECK(mut_hipcc.compile == 0);
+  CHECK(mut_hipcc.run != 0);
+
   const std::string hdr = ReadHeader();
   CHECK(hdr.find("if (std::uncaught_exceptions() > 0) return;") == std::string::npos);
   CHECK(hdr.find("if (!set(dev)) std::terminate();") != std::string::npos);
   CHECK(hdr.find("PublishThenRestoreOrThrow") != std::string::npos);
-  const auto pub = hdr.find("void PublishThenRestoreOrThrow");
-  REQUIRE(pub != std::string::npos);
-  const auto pub_end = hdr.find("enum class PrefillPeerFailAt", pub);
-  REQUIRE(pub_end != std::string::npos);
-  const std::string body = hdr.substr(pub, pub_end - pub);
-  CHECK(body.find("catch (const RestoreFailed&)") != std::string::npos);
-  CHECK(body.find("slot.pending_M = 0") != std::string::npos);
-  CHECK(body.find("(void)retire()") != std::string::npos);
 }
-
 
 TEST_CASE("prefill peer HostLaunch fill-lease fail retires outside lock") {
   vt::rocm::PrefillDequantCacheHost cache;
