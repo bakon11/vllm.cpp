@@ -1778,6 +1778,10 @@ vllm_cpp_add_test(test_gemma4_rocm_fp8_seams vt/test_gemma4_rocm_fp8_seams.cpp)
 vllm_cpp_add_test(test_ops_getblas_dualslot vt/test_ops_getblas_dualslot.cpp)
 target_compile_definitions(test_ops_getblas_dualslot PRIVATE
   VLLM_CPP_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+if(VLLM_CPP_HIP)
+  # Separate HIP target: calls production GetBlas. Missing devices → exit 77.
+  vllm_cpp_add_test(test_ops_getblas_product vt/test_ops_getblas_product.cpp)
+endif()
 vllm_cpp_add_test(test_ops_penalties vt/test_ops_penalties.cpp)
 
 vllm_cpp_add_test(test_npy parity/test_npy.cpp)
