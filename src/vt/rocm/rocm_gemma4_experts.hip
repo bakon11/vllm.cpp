@@ -736,6 +736,8 @@ struct PeerSlot {
   int cache_dev = -1;
   bool ev_e_recorded = false;
   bool this_gen_ev_e = false;
+  bool work_on_compute = false;
+  bool work_on_expert = false;
   bool rollback_armed = false;
   bool quarantined = false;
 };
@@ -749,15 +751,7 @@ inline PeerPipe& PeerPipeTls() {
   return pipe;
 }
 
-vt::rocm::PrefillPeerLife PeerLifeView(const PeerSlot& tls) {
-  vt::rocm::PrefillPeerLife life;
-  life.cache_pin = tls.cache_pin;
-  life.this_gen_ev_e = tls.this_gen_ev_e;
-  life.rollback_armed = tls.rollback_armed;
-  life.quarantined = tls.quarantined;
-  life.ev_e_recorded = tls.ev_e_recorded;
-  return life;
-}
+vt::rocm::PrefillPeerLife PeerLifeView(const PeerSlot& tls) { return vt::rocm::LifeFromSlot(tls); }
 
 void RestoreComputeOrThrow(int compute_dev) {
   if (hipSetDevice(compute_dev) != hipSuccess) throw vt::rocm::RestoreFailed{};
@@ -765,13 +759,18 @@ void RestoreComputeOrThrow(int compute_dev) {
 
 // Unpin only after a successful event/stream retirement. Failure quarantines the pin.
 // ChoosePrefillRetire forbids syncing a leftover prior ev_e during current-gen rollback.
-bool RetirePinThenUnpin(PeerSlot& tls, hipStream_t expert_or_compute) {
+bool RetirePinThenUnpin(PeerSlot& tls, hipStream_t expert_stream, hipStream_t compute_stream) {
   const auto target = vt::rocm::ChoosePrefillRetire(PeerLifeView(tls));
   bool retire_ok = true;
   if (target == vt::rocm::PrefillRetireTarget::RecordedEvent && tls.ev_e) {
     retire_ok = hipEventSynchronize(tls.ev_e) == hipSuccess;
-  } else if (target == vt::rocm::PrefillRetireTarget::CurrentStream && expert_or_compute) {
-    retire_ok = hipStreamSynchronize(expert_or_compute) == hipSuccess;
+  } else if (target == vt::rocm::PrefillRetireTarget::ExpertStream && expert_stream) {
+    retire_ok = hipStreamSynchronize(expert_stream) == hipSuccess;
+  } else if (target == vt::rocm::PrefillRetireTarget::ComputeStream && compute_stream) {
+    retire_ok = hipStreamSynchronize(compute_stream) == hipSuccess;
+  } else if (target == vt::rocm::PrefillRetireTarget::ComputeStream && expert_stream) {
+    // no compute handle (should not happen after first enqueue) — do not fake-succeed
+    retire_ok = false;
   }
   if (!retire_ok) {
     tls.quarantined = true;
@@ -787,11 +786,13 @@ bool RetirePinThenUnpin(PeerSlot& tls, hipStream_t expert_or_compute) {
   tls.rollback_armed = false;
   tls.ev_e_recorded = false;
   tls.this_gen_ev_e = false;
+  tls.work_on_compute = false;
+  tls.work_on_expert = false;
   return true;
 }
 
-void FailLaunchRestore(PeerSlot& tls, hipStream_t est, int compute_dev) {
-  if (!RetirePinThenUnpin(tls, est)) tls.quarantined = true;
+void FailLaunchRestore(PeerSlot& tls, hipStream_t est, hipStream_t cst, int compute_dev) {
+  if (!RetirePinThenUnpin(tls, est, cst)) tls.quarantined = true;
   RestoreComputeOrThrow(compute_dev);
 }
 
@@ -839,8 +840,15 @@ bool RunGemma4Fp8ExpertGeGLUPrefillOnExpertDevice(vt::Queue& compute_q, int expe
       Check(hipSetDevice(compute_dev), "same alloc");
       size_t gu_act_cap = static_cast<size_t>(std::max(M, 64)) * static_cast<size_t>(2 * I) * 2;
       size_t act_cap = static_cast<size_t>(std::max(M, 64)) * static_cast<size_t>(I) * 2;
-      if (hipMalloc(&tls.gu_act, gu_act_cap) != hipSuccess) return false;
-      if (hipMalloc(&tls.act, act_cap) != hipSuccess) return false;
+      void* ngu = nullptr;
+      void* nact = nullptr;
+      if (hipMalloc(&ngu, gu_act_cap) != hipSuccess) return false;
+      if (hipMalloc(&nact, act_cap) != hipSuccess) {
+        (void)hipFree(ngu);
+        return false;
+      }
+      tls.gu_act = ngu;
+      tls.act = nact;
       tls.dev = compute_dev;
       tls.I = I;
       tls.H = H;
@@ -850,30 +858,55 @@ bool RunGemma4Fp8ExpertGeGLUPrefillOnExpertDevice(vt::Queue& compute_q, int expe
     void* gu_w = nullptr;
     void* dn_w = nullptr;
     int pin = -1;
+    hipStream_t cst = static_cast<hipStream_t>(compute_q.handle);
     {
       std::lock_guard<std::mutex> lk(wslot.cache.mu);
       if (!wslot.cache.Ensure(compute_dev, I, H)) return false;
       BindPrefillCacheFill(wslot.cache, compute_q, fp8_gu, s_gu, fp8_dn, s_dn, I, H);
-      if (!wslot.cache.GetLocked(fp8_gu, &gu_w, &dn_w, &pin)) return false;
+      if (!wslot.cache.GetLocked(fp8_gu, &gu_w, &dn_w, &pin)) {
+        if (pin >= 0) {
+          tls.life.PersistPin(pin, compute_dev);
+          const bool ok = hipStreamSynchronize(cst) == hipSuccess;
+          if (!ok || !wslot.cache.RetireFillLocked(pin, ok)) {
+            tls.life.Quarantine(pin, compute_dev);
+          } else {
+            tls.life.ClearPin();
+          }
+        }
+        return false;
+      }
     }
-    hipStream_t cst = static_cast<hipStream_t>(compute_q.handle);
-    vt::Tensor x = vt::Tensor::Contiguous(const_cast<void*>(x_compute), vt::DType::kBF16, dev, {M, H});
-    vt::Tensor gu_wt = vt::Tensor::Contiguous(gu_w, vt::DType::kBF16, dev, {2 * I, H});
-    vt::Tensor gu_act = vt::Tensor::Contiguous(tls.gu_act, vt::DType::kBF16, dev, {M, 2 * I});
-    vt::Tensor act = vt::Tensor::Contiguous(tls.act, vt::DType::kBF16, dev, {M, I});
-    vt::MatmulBT(compute_q, gu_act, x, gu_wt);
-    vt::GeluAndMul(compute_q, act, gu_act);
-    vt::MatmulBTAlphaBeta(compute_q, y_compute, act.data, dn_w, M, H, I, 1.f, 0.f, vt::DType::kBF16);
-    if (hipStreamSynchronize(cst) != hipSuccess) {
-      tls.life.Quarantine(pin, compute_dev);
-      return false;
+    tls.life.PersistPin(pin, compute_dev);
+    try {
+      vt::Tensor x = vt::Tensor::Contiguous(const_cast<void*>(x_compute), vt::DType::kBF16, dev, {M, H});
+      vt::Tensor gu_wt = vt::Tensor::Contiguous(gu_w, vt::DType::kBF16, dev, {2 * I, H});
+      vt::Tensor gu_act = vt::Tensor::Contiguous(tls.gu_act, vt::DType::kBF16, dev, {M, 2 * I});
+      vt::Tensor act = vt::Tensor::Contiguous(tls.act, vt::DType::kBF16, dev, {M, I});
+      vt::MatmulBT(compute_q, gu_act, x, gu_wt);
+      vt::GeluAndMul(compute_q, act, gu_act);
+      vt::MatmulBTAlphaBeta(compute_q, y_compute, act.data, dn_w, M, H, I, 1.f, 0.f, vt::DType::kBF16);
+      if (hipStreamSynchronize(cst) != hipSuccess) {
+        tls.life.Quarantine(pin, compute_dev);
+        RestoreComputeOrThrow(compute_dev);
+        return false;
+      }
+      {
+        std::lock_guard<std::mutex> lk(wslot.cache.mu);
+        wslot.cache.UnpinLocked(pin);
+      }
+      tls.life.ClearPin();
+      RestoreComputeOrThrow(compute_dev);
+      return true;
+    } catch (...) {
+      if (hipStreamSynchronize(cst) != hipSuccess) tls.life.Quarantine(pin, compute_dev);
+      else {
+        std::lock_guard<std::mutex> lk(wslot.cache.mu);
+        wslot.cache.UnpinLocked(pin);
+        tls.life.ClearPin();
+      }
+      RestoreComputeOrThrow(compute_dev);
+      throw;
     }
-    {
-      std::lock_guard<std::mutex> lk(wslot.cache.mu);
-      wslot.cache.UnpinLocked(pin);
-    }
-    tls.life.ClearPin();
-    return true;
   }
 
   if (!LaunchGemma4Fp8ExpertGeGLUPrefillPeer(compute_q, /*slot=*/0, expert_dev, x_compute, fp8_gu,
@@ -985,15 +1018,23 @@ bool LaunchGemma4Fp8ExpertGeGLUPrefillPeer(vt::Queue& compute_q, int slot, int e
     tls.cache_dev = -1;
     tls.ev_e_recorded = false;
     tls.this_gen_ev_e = false;
+    tls.work_on_compute = false;
+    tls.work_on_expert = false;
+    tls.rollback_armed = false;
   }
 
   hipStream_t est = static_cast<hipStream_t>(tls.eq.handle);
   if (hipEventRecord(tls.ev_c, cst) != hipSuccess) {
     RestoreComputeOrThrow(compute_dev); return false;
   }
+  // First successful current-gen enqueue is on the compute stream.
+  tls.rollback_armed = true;
+  tls.work_on_compute = true;
+  tls.this_gen_ev_e = false;
   if (hipStreamWaitEvent(est, tls.ev_c, 0) != hipSuccess) {
-    RestoreComputeOrThrow(compute_dev); return false;
+    FailLaunchRestore(tls, est, cst, compute_dev); return false;
   }
+  tls.work_on_expert = true;
 
   bool x_ok = hipMemcpyPeerAsync(tls.x, expert_dev, const_cast<void*>(x_compute), compute_dev,
                                  xy_need, est) == hipSuccess;
@@ -1001,18 +1042,16 @@ bool LaunchGemma4Fp8ExpertGeGLUPrefillPeer(vt::Queue& compute_q, int slot, int e
     std::vector<char> tmp(xy_need);
     Check(hipSetDevice(compute_dev), "x d2h");
     if (hipStreamSynchronize(cst) != hipSuccess) {
-      RestoreComputeOrThrow(compute_dev); return false;
+      FailLaunchRestore(tls, est, cst, compute_dev); return false;
     }
     if (hipMemcpy(tmp.data(), x_compute, xy_need, hipMemcpyDeviceToHost) != hipSuccess) {
-      RestoreComputeOrThrow(compute_dev); return false;
+      FailLaunchRestore(tls, est, cst, compute_dev); return false;
     }
     Check(hipSetDevice(expert_dev), "x h2d");
     if (hipMemcpyAsync(tls.x, tmp.data(), xy_need, hipMemcpyHostToDevice, est) != hipSuccess) {
-      RestoreComputeOrThrow(compute_dev); return false;
+      FailLaunchRestore(tls, est, cst, compute_dev); return false;
     }
   }
-  tls.rollback_armed = true;
-  tls.this_gen_ev_e = false;
 
   auto& wslot = DequantCacheSlotFor(expert_dev);
   void* gu_w = nullptr;
@@ -1021,12 +1060,16 @@ bool LaunchGemma4Fp8ExpertGeGLUPrefillPeer(vt::Queue& compute_q, int slot, int e
   {
     std::lock_guard<std::mutex> lk(wslot.cache.mu);
     if (!wslot.cache.Ensure(expert_dev, I, H)) {
-      FailLaunchRestore(tls, est, compute_dev); return false;
+      FailLaunchRestore(tls, est, cst, compute_dev); return false;
     }
     Check(hipSetDevice(expert_dev), "dequant setdev");
     BindPrefillCacheFill(wslot.cache, tls.eq, fp8_gu, s_gu, fp8_dn, s_dn, I, H);
     if (!wslot.cache.GetLocked(fp8_gu, &gu_w, &dn_w, &pin)) {
-      FailLaunchRestore(tls, est, compute_dev); return false;
+      if (pin >= 0) {
+        tls.cache_pin = pin;
+        tls.cache_dev = expert_dev;
+      }
+      FailLaunchRestore(tls, est, cst, compute_dev); return false;
     }
   }
   tls.cache_pin = pin;
@@ -1042,7 +1085,7 @@ bool LaunchGemma4Fp8ExpertGeGLUPrefillPeer(vt::Queue& compute_q, int slot, int e
   vt::MatmulBTAlphaBeta(tls.eq, tls.y, act.data, dn_w, M, H, I, 1.f, 0.f, vt::DType::kBF16);
 
   if (hipEventRecord(tls.ev_e, est) != hipSuccess) {
-    FailLaunchRestore(tls, est, compute_dev); return false;
+    FailLaunchRestore(tls, est, cst, compute_dev); return false;
   }
   tls.this_gen_ev_e = true;
   tls.ev_e_recorded = true;
@@ -1056,7 +1099,8 @@ bool LaunchGemma4Fp8ExpertGeGLUPrefillPeer(vt::Queue& compute_q, int slot, int e
     const int compute_dev = compute_q.device.index;
     PeerSlot& tls = PeerPipeTls().s[slot];
     hipStream_t est = tls.eq_live ? static_cast<hipStream_t>(tls.eq.handle) : nullptr;
-    if (tls.rollback_armed || tls.cache_pin >= 0) (void)RetirePinThenUnpin(tls, est);
+    hipStream_t cst = static_cast<hipStream_t>(compute_q.handle);
+    if (tls.rollback_armed || tls.cache_pin >= 0) (void)RetirePinThenUnpin(tls, est, cst);
     RestoreComputeOrThrow(compute_dev);
     throw;
   }
@@ -1076,7 +1120,7 @@ bool FinishGemma4Fp8ExpertGeGLUPrefillPeer(vt::Queue& compute_q, int slot, void*
   hipStream_t est = tls.eq_live ? static_cast<hipStream_t>(tls.eq.handle) : nullptr;
 
   if (hipStreamWaitEvent(cst, tls.ev_e, 0) != hipSuccess) {
-    if (!RetirePinThenUnpin(tls, est)) tls.quarantined = true;
+    if (!RetirePinThenUnpin(tls, est, cst)) tls.quarantined = true;
     else tls.pending_M = 0;
     RestoreComputeOrThrow(compute_dev); return false;
   }
@@ -1090,13 +1134,13 @@ bool FinishGemma4Fp8ExpertGeGLUPrefillPeer(vt::Queue& compute_q, int slot, void*
       RestoreComputeOrThrow(compute_dev); return false;
     }
     if (hipMemcpy(tmp.data(), tls.y, xy_need, hipMemcpyDeviceToHost) != hipSuccess) {
-      if (!RetirePinThenUnpin(tls, est)) tls.quarantined = true;
+      if (!RetirePinThenUnpin(tls, est, cst)) tls.quarantined = true;
       else tls.pending_M = 0;
       RestoreComputeOrThrow(compute_dev); return false;
     }
     Check(hipSetDevice(compute_dev), "y h2d");
     if (hipMemcpyAsync(y_compute, tmp.data(), xy_need, hipMemcpyHostToDevice, cst) != hipSuccess) {
-      if (!RetirePinThenUnpin(tls, est)) tls.quarantined = true;
+      if (!RetirePinThenUnpin(tls, est, cst)) tls.quarantined = true;
       else tls.pending_M = 0;
       RestoreComputeOrThrow(compute_dev); return false;
     }
@@ -1106,7 +1150,7 @@ bool FinishGemma4Fp8ExpertGeGLUPrefillPeer(vt::Queue& compute_q, int slot, void*
     RestoreComputeOrThrow(compute_dev); return false;
   }
   tls.ev_e_recorded = true;
-  if (!RetirePinThenUnpin(tls, est)) {
+  if (!RetirePinThenUnpin(tls, est, cst)) {
     tls.quarantined = true;
     RestoreComputeOrThrow(compute_dev); return false;
   }
@@ -1118,7 +1162,7 @@ bool FinishGemma4Fp8ExpertGeGLUPrefillPeer(vt::Queue& compute_q, int slot, void*
     const int compute_dev = compute_q.device.index;
     PeerSlot& tls = PeerPipeTls().s[slot];
     hipStream_t est = tls.eq_live ? static_cast<hipStream_t>(tls.eq.handle) : nullptr;
-    if (tls.cache_pin >= 0 || tls.rollback_armed) (void)RetirePinThenUnpin(tls, est);
+    if (tls.cache_pin >= 0 || tls.rollback_armed) (void)RetirePinThenUnpin(tls, est, cst);
     RestoreComputeOrThrow(compute_dev);
     throw;
   }
