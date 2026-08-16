@@ -350,6 +350,7 @@ CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the
 | Custom logits processors on CUDA | Open, not root-caused | Segfaults in a CUDA build, 232/232 green on CPU |
 | Memory budgeting (`ROAD-V1-MEM`, #83) | M1+M2 landed (absolute bytes) | `--kv-cache-memory` sizes the KV pool from an absolute byte budget (ABI v16, group-aware divisor); `--num-blocks` overrides; `--gpu-memory-utilization` needs the M3 profile run (dgx-gated). See `specs/kv-sizing.md` |
 | Gemma4 MoE ROCm FP8 + SharedK-WMMA | Partial | Dual-GPU FP8 experts + SharedK-WMMA (RDNA4); #837 GetBlas `tls_slots[2]` + product `GetBlas` probe. Decode-graph deferred |
+| Gemma4 MoE ROCm FP8 + SharedK-WMMA | Partial | Dual-GPU FP8 experts + SharedK-WMMA (RDNA4); #838 T≤63, independent serial oracle, retire-in-scope. Decode-graph deferred |
 
 ## How to read this page
 

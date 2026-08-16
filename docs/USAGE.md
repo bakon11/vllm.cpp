@@ -2943,6 +2943,14 @@ test accessor for that file-local `GetBlas`. HIP live probe is a separate CTest
 target (exit 77 if `HIP_VISIBLE_DEVICES` empty); it enters capture so production `StreamIsCapturing` is load-bearing. No new env. This PR does **not**
 restructure the Gemma-4 layer loop or enable decode hipGraph (those stay lab-only
 until a CUDA token-exact gate can land them).
+ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`, `VT_GEMMA4_DECODE_INDEXED_MAX_T`).
+Indexed T=2..63 retires peer/compute work before pooled scratch is released.
+Unset indexed-max defaults to 63 (T=2..63 uses the existing per-token indexed
+helpers on a scratch-scaled weight copy; helper failure retires peer/compute
+streams before pooled scratch returns, then falls back with a single host scale).
+`=1` restores T=1-only. Defaults stay safe off RDNA4.
+This PR does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
+(those stay lab-only until a CUDA token-exact gate can land them).
 
 ## LTX-2.5 text conditioning
 
