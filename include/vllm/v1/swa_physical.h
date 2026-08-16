@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "vllm/v1/attention/backend.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/dtype.h"
 
@@ -50,6 +51,15 @@ inline int64_t AttnLayerPhysicalBlocks(const KVCacheConfig& cfg, int layer,
     }
   }
   return std::max<int64_t>(layer_blocks, 2);
+}
+
+// Production Gemma layer metadata routing. Sliding layers use slide_meta when
+// present; full layers and the SWA-off null pointer keep full_meta.
+inline const CommonAttentionMetadata& SelectGemmaLayerAttnMeta(
+    bool full_attention_layer, const CommonAttentionMetadata& full_meta,
+    const CommonAttentionMetadata* slide_meta) {
+  return (!full_attention_layer && slide_meta != nullptr) ? *slide_meta
+                                                          : full_meta;
 }
 
 }  // namespace vllm::v1

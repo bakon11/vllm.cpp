@@ -49,6 +49,7 @@
 #include "vllm/model_executor/models/device_pool.h"       // Pool
 #include "vllm/model_executor/models/gemma4_moe.h"
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
+#include "vllm/v1/swa_physical.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
@@ -615,7 +616,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     const auto t0 = layer_prof ? clock::now() : clock::time_point{};
 
     const CommonAttentionMetadata& layer_meta =
-        (!full && slide_attn_meta != nullptr) ? *slide_attn_meta : attn_meta;
+        v1::SelectGemmaLayerAttnMeta(full, attn_meta, slide_attn_meta);
     StepInputs& layer_si =
         (!full && si_slide.has_value()) ? *si_slide : si;
 
