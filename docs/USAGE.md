@@ -2949,6 +2949,7 @@ Unset indexed-max defaults to 63 (T=2..63 uses the existing per-token indexed
 helpers on a scratch-scaled weight copy; helper failure retires peer/compute
 streams before pooled scratch returns, then falls back with a single host scale).
 `=1` restores T=1-only. Defaults stay safe off RDNA4.
+Prefill peer (#839) unpins dequant cache only after observed retirement; a failed fill/ready lease is retired with RetireFillLocked after the producer stream sync (never under cache.mu); restore-fail after publish retires before rethrow; failed retire quarantines the pin.
 This PR does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
 (those stay lab-only until a CUDA token-exact gate can land them).
 
@@ -3631,3 +3632,7 @@ length is the one the request's duration implies, and that it is **real audio** 
 non-zero, unclipped, non-constant, and with two channels that differ (the stereo
 fold is a contiguous split of the 128 latent channels, and an interleave produces
 a correctly shaped, correctly ranged, wrong song).
+
+Gemma-4 FP8 xdev prefill (`RunGemma4Fp8ExpertGeGLUPrefillOnExpertDevice`) is a
+Launch/Finish wrapper: cache pins stay live until host-observed `ev_e` retirement.
+Peer-pipe overlap stays off (slot 0 only).
