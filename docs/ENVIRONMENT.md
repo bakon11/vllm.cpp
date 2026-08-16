@@ -223,6 +223,9 @@ on CUDA/CPU builds beyond the documented behavior.
 | `VT_GEMMA4_GPU0_HEADROOM_GB` | `12` | GiB kept free on GPU0 when packing resident experts (decode vs long-prefill trade). Lab dual R9700 + 49k KV: `8` survives 16k+ prefill; `6` OOMs ~11k |
 | `VT_GEMMA4_PREFILL_BATCH_MOE` | auto / `1` in lab recipe | `=1` group-by-expert prefill GEMM for `T>=64`; `=0` serial M=1 (slow). Unset = auto |
 | `VT_GEMMA4_DECODE_INDEXED_MAX_T` | `63` | Widen device-indexed FP8 MoE from T=1 to `T<=N` (`N` clamped `[1,63]`). Unset = 63. `=1` restores the old T=1-only gate. T≥64 still uses prefill-batch |
+| `VT_GEMMA4_SWA_PHYSICAL` | on (when `sliding_window` present) | `=0` forces legacy single FullAttention KV group. Unset/`1` enables hybrid full+slide groups + window-scoped slide pool |
+| `VT_GEMMA4_SWA_MAX_NUM_SEQS` | (from `MAX_NUM_SEQS` else `1`) | Scales SWA sliding pool: `slide_pool = max_admission * N + 1`. Prefer exporting `MAX_NUM_SEQS` from the serve recipe |
+| `VT_GEMMA4_SWA_POOL_BLOCKS` | (auto) | Hard override of sliding physical pool block count (bypasses multi-seq scale) |
 | `VT_GEMMA4_MLP_MOE_PARALLEL` | off | `=1` run Gemma4 MLP and MoE on two HIP streams (lab; wall ~flat on R9700). Not wired in this PR tip (decode-graph-free split) |
 | `VT_ATTN_PREFILL_FLASH` | off | `=1` SGLang-style BM×BN GQA flash prefill (lab A/B) |
 | `VT_GEMMA4_PREFILL_GEMM_M` | `256` | Tokens per expert in prefill-batch GEMM chunks (`16..2048`). Larger M → fewer launches; lab `512` ~+37% prefill vs `64` |

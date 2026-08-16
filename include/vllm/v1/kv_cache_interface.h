@@ -374,6 +374,13 @@ struct KVCacheConfig {
   // -Wmissing-field-initializers, so this addition is source-compatible too.
   std::vector<std::shared_ptr<AttentionSpec>> per_layer_attn_specs = {};
 
+  // OPTIONAL per-group physical pool sizes (index == kv_cache_groups index).
+  // Empty => every group shares `num_blocks` (historical single-pool).
+  // When NON-empty it MUST match kv_cache_groups.size(). Sliding-window groups
+  // use max_admission-sized pools so their layer tensors stay window-scoped
+  // (Gemma-4 SWA physical long-ctx). Full-attention groups keep num_blocks.
+  std::vector<int> group_num_blocks = {};
+
   // Upstream property has_mamba_layers.
   bool has_mamba_layers() const;
   // Upstream property needs_kv_cache_zeroing.

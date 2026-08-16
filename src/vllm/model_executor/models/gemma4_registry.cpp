@@ -185,16 +185,14 @@ void ParseGemma4ForConditionalGenerationConfig(const HfConfig& config) {
 v1::KVCacheConfig MakeGemma4ForConditionalGenerationKVCache(const HfConfig& config,
                                                             int block_size,
                                                             int num_blocks) {
-  // TRUE topology (G1b LANDED): TWO head dims — sliding layers head_dim=256,
-  // full_attention layers global_head_dim=512, both num_key_value_heads=2, plus
-  // YOCO KV-sharing on the last num_kv_shared_layers. The runner now consumes a
-  // PER-LAYER attention spec (`per_layer_attn_specs`, runner.cpp G1b), so each
-  // non-GDN layer allocates + views its own head_dim. The single group below
-  // still drives the (head_dim-independent) block table / KV manager; its spec
-  // carries the LARGER head_dim as an honest per-page upper bound.
-  // HfConfig::raw is the FULL config.json (hf_config.cpp:414); Gemma-4's
-  // global_head_dim / layer_types are nested under `text_config` in the mm
-  // wrapper, so resolve that view (top-level for a plain config).
+  // TRUE topology (G1b + SWA physical):
+  //   - sliding layers: head_dim=256, Hkv=8, SlidingWindowSpec (window-scoped
+  //     physical pool + per-layer tensor size)
+  //   - full_attention layers: global_head_dim=512, Hkv=2, FullAttentionSpec
+  // Hybrid coordinator (2 attention groups) + group_num_blocks is the long-ctx
+  // VRAM win: ~5 GiB KV @262k vs ~55 GiB full-store.
+  // Opt out: VT_GEMMA4_SWA_PHYSICAL=0 → legacy single FullAttention group
+  // (byte-identical to pre-SWA-physical G1b).
   const nlohmann::json& raw =
       (config.raw.contains("text_config") && config.raw.at("text_config").is_object())
           ? config.raw.at("text_config")
@@ -213,6 +211,11 @@ v1::KVCacheConfig MakeGemma4ForConditionalGenerationKVCache(const HfConfig& conf
       it != raw.end() && it->is_number_integer()) {
     head_dim_full = it->get<int>();
   }
+  int sliding_window = 0;
+  if (const auto it = raw.find("sliding_window");
+      it != raw.end() && it->is_number_integer()) {
+    sliding_window = it->get<int>();
+  }
   const vt::DType kv_dtype = v1::ResolveKvCacheDType();
   const int64_t L = config.num_hidden_layers;
 
@@ -226,20 +229,108 @@ v1::KVCacheConfig MakeGemma4ForConditionalGenerationKVCache(const HfConfig& conf
     }
   }
 
+  const bool swa_physical = [] {
+    const char* e = std::getenv("VT_GEMMA4_SWA_PHYSICAL");
+    // Default ON when sliding_window is present; explicit 0 disables.
+    if (e != nullptr && e[0] == '0') return false;
+    return true;
+  }();
+
   v1::KVCacheConfig kv;
   kv.num_blocks = num_blocks;
-  kv.kv_cache_groups.emplace_back(
-      std::vector<std::string>{"fa"},
-      std::make_shared<v1::FullAttentionSpec>(
-          block_size, std::max(num_kv_heads, num_kv_heads_full),
-          std::max(head_dim_sliding, head_dim_full), kv_dtype));
   kv.per_layer_attn_specs.reserve(static_cast<size_t>(L));
+
+  const bool use_hybrid_swa =
+      swa_physical && sliding_window > 0 &&
+      std::any_of(is_full.begin(), is_full.end(), [](bool f) { return !f; }) &&
+      std::any_of(is_full.begin(), is_full.end(), [](bool f) { return f; });
+
+  if (!use_hybrid_swa) {
+    kv.kv_cache_groups.emplace_back(
+        std::vector<std::string>{"fa"},
+        std::make_shared<v1::FullAttentionSpec>(
+            block_size, std::max(num_kv_heads, num_kv_heads_full),
+            std::max(head_dim_sliding, head_dim_full), kv_dtype));
+    for (int64_t l = 0; l < L; ++l) {
+      const bool full = is_full[static_cast<size_t>(l)];
+      const int hd = full ? head_dim_full : head_dim_sliding;
+      const int hkv = full ? num_kv_heads_full : num_kv_heads;
+      kv.per_layer_attn_specs.push_back(std::make_shared<v1::FullAttentionSpec>(
+          block_size, hkv, hd, kv_dtype));
+    }
+    return kv;
+  }
+
+  std::vector<std::string> full_names;
+  std::vector<std::string> slide_names;
+  full_names.reserve(static_cast<size_t>(L));
+  slide_names.reserve(static_cast<size_t>(L));
   for (int64_t l = 0; l < L; ++l) {
-    const bool full = is_full[static_cast<size_t>(l)];
-    const int hd = full ? head_dim_full : head_dim_sliding;
-    const int hkv = full ? num_kv_heads_full : num_kv_heads;
-    kv.per_layer_attn_specs.push_back(std::make_shared<v1::FullAttentionSpec>(
-        block_size, hkv, hd, kv_dtype));
+    const std::string name = "layers." + std::to_string(l) + ".attn";
+    if (is_full[static_cast<size_t>(l)]) {
+      full_names.push_back(name);
+    } else {
+      slide_names.push_back(name);
+    }
+  }
+
+  auto full_spec = std::make_shared<v1::FullAttentionSpec>(
+      block_size, num_kv_heads_full, head_dim_full, kv_dtype);
+  auto slide_spec = std::make_shared<v1::SlidingWindowSpec>(
+      block_size, num_kv_heads, head_dim_sliding, kv_dtype, sliding_window);
+
+  kv.kv_cache_groups.emplace_back(std::move(full_names), full_spec);
+  kv.kv_cache_groups.emplace_back(std::move(slide_names), slide_spec);
+
+  const int batch_for_swa = [] {
+    if (const char* e = std::getenv("VT_MAX_NUM_BATCHED_TOKENS");
+        e != nullptr && e[0] != '\0') {
+      const int v = std::atoi(e);
+      if (v > 0) return v;
+    }
+    if (const char* e = std::getenv("MAX_NUM_BATCHED_TOKENS");
+        e != nullptr && e[0] != '\0') {
+      const int v = std::atoi(e);
+      if (v > 0) return v;
+    }
+    return 8192;
+  }();
+  const int slide_blocks = slide_spec->max_admission_blocks_per_request(
+      batch_for_swa, /*max_model_len=*/num_blocks * block_size);
+  const int max_num_seqs_for_swa = [] {
+    if (const char* e = std::getenv("VT_GEMMA4_SWA_MAX_NUM_SEQS");
+        e != nullptr && e[0] != '\0') {
+      const int v = std::atoi(e);
+      if (v >= 1 && v <= 4096) return v;
+    }
+    if (const char* e = std::getenv("MAX_NUM_SEQS"); e != nullptr && e[0] != '\0') {
+      const int v = std::atoi(e);
+      if (v >= 1 && v <= 4096) return v;
+    }
+    return 1;
+  }();
+  int slide_pool = std::max(slide_blocks * max_num_seqs_for_swa + 1, 2);
+  if (const char* e = std::getenv("VT_GEMMA4_SWA_POOL_BLOCKS");
+      e != nullptr && e[0] != '\0') {
+    const int v = std::atoi(e);
+    if (v >= 2) slide_pool = v;
+  }
+  kv.group_num_blocks = {num_blocks, slide_pool};
+  std::fprintf(stderr,
+               "INFO gemma4 SWA physical: groups=full+slide full_blocks=%d "
+               "slide_blocks=%d (batch_for_swa=%d window=%d max_admission=%d "
+               "max_num_seqs=%d)\n",
+               num_blocks, slide_pool, batch_for_swa, sliding_window,
+               slide_blocks, max_num_seqs_for_swa);
+
+  for (int64_t l = 0; l < L; ++l) {
+    if (is_full[static_cast<size_t>(l)]) {
+      kv.per_layer_attn_specs.push_back(std::make_shared<v1::FullAttentionSpec>(
+          block_size, num_kv_heads_full, head_dim_full, kv_dtype));
+    } else {
+      kv.per_layer_attn_specs.push_back(std::make_shared<v1::SlidingWindowSpec>(
+          block_size, num_kv_heads, head_dim_sliding, kv_dtype, sliding_window));
+    }
   }
   return kv;
 }

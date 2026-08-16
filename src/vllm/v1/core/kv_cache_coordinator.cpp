@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <memory>
 
 #include "vllm/v1/request.h"
 
@@ -113,15 +114,70 @@ KVCacheCoordinator::KVCacheCoordinator(KVCacheConfig kv_cache_config,
     }
   }
 
+  // Per-group pools (Gemma-4 SWA physical). Empty group_num_blocks => all
+  // managers share block_pool (historical). When set, group 0 uses block_pool
+  // (sized to group_num_blocks[0] which must match config.num_blocks), and
+  // groups i>0 get private pools of group_num_blocks[i].
+  const auto& gnb = this->kv_cache_config.group_num_blocks;
+  const bool multi_pool =
+      !gnb.empty() &&
+      gnb.size() == this->kv_cache_config.kv_cache_groups.size();
+  if (multi_pool) {
+    assert(gnb[0] == this->kv_cache_config.num_blocks &&
+           "group_num_blocks[0] must equal KVCacheConfig::num_blocks "
+           "(block_pool is sized from num_blocks)");
+  }
+  manager_pools_.reserve(this->kv_cache_config.kv_cache_groups.size());
   for (std::size_t i = 0; i < this->kv_cache_config.kv_cache_groups.size();
        ++i) {
+    BlockPool* pool = &block_pool;
+    if (multi_pool && i > 0) {
+      const int n = std::max(gnb[i], 2);
+      group_pools_.push_back(std::make_unique<BlockPool>(
+          n, enable_caching, hash_block_size_, enable_kv_cache_events));
+      pool = group_pools_.back().get();
+    }
+    manager_pools_.push_back(pool);
     single_type_managers.push_back(get_manager_for_kv_cache_spec(
         this->kv_cache_config.kv_cache_groups[i].kv_cache_spec,
-        max_num_batched_tokens_, max_model_len, block_pool, enable_caching,
+        max_num_batched_tokens_, max_model_len, *pool, enable_caching,
         static_cast<int>(i), scheduler_block_size));
   }
 
   // retention_interval stays nullopt (dense caching); env read deferred.
+}
+
+bool KVCacheCoordinator::can_allocate_across_groups(
+    const std::string& request_id, int num_tokens,
+    const KVCacheBlocksTuple& new_computed_blocks, int /*num_encoder_tokens*/,
+    int total_computed_tokens, int num_tokens_main_model,
+    bool apply_admission_cap, int watermark_blocks,
+    int reserved_blocks) const {
+  if (group_pools_.empty()) {
+    int need = 0;
+    for (std::size_t i = 0; i < single_type_managers.size(); ++i) {
+      need += single_type_managers[i]->get_num_blocks_to_allocate(
+          request_id, num_tokens, new_computed_blocks[i], total_computed_tokens,
+          num_tokens_main_model, apply_admission_cap);
+    }
+    const int available =
+        static_cast<int>(block_pool.get_num_free_blocks()) - reserved_blocks;
+    return need + watermark_blocks <= available;
+  }
+  for (std::size_t i = 0; i < single_type_managers.size(); ++i) {
+    const int need = single_type_managers[i]->get_num_blocks_to_allocate(
+        request_id, num_tokens, new_computed_blocks[i], total_computed_tokens,
+        num_tokens_main_model, apply_admission_cap);
+    BlockPool* pool = manager_pools_[i];
+    const int available =
+        static_cast<int>(pool->get_num_free_blocks()) -
+        (i == 0 ? reserved_blocks : 0);
+    const int wm = (i == 0 ? watermark_blocks : 0);
+    if (need + wm > available) {
+      return false;
+    }
+  }
+  return true;
 }
 
 int KVCacheCoordinator::get_num_blocks_to_allocate(
@@ -473,9 +529,13 @@ HybridKVCacheCoordinator::find_longest_cache_hit(
         max_length =
             std::min(curr_hit_length + spec->block_size, max_cache_hit_length);
       }
+      // Gemma-4 SWA physical multi-pool: each SingleType manager caches into
+      // its own BlockPool. Looking up every group against the coordinator's
+      // shared block_pool always misses slide/other pools.
+      BlockPool& group_pool = group.representative->block_pool;
       std::vector<std::vector<KVCacheBlock*>> hit_blocks =
           group.representative->find_longest_cache_hit(
-              block_hashes, max_length, group_ids, block_pool, *spec,
+              block_hashes, max_length, group_ids, group_pool, *spec,
               drop_eagle_block, /*alignment_tokens=*/scheduler_block_size);
       int new_hit_length =
           static_cast<int>(hit_blocks[0].size()) * spec->block_size;
