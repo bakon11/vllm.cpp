@@ -151,19 +151,20 @@ ForwardLogits ForwardGemma4ForConditionalGeneration(
         Gemma4Model::ForwardMm(*mm.inputs_embeds_bf16, *mm.ple_token_ids,
                                input.positions, input.attn_meta, input.attn_kv,
                                weights, input.config, input.queue,
-                               input.logits_indices),
+                               input.logits_indices, input.slide_attn_meta),
         input.config.vocab_size);
   }
   if (input.gather_logits) {
     return Gemma4Model::ForwardDevice(input.token_ids, input.positions,
                                       input.attn_meta, input.attn_kv, weights,
                                       input.config, input.queue,
-                                      input.logits_indices);
+                                      input.logits_indices,
+                                      input.slide_attn_meta);
   }
   return HostLogits(
       Gemma4Model::Forward(input.token_ids, input.positions, input.attn_meta,
                            input.attn_kv, weights, input.config, input.queue,
-                           input.logits_indices),
+                           input.logits_indices, input.slide_attn_meta),
       input.config.vocab_size);
 }
 

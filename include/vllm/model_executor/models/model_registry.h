@@ -322,6 +322,11 @@ struct ModelForwardInput {
   // only sets it on the discrete-CUDA async path, which the Qwen3.5 gate vehicle
   // owns). Null on every other path, so every other forward is byte-identical.
   const int32_t* device_token_ids = nullptr;
+  // Optional sliding-window group meta (Gemma-4 SWA physical). Null on the
+  // legacy single full-attn group. Sliding layers must use this for block_table
+  // + slot_mapping; full layers keep attn_meta. Appended so positional
+  // ModelForwardInput constructions stay valid.
+  const v1::CommonAttentionMetadata* slide_attn_meta = nullptr;
 };
 
 using ModelConfigHook = void (*)(const HfConfig& config);

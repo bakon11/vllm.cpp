@@ -827,6 +827,7 @@ vllm_cpp_add_test(test_block_pool vllm/v1/test_block_pool.cpp)
 vllm_cpp_add_test(test_kv_events vllm/v1/test_kv_events.cpp)
 vllm_cpp_add_test(test_single_type_kv_cache_manager vllm/v1/test_single_type_kv_cache_manager.cpp)
 vllm_cpp_add_test(test_kv_cache_coordinator vllm/v1/test_kv_cache_coordinator.cpp)
+vllm_cpp_add_test(test_swa_physical vllm/v1/test_swa_physical.cpp)
 vllm_cpp_add_test(test_kv_cache_manager vllm/v1/test_kv_cache_manager.cpp)
 vllm_cpp_add_test(test_none_hash_determinism vllm/v1/test_none_hash_determinism.cpp)
 # This suite explicitly exercises configured and unconfigured hash seeding in

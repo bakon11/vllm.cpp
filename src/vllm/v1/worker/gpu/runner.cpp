@@ -5,6 +5,7 @@
 // See include/vllm/v1/worker/gpu/runner.h for scope, the V1-algorithm / MRV2-
 // contract composition, the four-way ordering contract, and the deferred paths.
 #include "vllm/v1/worker/gpu/runner.h"
+#include "vllm/v1/swa_physical.h"
 
 #include <algorithm>
 #include <chrono>
@@ -534,6 +535,10 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // so a later-appended draft group can never displace it. With num_spec==0
   // (every run today) there is exactly ONE full-attn group, so this is
   // byte-identical to the old behavior — the first and only group is chosen.
+  ValidateGroupNumBlocks(kv_cache_config);
+  full_attn_group_id_ = -1;
+  gdn_group_id_ = -1;
+  slide_group_id_ = -1;
   for (int g = 0; g < static_cast<int>(kv_cache_config.kv_cache_groups.size());
        ++g) {
     const auto& group = kv_cache_config.kv_cache_groups[static_cast<size_t>(g)];
@@ -550,6 +555,8 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       if (!group.is_eagle_group && full_attn_group_id_ < 0) {
         full_attn_group_id_ = g;
       }
+    } else if (kind == KVCacheSpecKind::kSlidingWindow) {
+      if (slide_group_id_ < 0) slide_group_id_ = g;
     } else if (kind == KVCacheSpecKind::kMamba) {
       gdn_group_id_ = g;
     }
@@ -809,6 +816,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     vt::DType dtype;
   };
   std::vector<FaDims> fa_dims;
+  attn_layer_num_blocks_.clear();
   layer_kv_class_.assign(static_cast<size_t>(num_layers), LayerKvClass::kNone);
   for (int64_t l = 0; l < num_layers; ++l) {
     bool is_gdn = false;
@@ -882,9 +890,12 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
         VT_CHECK(l_page > 0,
                  "runner: per-layer attention spec reported a non-positive page");
       }
+      const int64_t layer_blocks = AttnLayerPhysicalBlocks(
+          kv_cache_config, static_cast<int>(l), slide_group_id_, num_blocks_);
+      attn_layer_num_blocks_.push_back(layer_blocks);
       full_attn_buf_.push_back(std::make_unique<CacheBuffer>(
           dev, queue_,
-          static_cast<size_t>(num_blocks_) * static_cast<size_t>(l_page),
+          static_cast<size_t>(layer_blocks) * static_cast<size_t>(l_page),
           kv_cache_backend_resident_));
       fa_dims.push_back(FaDims{l_Hkv, l_Dh, l_dtype});
     }
@@ -903,12 +914,14 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // to `full_attn_buf_`; in the uniform case every entry is {Hkv, Dh, kv_dtype}.
   VT_CHECK(fa_dims.size() == full_attn_buf_.size(),
            "runner: per-layer KV view geometry out of sync with buffers");
+  VT_CHECK(attn_layer_num_blocks_.size() == full_attn_buf_.size(),
+           "runner: per-layer num_blocks out of sync with buffers");
   attn_kv_.clear();
   for (size_t i = 0; i < full_attn_buf_.size(); ++i) {
     PagedKvCache kv;
     kv.data = full_attn_buf_[i]->data();
     kv.dtype = fa_dims[i].dtype;
-    kv.num_blocks = num_blocks_;
+    kv.num_blocks = attn_layer_num_blocks_[i];
     kv.block_size = fa_block_size;
     kv.num_kv_heads = fa_dims[i].num_kv_heads;
     kv.head_size = fa_dims[i].head_size;
@@ -1239,6 +1252,15 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   CommonAttentionMetadata attn_meta = MakeCommonAttentionMetadata(
       step, fa_bt, fa_cols, /*causal=*/true, full_attn_group_id_);
 
+  CommonAttentionMetadata slide_attn_meta;
+  if (slide_group_id_ >= 0) {
+    int sw_cols = 0;
+    const std::vector<int32_t> sw_bt =
+        gather_block_table(slide_group_id_, num_reqs, &sw_cols);
+    slide_attn_meta = MakeCommonAttentionMetadata(
+        step, sw_bt, sw_cols, /*causal=*/true, slide_group_id_);
+  }
+
   // GDN KV group metadata: the same step over the GDN group's block table,
   // segmented decode-first by the GDN builder (M1.6 Task 4). GATED on the model
   // HAVING a linear-attention (GDN/Mamba) KV group: a full-attention-only model
@@ -1406,6 +1428,8 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // Set after construction because the field sits at the END of the struct, where
   // it cannot shift the positional aggregate initializers other callers use.
   forward_input.device_token_ids = device_input_ids;
+  forward_input.slide_attn_meta =
+      (slide_group_id_ >= 0) ? &slide_attn_meta : nullptr;
 
   // ENG-ASYNC-SCHED depth-2 LIFETIME GUARD — the MOVED drain (mirror path only).
   // The bulk host prep above (update_states + prepare_inputs + attention/GDN
@@ -1478,6 +1502,7 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   exec_state_.logits = std::move(logits);
   exec_state_.step = std::move(step);
   exec_state_.attn_meta = std::move(attn_meta);
+  exec_state_.slide_attn_meta = std::move(slide_attn_meta);
   exec_state_.gdn_meta = std::move(gdn_meta);
   exec_state_.req_ids.reserve(static_cast<size_t>(num_reqs));
   for (int i = 0; i < num_reqs; ++i) {

@@ -242,6 +242,13 @@ class GPUModelRunner final : public ModelRunnerBase {
   int64_t spec_drafts_accepted() const { return spec_drafts_accepted_; }
   int full_attn_group_id() const { return full_attn_group_id_; }
   int gdn_group_id() const { return gdn_group_id_; }
+  int slide_group_id() const { return slide_group_id_; }
+  const std::vector<int64_t>& attn_layer_num_blocks() const {
+    return attn_layer_num_blocks_;
+  }
+  const CommonAttentionMetadata& last_slide_attn_meta() const {
+    return exec_state_.slide_attn_meta;
+  }
   int64_t num_blocks() const { return num_blocks_; }
   // The per-block byte cost the attention-cache allocator ACTUALLY used, taken
   // from the KV SPEC (`spec->page_size_bytes()`, upstream
@@ -454,6 +461,11 @@ class GPUModelRunner final : public ModelRunnerBase {
   // KV group layout (resolved from the KVCacheConfig).
   int full_attn_group_id_ = -1;
   int gdn_group_id_ = -1;
+  // Gemma-4 SWA physical: SlidingWindowSpec group. -1 = legacy single full group.
+  int slide_group_id_ = -1;
+  // Physical block counts parallel to full_attn_buf_ / attn_kv_. Empty =>
+  // every layer uses num_blocks_.
+  std::vector<int64_t> attn_layer_num_blocks_;
   int64_t num_blocks_ = 0;
   // Per-block attention-cache bytes as reported by the KV spec (see the
   // fa_page_size_bytes() accessor).
@@ -768,6 +780,7 @@ class GPUModelRunner final : public ModelRunnerBase {
     int num_reqs = 0;
     StepInputs step;
     CommonAttentionMetadata attn_meta;
+    CommonAttentionMetadata slide_attn_meta;
     GDNAttentionMetadata gdn_meta;
     std::vector<std::string> req_ids;  // dense order (== input_batch order)
     // SPEC-MTP I5d: the target's post-final-norm [T,H] hidden tap captured this

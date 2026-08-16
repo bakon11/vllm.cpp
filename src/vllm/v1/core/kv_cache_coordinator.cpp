@@ -8,6 +8,8 @@
 #include <memory>
 
 #include "vllm/v1/request.h"
+#include "vllm/v1/swa_physical.h"
+#include "vt/dtype.h"
 
 namespace vllm::v1 {
 
@@ -118,15 +120,9 @@ KVCacheCoordinator::KVCacheCoordinator(KVCacheConfig kv_cache_config,
   // managers share block_pool (historical). When set, group 0 uses block_pool
   // (sized to group_num_blocks[0] which must match config.num_blocks), and
   // groups i>0 get private pools of group_num_blocks[i].
+  ValidateGroupNumBlocks(this->kv_cache_config);
   const auto& gnb = this->kv_cache_config.group_num_blocks;
-  const bool multi_pool =
-      !gnb.empty() &&
-      gnb.size() == this->kv_cache_config.kv_cache_groups.size();
-  if (multi_pool) {
-    assert(gnb[0] == this->kv_cache_config.num_blocks &&
-           "group_num_blocks[0] must equal KVCacheConfig::num_blocks "
-           "(block_pool is sized from num_blocks)");
-  }
+  const bool multi_pool = !gnb.empty();
   manager_pools_.reserve(this->kv_cache_config.kv_cache_groups.size());
   for (std::size_t i = 0; i < this->kv_cache_config.kv_cache_groups.size();
        ++i) {

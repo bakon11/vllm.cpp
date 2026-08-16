@@ -397,6 +397,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const std::vector<PagedKvCache>& attn_kv,
                  const Gemma4Weights& weights, const HfConfig& config,
                  const std::vector<int32_t>& logits_indices,
+                 const CommonAttentionMetadata* slide_attn_meta = nullptr,
                  const std::vector<uint16_t>* inputs_embeds_override = nullptr,
                  const std::vector<int32_t>* ple_token_ids = nullptr,
                  std::vector<std::vector<float>>* hidden_states_out = nullptr) {
@@ -509,6 +510,10 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   }
 
   StepInputs si = BuildStepInputs(d, positions, attn_meta, config);
+  std::optional<StepInputs> si_slide;
+  if (slide_attn_meta != nullptr) {
+    si_slide = BuildStepInputs(d, positions, *slide_attn_meta, config);
+  }
 
   // hidden state stream (each layer fully materializes h; no separate residual).
   DBuf hidden(d, DType::kBF16, {T, H});
@@ -609,9 +614,14 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     using clock = std::chrono::steady_clock;
     const auto t0 = layer_prof ? clock::now() : clock::time_point{};
 
-    DBuf attn = Gemma4AttnBlock(d, w, g, dhn.t(), si, attn_meta, kv, T, Dh, full,
-                                ones_dh, full ? &prop_cache.t() : nullptr, window,
-                                g.rope_theta_sliding);
+    const CommonAttentionMetadata& layer_meta =
+        (!full && slide_attn_meta != nullptr) ? *slide_attn_meta : attn_meta;
+    StepInputs& layer_si =
+        (!full && si_slide.has_value()) ? *si_slide : si;
+
+    DBuf attn = Gemma4AttnBlock(d, w, g, dhn.t(), layer_si, layer_meta, kv, T, Dh,
+                                full, ones_dh, full ? &prop_cache.t() : nullptr,
+                                window, g.rope_theta_sliding);
 
     Tensor w_pa = ResidentWeight(d, w.post_attention_layernorm, {H});
     // h1 = rmsnorm(attn) + hidden  (one kernel)
@@ -749,10 +759,11 @@ std::vector<float> Gemma4Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Gemma4Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const CommonAttentionMetadata* slide_attn_meta) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices);
+                             config, logits_indices, slide_attn_meta);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
@@ -763,11 +774,13 @@ Gemma4HiddenStatesResult Gemma4Model::ForwardHiddenStates(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Gemma4Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const CommonAttentionMetadata* slide_attn_meta) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   Gemma4HiddenStatesResult out;
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices, nullptr, nullptr, &out.hidden_states);
+                             config, logits_indices, slide_attn_meta, nullptr,
+                             nullptr, &out.hidden_states);
   const int64_t n_out = dlogits.t().shape[0];
   out.logits.resize(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, out.logits.data());
@@ -780,10 +793,11 @@ ForwardLogits Gemma4Model::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Gemma4Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const CommonAttentionMetadata* slide_attn_meta) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices);
+                             config, logits_indices, slide_attn_meta);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(d, std::move(dlogits), n_out, config.vocab_size);
 }
@@ -793,14 +807,15 @@ std::vector<float> Gemma4Model::ForwardMm(
     const std::vector<int32_t>& ple_token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Gemma4Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const CommonAttentionMetadata* slide_attn_meta) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   // token_ids is unused when inputs_embeds_override is set (T comes from
   // positions); pass an empty vector so the mm seam never dereferences it.
   const std::vector<int32_t> no_tokens;
   DBuf dlogits = ForwardBody(d, no_tokens, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices, &inputs_embeds_bf16,
-                             &ple_token_ids);
+                             config, logits_indices, slide_attn_meta,
+                             &inputs_embeds_bf16, &ple_token_ids);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
