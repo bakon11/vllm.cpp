@@ -1,6 +1,7 @@
 // CPU tests for SWA_PHYSICAL data-plane helpers + fail-closed group_num_blocks.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -253,7 +254,14 @@ TEST_CASE("registry MakeKVCache: SWA_PHYSICAL default hybrid two groups") {
   CHECK(kv.kv_cache_groups.size() == 2);
   REQUIRE(kv.group_num_blocks.size() == 2);
   CHECK(kv.group_num_blocks[0] == 64);
-  CHECK(kv.group_num_blocks[1] >= 2);
-  CHECK(kv.group_num_blocks[1] < 64);
+  CHECK(dynamic_cast<const SlidingWindowSpec*>(
+            kv.kv_cache_groups[1].kv_cache_spec.get()) != nullptr);
+  // Slide pool is window/batch sized, not capped by full num_blocks.
+  auto expect_slide = std::make_shared<SlidingWindowSpec>(
+      /*block_size=*/16, /*num_kv_heads=*/8, /*head_size=*/256, DType::kBF16,
+      /*sliding_window=*/512);
+  const int admit =
+      expect_slide->max_admission_blocks_per_request(8192, 64 * 16);
+  CHECK(kv.group_num_blocks[1] == std::max(admit * 1 + 1, 2));
   CHECK(vllm::v1::FirstSlidingWindowGroupId(kv) == 1);
 }
