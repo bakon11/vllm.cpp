@@ -818,7 +818,9 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
       const auto disp = Gemma4IndexedDispatchTokens(
           1, H, top_k, fp8_res_peer, static_cast<uint16_t*>(acc_fast.ptr()),
           static_cast<const uint16_t*>(expert_in.data), static_cast<const int32_t*>(ri.ptr()),
-          helper_rw, [&](const Gemma4IndexedCall& c) { return run_one(c.y, c.x, c.ri, c.rw); },
+          helper_rw, [&](const Gemma4IndexedCall<uint16_t, uint16_t>& c) {
+            return run_one(c.y, c.x, c.ri, c.rw);
+          },
           restore_compute);
       if (disp.ok) {
         const auto t_router1 = profile ? clock::now() : clock::time_point{};
@@ -866,7 +868,9 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
       } else {
         const auto disp = Gemma4IndexedDispatchTokens(
             T, H, top_k, fp8_res_peer, y_base, x_base, ri_base, helper_rw,
-            [&](const Gemma4IndexedCall& c) { return run_one(c.y, c.x, c.ri, c.rw); },
+            [&](const Gemma4IndexedCall<uint16_t, uint16_t>& c) {
+              return run_one(c.y, c.x, c.ri, c.rw);
+            },
             restore_compute);
         if (disp.ok) {
           Gemma4MoeScratch r;
