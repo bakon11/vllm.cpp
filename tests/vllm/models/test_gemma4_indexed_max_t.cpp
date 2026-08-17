@@ -313,7 +313,29 @@ TEST_CASE("gemma4 indexed-max-t: source invariants") {
   CHECK(moe.find("Gemma4IndexedScratchKindFor") != std::string::npos);
   CHECK(moe.find("retire-before-acc_idx-dtor") != std::string::npos);
   CHECK(moe.find("RetireGemma4Fp8TopKIndexedPeer") != std::string::npos);
-  CHECK(moe.find("rw_idx") != std::string::npos);
+  CHECK(moe.find("rw_idx_owned") != std::string::npos);
+  CHECK(moe.find("struct RwIdxTls") != std::string::npos);
+  CHECK(moe.find("static thread_local RwIdxTls rwt") != std::string::npos);
+  // T=1 scaled rw is TLS-stable; only T>1 Release()s a pooled copy.
+  const auto rwt_at = moe.find("struct RwIdxTls");
+  REQUIRE(rwt_at != std::string::npos);
+  const auto t1_arm = moe.find("Gemma4IndexedScratchKind::TlsT1", rwt_at);
+  REQUIRE(t1_arm != std::string::npos);
+  const auto owned_emplace = moe.find("rw_idx_owned.emplace", rwt_at);
+  REQUIRE(owned_emplace != std::string::npos);
+  CHECK(owned_emplace > t1_arm);  // pooled emplace is the T>1 branch
+  CHECK(moe.find("rwt.buf->Release") == std::string::npos);
+  CHECK(moe.find("rw_idx_owned->Release()") != std::string::npos);
+  // Fresh copy + scale land on the TLS/owned dest every call, never on `rw`.
+  const auto copy_at = moe.find("d.b.Copy(d.q, scaled->ptr(), rw.ptr()", rwt_at);
+  REQUIRE(copy_at != std::string::npos);
+  const auto key_if = moe.find("rwt.dev != compute_dev || rwt.n != n || !rwt.buf", rwt_at);
+  REQUIRE(key_if != std::string::npos);
+  CHECK(copy_at > key_if);  // copy is outside the TLS-miss emplace
+  CHECK(moe.find("ApplyExpertScaleRw(d.q, static_cast<float*>(scaled->ptr())", rwt_at) !=
+        std::string::npos);
+  CHECK(moe.find("ApplyExpertScaleRw(d.q, static_cast<float*>(rw.ptr())", rwt_at) ==
+        std::string::npos);
   CHECK(moe.find("ExpertGeGLUFp8TopKIndexedBatched") == std::string::npos);
   const auto serial = ReadText("include/vllm/model_executor/models/gemma4_indexed_gate.h");
   const auto sref = serial.find("Gemma4IndexedHostSerialRef");

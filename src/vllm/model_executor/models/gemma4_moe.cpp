@@ -787,18 +787,38 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     }
 
     // Never mutate router `rw` in place — fallback must still see unscaled weights.
-    std::optional<DBuf> rw_idx;
+    // T=1: TLS-stable copy (hipGraph bakes the pointer). T>1: per-call pooled DBuf.
+    struct RwIdxTls {
+      int dev = -1;
+      int64_t n = 0;  // T*top_k
+      std::optional<DBuf> buf;
+    };
+    static thread_local RwIdxTls rwt;
+    std::optional<DBuf> rw_idx_owned;
     const float* helper_rw = static_cast<const float*>(rw.ptr());
     if (escale_ptr) {
-      rw_idx.emplace(d, DType::kF32, std::vector<int64_t>{T, top_k});
-      d.b.Copy(d.q, rw_idx->ptr(), rw.ptr(), static_cast<size_t>(T * top_k) * sizeof(float));
+      const int64_t n = T * top_k;
+      const bool t1_tls = Gemma4IndexedScratchKindFor(T) == Gemma4IndexedScratchKind::TlsT1;
+      DBuf* scaled = nullptr;
+      if (t1_tls) {
+        if (rwt.dev != compute_dev || rwt.n != n || !rwt.buf) {
+          rwt.buf.emplace(d, DType::kF32, std::vector<int64_t>{T, top_k});
+          rwt.dev = compute_dev;
+          rwt.n = n;
+        }
+        scaled = &*rwt.buf;
+      } else {
+        rw_idx_owned.emplace(d, DType::kF32, std::vector<int64_t>{T, top_k});
+        scaled = &*rw_idx_owned;
+      }
+      d.b.Copy(d.q, scaled->ptr(), rw.ptr(), static_cast<size_t>(n) * sizeof(float));
       for (int64_t t = 0; t < T; ++t) {
         const auto off = Gemma4IndexedTokenOffsets(t, H, top_k);
-        vt::ApplyExpertScaleRw(d.q, static_cast<float*>(rw_idx->ptr()) + off.route,
+        vt::ApplyExpertScaleRw(d.q, static_cast<float*>(scaled->ptr()) + off.route,
                                static_cast<const int32_t*>(ri.ptr()) + off.route, escale_ptr, top_k,
                                static_cast<int>(E));
       }
-      helper_rw = static_cast<const float*>(rw_idx->ptr());
+      helper_rw = static_cast<const float*>(scaled->ptr());
     }
 
     const auto indexed_arm = Gemma4IndexedSelectArm(fp8_res_same, fp8_res_peer);
@@ -832,7 +852,7 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     };
 
     if (Gemma4IndexedScratchKindFor(T) == Gemma4IndexedScratchKind::TlsT1) {
-      // Stable T=1 acc for hipGraph (do not pool-Release).
+      // Stable T=1 acc for hipGraph (do not pool-Release). rw_idx is RwIdxTls.
       struct AccFastTls {
         int dev = -1;
         int64_t H = 0;
@@ -883,7 +903,7 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
         }
         return r;
       }
-      (void)retire_indexed();  // T=1 TLS is not pooled; still retire before rw_idx dtor
+      (void)retire_indexed();  // T=1 TLS acc/rw_idx are not pooled; retire before leaving arm
     } else {
       std::optional<DBuf> acc_idx;
       acc_idx.emplace(d, DType::kBF16, std::vector<int64_t>{T, H});
@@ -913,7 +933,7 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
       }
     }
     if (!indexed_retired) (void)retire_indexed();
-    if (!indexed_retired && rw_idx) (void)rw_idx->Release();
+    if (!indexed_retired && rw_idx_owned) (void)rw_idx_owned->Release();
     // fall through to legacy host-gather path
   }
 

@@ -39,7 +39,7 @@ T=19 warmup / short prefill is **observed** to take the serial M1 peer path (`Ru
    - `VT_GEMMA4_DECODE_INDEXED_MAX_T`: unset → **63**; `=1` → T=1 only; clamp `[1,63]`.
 2. Replace the T==1 gate with:
    `T >= 1 && T <= indexed_max_t && T < kPrefillBatchMinT && fp8_res && top_k <= 8 && top_k > 0`.
-3. T=1: keep hipGraph-stable TLS acc (do not `pool-Release`).
+3. T=1: keep hipGraph-stable TLS acc **and** TLS `rw_idx` (do not `pool-Release` either). Key `RwIdxTls` by `(compute_dev, T*top_k)`. T>1 keeps a per-call pooled `rw_idx_owned`.
 4. T>1: owned `[T,H]` bf16 buffer, per-token existing indexed helpers (same-dev or peer).
 5. Document the env in `docs/ENVIRONMENT.md` in the **implementation** commit.
 
@@ -129,20 +129,27 @@ Found while landing, and left open rather than papered over. Each needs the
 RDNA4 pair this repository's maintainers do not have, so none of them can be
 answered from a CPU host. The row does not reach `DONE` until they are.
 
-1. **`rw_idx` breaks the invariant Scope item 3 protects.** The T=1 arm now
-   takes its router weights from a per-call pooled `DBuf` (`gemma4_moe.cpp:760`)
-   where it previously read the caller-owned `rw`. A pooled buffer's address
-   moves between calls, so it is not capture-stable, while the comment three
-   lines below it still reads "Stable T=1 acc for hipGraph (do not
-   pool-Release)". Decode hipGraph is lab-only today, which is why nothing
-   observes this — it is latent, not absent. Either hold `rw_idx` in the same
-   TLS that holds `acc_fast`, or state in the spec that T=1 has stopped being
-   capture-stable and why that is acceptable.
-2. **No measurement.** #838 is filed as `perf` and this change flips a product
-   default for T=2..63, so `docs/BENCHMARKS.md` owes a before/after on the
-   arm that changed. Correctness first: the token-exact result for T=2..63
-   against `VT_GEMMA4_DECODE_INDEXED_MAX_T=1` comes before any throughput
-   number is accepted.
+1. **`rw_idx` capture-stability — SOURCE FIXED, GPU witness still owed.** T=1
+   scaled router weights now live in `RwIdxTls` (`thread_local`, keyed
+   `compute_dev` + `T*top_k`). Only T>1 `Release()`s a pooled `rw_idx_owned`.
+   Host source invariants cover the shape. Owed on gfx1201: one decode
+   hipGraph capture+replay witness that the baked `rw` pointer still matches
+   the live TLS address (idle-beside `:8012`, never `:8010`).
+2. **No measurement — protocol frozen to Researcher ca41; GPU after static GREEN.**
+   Same `cff626f93`-derived binary (tree-identical to `9d4a16c5`), model, recipe,
+   GPU placement, prompts, context, sampling, and exact active batch T:
+   - A: `VT_GEMMA4_DECODE_INDEXED_MAX_T=63`
+   - B: `=1` (T>1 host-gather). Separate processes (env once-cached).
+   - T={2,8,63}; prove realized shape + selected arm in logs/counters.
+   - Correctness first: deterministic greedy per-request token IDs A vs B
+     must match before any timing is accepted.
+   - Isolated `:8012`; never `:8010`; idle window; alternate AB/BA by T.
+   - Exclude model load and first-request warmup. ≥3 warmups + ≥5 measured
+     steady repeats/arm. Median **and range** for decode tok/s and per-step
+     latency (not e2e load).
+   - Record binary SHA, HEAD, ROCm/compiler, env, GPU mapping, prompt /
+     context / output lengths, raw samples, thermal/clock, teardown.
+   - Do not call a noisy single run a default-flip win.
 3. **The per-expert scale costs one kernel launch per token.**
    `gemma4_moe.cpp:766-773` calls `vt::ApplyExpertScaleRw` inside the T-loop, up
    to 63 launches. `ApplyExpertScaleRwKernel`
