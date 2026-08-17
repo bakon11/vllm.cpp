@@ -3904,12 +3904,22 @@ This path does **not** restructure the Gemma-4 layer loop or enable decode hipGr
 (those stay lab-only until a CUDA token-exact gate can land them).
 
 Contributor KEEP recipe (2x R9700 gfx1201, ROCm 7.2.4, `PREFIX_CACHE=0`, unique
-pads, 2026-08-13): SharedK-WMMA on, FLASH/FMHA off, `VT_GEMMA4_PREFILL_GEMM_M=2048`,
-`PEER_ACT=1`, batch MoE `T>=64`, decode KV-splits 16 / slide-splits 8. Fair median
-prefill **2014 t/s @~11k** and **1099 t/s @~42k**; stream decode **55 t/s** temp=0.
-Paris / arith `63` / `gemma4` tool_calls held. Speculative, ngram, FMHA, and
-layer-split are **out of this recipe**. This is a reliable plateau, not Vulkan
-prefill parity. Details: [spec](../.agents/specs/gemma4-rocm-fp8-moe.md).
+pads, 2026-08-13): SharedK-WMMA on, FLASH/FMHA off, `VT_GEMMA4_PREFILL_GEMM_M=2048`
+(the default), `VT_GEMMA4_PREFILL_PEER_ACT=1` (the default), batch MoE `T>=64`.
+Fair median prefill **2014 t/s @~11k** and **1099 t/s @~42k**; stream decode
+**55 t/s** temp=0. Paris / arith `63` / `gemma4` tool_calls held. Speculative,
+ngram, FMHA, and layer-split are **out of this recipe**. Details:
+[spec](../.agents/specs/gemma4-rocm-fp8-moe.md).
+
+These are contributor-lab numbers against **no denominator**: no pinned vLLM-ROCm
+run on the same box, same model, same quantization and same request shape exists
+for them, so `docs/BENCHMARKS.md` still records this backend as `PENDING: no
+binding throughput number` and this recipe does not change that. The decode
+figure is also not reproducible from the knobs above: the as-run recipe set four
+further decode splits that no product code in this tree reads
+([#845](https://github.com/mudler/vllm.cpp/issues/845)), and they are recorded in
+the spec rather than here, because a recipe on this page has to be one a reader
+can follow.
 
 ## LTX-2.5 text conditioning
 
