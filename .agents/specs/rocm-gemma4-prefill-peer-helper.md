@@ -190,19 +190,32 @@ is discharged. Named here rather than left to be discovered, per AGENTS.md
   translation unit that consumes the header, so the move cannot be verified
   where this repair was made.
 
-- **`PeerSlot s[2]` with only slot 0 reachable from production.** Scope item 3
-  passes `slot=0` and item 6 keeps every overlap knob default OFF, so the second
-  slot is allocated and never entered from `RunGemma4Fp8ExpertGeGLUPrefillOnExpertDevice`.
-  `docs/USAGE.md` states it ("Peer-pipe overlap stays off (slot 0 only)"). Owed:
-  either a production path that reaches slot 1, or the array narrowed to one slot.
+- **The blocking retirement has no measurement — protocol frozen to Researcher
+  ca41. Do NOT run the historical async-unpin product arm.** That arm is the
+  lifetime bug; using it as a “before” product binary can unpin storage while
+  queued GEMMs still consume it. Safe attribution only:
+  1. Env-gated measurement-only counters around each product
+     `hipEventSynchronize(ev_e)` and `hipStreamSynchronize(cst)`: call count,
+     host-block microseconds by kind, and pre-sync
+     `hipEventQuery`/`hipStreamQuery` ready-vs-not-ready. No change to
+     ordering/lifetime.
+  2. Frozen prefill smoke T=2029 on 2×R9700: uninstrumented current-head
+     throughput plus instrumented attribution as separate legs. Same
+     binary/head/recipe; ≥3 warmups + ≥5 steady samples. Report prefill
+     tok/s/TTFT, total request time, wait calls, cumulative wait-host-us,
+     us/call, ready fraction, wait-time/request-time ratio. Instrumented
+     throughput is diagnostic, not canonical.
+  3. If a literal before/after remains mandatory: a **separate synthetic HIP
+     microbench** whose buffers stay live until one final stream sync. A waits
+     per expert like product; B enqueues the same sequence then waits once.
+     Same op count/streams/bytes. Label as overlap upper bound, not product
+     throughput. Never disable retirement/unpin in the model path. Never infer
+     `before = elapsed - wait_us` as measured throughput.
+  4. Isolated `:8012`; never `:8010`; idle window; teardown. Record raw logs +
+     HEAD/binary/recipe in `docs/BENCHMARKS.md` + `.agents/benchmark-record.md`.
+     Expensive → next-row; the correctness wait stays.
 
-- **The blocking retirement has no measurement.**
-  `FinishGemma4Fp8ExpertGeGLUPrefillPeer` now host-waits — `hipEventSynchronize(tls.ev_e)`
-  and `hipStreamSynchronize(cst)`, and the same-dev arm gains one too — on every
-  call, where the path was fully asynchronous before. It runs per expert per layer
-  during prefill, so it serialises a pipeline that used to overlap. Design rule 2
-  requires the host-wait for correctness and correctness comes first, so the wait
-  stays; what is owed is the number. Owed: prefill throughput before and after on
-  2x R9700 (gfx1201) at the T values this row was smoked on, recorded in
-  `docs/BENCHMARKS.md` and `.agents/benchmark-record.md`. No CI runner here has
-  the hardware.
+- **`PeerSlot s[2]` — narrow to `[1]` (Researcher ca41).** Do not invent slot-1
+  overlap wiring in this merge-gating pass. Proposed CPU repair after ACK:
+  `s[2]` → `s[1]`, Launch/Finish fail-closed on `slot != 0`, keep the existing
+  slot-0 source invariant. No GPU.
