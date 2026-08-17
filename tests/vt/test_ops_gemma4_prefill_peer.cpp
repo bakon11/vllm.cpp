@@ -1,8 +1,10 @@
 // #839 host lifetime + product-policy mutations for prefill peer.
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <doctest/doctest.h>
 
@@ -43,6 +45,52 @@ std::string ExtractRestoreComputeOrThrow(const std::string& hip) {
   const auto b = hip.find("\nbool RetirePinThenUnpin", a);
   REQUIRE(b != std::string::npos);
   return hip.substr(a, b - a);
+}
+
+// The HIP half of the two compile gates below needs a HIP compiler. This file
+// used to name one absolute path from the contributor's box
+// ("/opt/rocm-7.2.4/core-7.14/bin/hipcc") and CHECK that it returned 0, so on
+// every machine without that exact path the gate FAILED instead of reporting
+// that it had not run -- the whole build-test-cpu and both sanitize-cpu legs of
+// #1047, green on main. Resolve the toolchain the way
+// tests/vt/test_ops_getblas_product.cpp:15-21 resolves its precondition, and say
+// out loud when it is absent.
+//
+// Absent hipcc does NOT exit 77 here, unlike getblas: that file is one HIP gate
+// and nothing else, while this one carries 21 host-lifetime cases that are the
+// only gate CI has on this change. Exiting would take those with it. The g++ leg
+// of both compile gates still runs and still asserts, so neither case reports a
+// zero-assertion pass; what is lost off ROCm is the HIP-header compile, which no
+// CI runner here can perform. See `## Owed` in the spec.
+const char* ResolveHipcc() {
+  static const std::string resolved = [] {
+    std::vector<std::string> candidates;
+    for (const char* var : {"VLLM_CPP_HIPCC", "HIPCC"}) {
+      if (const char* v = std::getenv(var); v != nullptr && v[0] != '\0') candidates.emplace_back(v);
+    }
+    if (const char* rp = std::getenv("ROCM_PATH"); rp != nullptr && rp[0] != '\0') {
+      candidates.emplace_back(std::string(rp) + "/bin/hipcc");
+    }
+    candidates.emplace_back("hipcc");  // PATH
+    candidates.emplace_back("/opt/rocm/bin/hipcc");
+    for (const auto& c : candidates) {
+      const std::string probe = c + " --version >/dev/null 2>&1";
+      if (std::system(probe.c_str()) == 0) return c;
+    }
+    return std::string{};
+  }();
+  return resolved.empty() ? nullptr : resolved.c_str();
+}
+
+// Loud, and on stderr, so a reader of a CI log can tell a gate that ran from one
+// that could not. Never silent: a skip nobody can see is the failure mode this
+// repository's exit-77 convention exists to prevent.
+void ReportHipccNotRun(const char* what) {
+  std::fprintf(stderr,
+               "\n*** HIP COMPILE GATE NOT RUN — no hipcc resolved, this is NOT a pass ***\n"
+               "%s\n"
+               "Set VLLM_CPP_HIPCC=/path/to/hipcc (or put hipcc on PATH, or set ROCM_PATH) to run it.\n",
+               what);
 }
 
 struct RestoreGateRc {
@@ -434,10 +482,6 @@ TEST_CASE("prefill peer product RestoreComputeOrThrow no-op mutation is RED") {
   const auto gxx = CompileAndRunProductRestore(restore, "g++");
   CHECK(gxx.compile == 0);
   CHECK(gxx.run == 0);
-  const auto hipcc =
-      CompileAndRunProductRestore(restore, "/opt/rocm-7.2.4/core-7.14/bin/hipcc -x c++");
-  CHECK(hipcc.compile == 0);
-  CHECK(hipcc.run == 0);
 
   const std::string line =
       "  if (hipSetDevice(compute_dev) != hipSuccess) throw vt::rocm::RestoreFailed{};\n";
@@ -447,11 +491,21 @@ TEST_CASE("prefill peer product RestoreComputeOrThrow no-op mutation is RED") {
   mut.replace(pos, line.size(), "  (void)compute_dev;\n");
   const auto mut_gxx = CompileAndRunProductRestore(mut, "g++");
   CHECK(mut_gxx.compile == 0);
+  // A mutant that fails to COMPILE reads as a caught defect while proving
+  // nothing, so the compile status is asserted separately from the run status.
   CHECK(mut_gxx.run != 0);
-  const auto mut_hipcc =
-      CompileAndRunProductRestore(mut, "/opt/rocm-7.2.4/core-7.14/bin/hipcc -x c++");
-  CHECK(mut_hipcc.compile == 0);
-  CHECK(mut_hipcc.run != 0);
+
+  if (const char* hipcc = ResolveHipcc(); hipcc != nullptr) {
+    const std::string hip_cxx = std::string(hipcc) + " -x c++";
+    const auto hip = CompileAndRunProductRestore(restore, hip_cxx);
+    CHECK(hip.compile == 0);
+    CHECK(hip.run == 0);
+    const auto mut_hip = CompileAndRunProductRestore(mut, hip_cxx);
+    CHECK(mut_hip.compile == 0);
+    CHECK(mut_hip.run != 0);
+  } else {
+    ReportHipccNotRun("RestoreComputeOrThrow no-op mutation, HIP-compiler leg");
+  }
 
   const std::string hdr = ReadHeader();
   CHECK(hdr.find("if (std::uncaught_exceptions() > 0) return;") == std::string::npos);
@@ -519,7 +573,6 @@ TEST_CASE("prefill peer two-compute-stream output-copy retirement") {
 TEST_CASE("prefill peer Finish catch HIP/C++ compile gate") {
   const std::string finish = ExtractFinish(ReadHip());
   CHECK(CompileFinishCatchTu(finish, "g++") == 0);
-  CHECK(CompileFinishCatchTu(finish, "/opt/rocm-7.2.4/core-7.14/bin/hipcc -x c++") == 0);
   std::string mut_cst = finish;
   const std::string decl = "    hipStream_t cst = static_cast<hipStream_t>(compute_q.handle);\n";
   auto p1 = mut_cst.find(decl);
@@ -528,7 +581,14 @@ TEST_CASE("prefill peer Finish catch HIP/C++ compile gate") {
   auto p2 = mut_cst.find(decl);
   if (p2 != std::string::npos) mut_cst.erase(p2, decl.size());
   CHECK(CompileFinishCatchTu(mut_cst, "g++") != 0);
-  CHECK(CompileFinishCatchTu(mut_cst, "/opt/rocm-7.2.4/core-7.14/bin/hipcc -x c++") != 0);
+
+  if (const char* hipcc = ResolveHipcc(); hipcc != nullptr) {
+    const std::string hip_cxx = std::string(hipcc) + " -x c++";
+    CHECK(CompileFinishCatchTu(finish, hip_cxx) == 0);
+    CHECK(CompileFinishCatchTu(mut_cst, hip_cxx) != 0);
+  } else {
+    ReportHipccNotRun("Finish catch compile gate, HIP-compiler leg");
+  }
 }
 
 TEST_CASE("prefill peer product two-stream output-copy mutation is RED") {

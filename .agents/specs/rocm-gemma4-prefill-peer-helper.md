@@ -4,7 +4,7 @@
 - **Row slug:** `ROCM-GEMMA4-PREFILL-PEER-HELPER` — child of `BACKEND-ROCM` (#41). Separate from #697.
 - **Worktree / branch (this unit only):** `/home/don/llms/vllm.cpp-prefill-peer` · `row/ROCM-GEMMA4-PREFILL-PEER-HELPER`
 - **Base / recipient:** `origin/main` `3ce5a1dc` `rocm_gemma4_experts.hip:648`
-- **Donor bytes:** `.agents/evidence/rocm-gemma4-prefill-peer/` slices hashed in `MANIFEST.md` (dirty lab `/home/don/llms/vllm.cpp` HEAD `2bb4bd8a` **plus uncommitted**; HEAD is not a clean donor).
+- **Donor bytes:** `.agents/specs/rocm-gemma4-prefill-peer-helper-donor-*.log` slices hashed in [`rocm-gemma4-prefill-peer-helper-donor.md`](rocm-gemma4-prefill-peer-helper-donor.md) (dirty lab `/home/don/llms/vllm.cpp` HEAD `2bb4bd8a` **plus uncommitted**; HEAD is not a clean donor).
 - **Implementer:** hermes-vllm. **Reviewer:** research. **Operator/smoke:** coord.
 - **Git:** spec-only first (coord `25c9` / research `5071` / BLOCK `64cb`); impl after spec GREEN **on this same row branch**. Independent RED/GREEN from #837/#838. Ordered B then C is allowed; no all-at-once port. One PR per row. No shared `row/ROCM-GEMMA4-XDEV-MOE` landing history.
 - **Depends on:** #837 is a separate hypothesis. Operator runs B then C on T=2029. Impl of C may assume B already landed **or** must still be A/B-able alone.
@@ -70,9 +70,9 @@ Caller in `gemma4_moe.cpp` prefill-batch peer-act chunk loop stays the public wr
 
 ### Donor hole (must not ship)
 
-Donor Launch (`launch-finish-1090-1310.txt`) unpins at ~1262–1265 immediately after enqueueing GEMMs and **before** `hipEventRecord(tls.ev_e)`. Finish ~1274–1300 enqueues `hipStreamWaitEvent(cst, tls.ev_e)` + peer copy and does **not** host-wait `ev_e`. `DequantCacheSlotFor` is process-wide (220–231), so another worker/stream may evict/rewrite a zero-pin slot while the first expert stream still reads it. "Unpin after Finish" is still insufficient unless Finish proves `ev_e` complete.
+Donor Launch (`rocm-gemma4-prefill-peer-helper-donor-launch-finish-1090-1310.log`) unpins at ~1262–1265 immediately after enqueueing GEMMs and **before** `hipEventRecord(tls.ev_e)`. Finish ~1274–1300 enqueues `hipStreamWaitEvent(cst, tls.ev_e)` + peer copy and does **not** host-wait `ev_e`. `DequantCacheSlotFor` is process-wide (220–231), so another worker/stream may evict/rewrite a zero-pin slot while the first expert stream still reads it. "Unpin after Finish" is still insufficient unless Finish proves `ev_e` complete.
 
-Donor `Ensure` (`dequant-cache-core-60-209.txt`) calls `FreeAll` whenever device/I/H/`nslots` disagree with the request. `FreeAll` `hipFree`s every slot and zeros `pins`, including live pins. Product must not copy that.
+Donor `Ensure` (`rocm-gemma4-prefill-peer-helper-donor-dequant-cache-core-60-209.log`) calls `FreeAll` whenever device/I/H/`nslots` disagree with the request. `FreeAll` `hipFree`s every slot and zeros `pins`, including live pins. Product must not copy that.
 
 ### Product ownership (required)
 
@@ -160,6 +160,49 @@ GPU (coord, after #837):
 
 ## Evidence
 
-Bus: `0384`, `713f`, `9772`, `25c9`, `5071`, `64cb`, `4954`. Donor bytes hashed in `.agents/evidence/rocm-gemma4-prefill-peer/MANIFEST.md` (cache core 60–209 required).
+Bus: `0384`, `713f`, `9772`, `25c9`, `5071`, `64cb`, `4954`. Donor bytes hashed in [`rocm-gemma4-prefill-peer-helper-donor.md`](rocm-gemma4-prefill-peer-helper-donor.md) (cache core 60–209 required).
 
 Now: `IMPLEMENTING` — ea9c product RestoreComputeOrThrow no-op compile-and-run RED. `a007ec40` is not a review target.
+
+## Owed
+
+Owned by this row (`ROCM-GEMMA4-PREFILL-PEER-HELPER`) and tracked by
+[#839](https://github.com/mudler/vllm.cpp/issues/839), which stays open until each
+is discharged. Named here rather than left to be discovered, per AGENTS.md
+"Nothing lands dead".
+
+- **The host simulator is a second implementation of Launch/Finish.**
+  `include/vt/rocm/rocm_gemma4_prefill_dequant_cache.h` carries `HostAlloc`,
+  `PrefillDequantCacheHost`, `HostRetireThenUnpin`, `HostLaunch` and `HostFinish`
+  (~250 of its lines), compiled into every HIP build. `HostLaunch`/`HostFinish`
+  are hand-written analogues of the product `LaunchGemma4Fp8ExpertGeGLUPrefillPeer`
+  and `FinishGemma4Fp8ExpertGeGLUPrefillPeer` in
+  `src/vt/rocm/rocm_gemma4_experts.hip`, so the lifetime cases in
+  `tests/vt/test_ops_gemma4_prefill_peer.cpp` exercise the analogue and not the
+  product. What binds the two today is the source-slice mutation gates in the
+  same file (`ProductFinishRetiresCstBeforeReuse`, `CompileFinishCatchTu`,
+  `CompileAndRunProductRestore`), which assert against the product TEXT. Owed:
+  move the `Host*` half under `tests/`, keeping `PrefillPeerLife`,
+  `ChoosePrefillRetire`, `PrefillDequantCacheT`, `ComputeDevGuard`,
+  `RestoreFailed`, `SameDevLife`, `OutputCopyGate`, `SlotReusable` and
+  `PublishThenRestoreOrThrow` in the header because the `.hip` reaches them.
+  Deliberately not done in this change: only a ROCm box compiles the one
+  translation unit that consumes the header, so the move cannot be verified
+  where this repair was made.
+
+- **`PeerSlot s[2]` with only slot 0 reachable from production.** Scope item 3
+  passes `slot=0` and item 6 keeps every overlap knob default OFF, so the second
+  slot is allocated and never entered from `RunGemma4Fp8ExpertGeGLUPrefillOnExpertDevice`.
+  `docs/USAGE.md` states it ("Peer-pipe overlap stays off (slot 0 only)"). Owed:
+  either a production path that reaches slot 1, or the array narrowed to one slot.
+
+- **The blocking retirement has no measurement.**
+  `FinishGemma4Fp8ExpertGeGLUPrefillPeer` now host-waits — `hipEventSynchronize(tls.ev_e)`
+  and `hipStreamSynchronize(cst)`, and the same-dev arm gains one too — on every
+  call, where the path was fully asynchronous before. It runs per expert per layer
+  during prefill, so it serialises a pipeline that used to overlap. Design rule 2
+  requires the host-wait for correctness and correctness comes first, so the wait
+  stays; what is owed is the number. Owed: prefill throughput before and after on
+  2x R9700 (gfx1201) at the T values this row was smoked on, recorded in
+  `docs/BENCHMARKS.md` and `.agents/benchmark-record.md`. No CI runner here has
+  the hardware.
