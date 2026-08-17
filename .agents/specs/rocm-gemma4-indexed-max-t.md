@@ -4,7 +4,7 @@
 - **Row slug:** `ROCM-GEMMA4-INDEXED-MAX-T` — child of `BACKEND-ROCM` (#41). Separate from #697.
 - **Worktree / branch (this unit only):** `/home/don/llms/vllm.cpp-indexed-max-t` · `row/ROCM-GEMMA4-INDEXED-MAX-T`
 - **Base / recipient:** `origin/main` `3ce5a1dc` `gemma4_moe.cpp:735` / `:1345`
-- **Donor bytes:** `.agents/evidence/rocm-gemma4-indexed-max-t/` slices hashed in `MANIFEST.md` (dirty lab `/home/don/llms/vllm.cpp` HEAD `2bb4bd8a` **plus uncommitted**; HEAD is not a clean donor).
+- **Donor bytes:** `.agents/specs/rocm-gemma4-indexed-max-t-donor-*.log` slices hashed in `rocm-gemma4-indexed-max-t-donor.md` (dirty lab `/home/don/llms/vllm.cpp` HEAD `2bb4bd8a` **plus uncommitted**; HEAD is not a clean donor).
 - **Implementer:** hermes-vllm. **Reviewer:** research. **Operator/smoke:** coord.
 - **Git:** spec-only first (coord `25c9` / research `5071` / BLOCK `64cb`); impl after spec GREEN **on this same row branch**. Independent RED/GREEN from #837/#839. One PR per row. No shared `row/ROCM-GEMMA4-XDEV-MOE` landing history.
 - **Supersedes for review:** `20332292` (BLOCK) and preview `c4fbe6e9` (not spec-GREEN).
@@ -121,4 +121,54 @@ GPU (coord): T=19 generate succeeds; T=1 decode + Paris/arith unchanged. Generat
 
 ## Evidence
 
-Bus: `713f`, `a63e`, `25c9`, `5071`, `64cb`. Donor bytes hashed in `.agents/evidence/rocm-gemma4-indexed-max-t/MANIFEST.md`.
+Bus: `713f`, `a63e`, `25c9`, `5071`, `64cb`. Donor bytes hashed in `.agents/specs/rocm-gemma4-indexed-max-t-donor.md`.
+
+## Open on gfx1201 hardware
+
+Found while landing, and left open rather than papered over. Each needs the
+RDNA4 pair this repository's maintainers do not have, so none of them can be
+answered from a CPU host. The row does not reach `DONE` until they are.
+
+1. **`rw_idx` breaks the invariant Scope item 3 protects.** The T=1 arm now
+   takes its router weights from a per-call pooled `DBuf` (`gemma4_moe.cpp:760`)
+   where it previously read the caller-owned `rw`. A pooled buffer's address
+   moves between calls, so it is not capture-stable, while the comment three
+   lines below it still reads "Stable T=1 acc for hipGraph (do not
+   pool-Release)". Decode hipGraph is lab-only today, which is why nothing
+   observes this — it is latent, not absent. Either hold `rw_idx` in the same
+   TLS that holds `acc_fast`, or state in the spec that T=1 has stopped being
+   capture-stable and why that is acceptable.
+2. **No measurement.** #838 is filed as `perf` and this change flips a product
+   default for T=2..63, so `docs/BENCHMARKS.md` owes a before/after on the
+   arm that changed. Correctness first: the token-exact result for T=2..63
+   against `VT_GEMMA4_DECODE_INDEXED_MAX_T=1` comes before any throughput
+   number is accepted.
+3. **The per-expert scale costs one kernel launch per token.**
+   `gemma4_moe.cpp:766-773` calls `vt::ApplyExpertScaleRw` inside the T-loop, up
+   to 63 launches. `ApplyExpertScaleRwKernel`
+   (`rocm_fp8_channel_gemv.hip:635`) is `<<<1, G>>>` and indexes `rw`/`ri`
+   linearly with `ri` holding global expert ids, so one call with
+   `G = T*top_k` is element-wise identical. `Gemma4IndexedOkT` bounds
+   `top_k <= 8` and `T <= 63`, so `G <= 504` fits one block today — but
+   collapsing the loop removes the structural reason `G` stays small, and
+   `ApplyExpertScaleRwRocm` does not check `G` against the 1024-thread block
+   limit or report a failed launch. The collapse therefore owes that guard.
+4. Smaller, same hardware: `Gemma4IndexedHelperHits()` does a global atomic
+   `fetch_add` per token on the decode hot path purely so a host test can
+   observe it; `Gemma4IndexedScratchValidForT` cannot return false in the T>1
+   branch that calls it; the new `RestoreComputeDev`
+   (`rocm_gemma4_experts.hip:572`) adds a second `hipSetDevice` on a success
+   path whose own comment says "no hipSetDevice between stream ops"; and
+   `RetireGemma4Fp8TopKIndexedPeer` returns `ok = true` while skipping the
+   expert-stream drain whenever `tls.edev != expert_dev`.
+5. The six `Gemma4Indexed*` host helpers at `gemma4_indexed_gate.h:113-160` have
+   no production caller and belong under `tests/`. Their "tensor oracle" is
+   `s = (e+1) * rw[g]`, which models none of the FP8 GeGLU arithmetic, so it
+   gates the T-loop's striding and nothing about the kernel. That is a real
+   thing to gate; the header is the wrong place to keep it, and the name
+   oversells it.
+6. A comment string is load-bearing: the source-invariant case asserts
+   `retire-before-acc_idx-dtor` appears in `gemma4_moe.cpp`. Reordering the
+   statements it names while keeping the comment passes, and deleting the
+   comment while keeping the order fails. The other invariants in that case
+   assert on code.

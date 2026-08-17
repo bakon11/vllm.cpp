@@ -47,6 +47,34 @@ std::string ReadText(const char* rel) {
   return ss.str();
 }
 
+// Slice ONE function definition, signature through its brace-matched closing
+// brace. The obvious alternative -- slice from this symbol to the next one --
+// is not a slice of this function at all; it is a slice of the GAP, so any
+// unrelated insertion after the closing brace lands inside it and reds a source
+// invariant that the function still satisfies. Skips a forward declaration by
+// requiring the first `{` to precede the first `;`. Braces inside string or
+// character literals would fool the matcher; the functions asserted on here
+// contain none, and a reviewer adding one must re-check this helper.
+std::string FunctionBody(const std::string& src, const std::string& signature) {
+  for (auto sig = src.find(signature); sig != std::string::npos;
+       sig = src.find(signature, sig + 1)) {
+    const auto open = src.find('{', sig);
+    if (open == std::string::npos) return {};
+    const auto semi = src.find(';', sig);
+    if (semi != std::string::npos && semi < open) continue;  // declaration
+    int depth = 0;
+    for (size_t i = open; i < src.size(); ++i) {
+      if (src[i] == '{') {
+        ++depth;
+      } else if (src[i] == '}' && --depth == 0) {
+        return src.substr(sig, i - sig + 1);
+      }
+    }
+    return {};
+  }
+  return {};
+}
+
 struct WritingHelper {
   bool peer_expected = false;
   int fail_at = -1;
@@ -296,11 +324,15 @@ TEST_CASE("gemma4 indexed-max-t: source invariants") {
   CHECK(hip.find("retire_fail") != std::string::npos);
   CHECK(hip.find("RetireGemma4Fp8TopKIndexedPeer") != std::string::npos);
   CHECK(hip.find("RestoreComputeDev") != std::string::npos);
-  const auto ret = hip.find("bool RetireGemma4Fp8TopKIndexedPeer");
-  REQUIRE(ret != std::string::npos);
-  const auto ret_end = hip.find("RunGemma4Fp8ExpertGeGLUPrefillOnExpertDevice", ret);
-  REQUIRE(ret_end != std::string::npos);
-  const std::string retire = hip.substr(ret, ret_end - ret);
+  // The guarantee: RetireGemma4Fp8TopKIndexedPeer synchronizes the compute
+  // stream, keeps that result, and returns it -- it never discards the status
+  // and never reports unconditional success. Asserted on the function's own
+  // body, so an unrelated definition added after it cannot red this case.
+  const std::string retire = FunctionBody(hip, "bool RetireGemma4Fp8TopKIndexedPeer");
+  REQUIRE_FALSE(retire.empty());
+  REQUIRE(retire.back() == '}');
+  CHECK(retire.find("RunGemma4Fp8ExpertGeGLUPrefillOnExpertDevice") == std::string::npos);
+  CHECK(retire.find("hipStreamSynchronize(cst)") != std::string::npos);
   CHECK(retire.find("(void)hipStreamSynchronize") == std::string::npos);
   CHECK(retire.find("return true;") == std::string::npos);
   CHECK(retire.find("return ok;") != std::string::npos);
