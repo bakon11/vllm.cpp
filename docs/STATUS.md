@@ -131,7 +131,7 @@ token-for-token correctness against the pinned oracle.
 | GLM-4 dense (sandwich norms, partial rope) | Correctness-complete, speed-pending | Token-exact 16/16 (GLM-4-9B-0414); first GLM-family model; partial interleaved RoPE + Gemma2 sandwich norms + biased qkv |
 | GLM-4.7-Flash (MLA + GLM MoE) | Correctness-complete, speed-pending | Token-exact 8/8 (GLM-4.7-Flash, 31.2B); reuses the DeepSeek-V2 MLA stack; first e2e coverage of the q_lora query branch + noaux_tc sigmoid router with routed-scaling |
 | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | **RUNNER FOLD LANDS (ROW 7 §21, #122): engine==CLI 128/128 byte-identical; golden 122/128 (near-tie profile); FA2 MLA default-ON; `vllm_complete_tokens` (ABI v13).** Grouped-router top-k block-parallel (byte-identical); no binding speed number: ckpt is tiktoken-only, so no warm-server harness. STRICT stays CLOSED. Server 19.0 tok/s wall (~0.90× vLLM floor) = speed open | paged suite 8/8·206; SACRED post-fold 35B 315/315 + 27B 235/235; thin ABI client (ratchet 8) |
-| Nemotron-3.5-Lightning-30B-A3B (Mamba2 + GQA + relu2 MoE) | **Paged forward + ABI driver land (#810 A2-P, A3); e2e token gate PENDING on `nvcc` + checkpoint visibility in the rc container** | `examples/nemotron_h_gen` reaches it through `include/vllm.h` alone; G-SAFE narrows to `num_reqs <= 1`. Two earlier pending causes on this row were measured false; the box is idle and the checkpoint is revision-verified |
+| Nemotron-3.5-Lightning-30B-A3B (Mamba2 + GQA + relu2 MoE) | **Host gate PASSES 96/96 `STRICT PASS`; GB10 fixed ([#1157](https://github.com/mudler/vllm.cpp/issues/1157)), sm_121a re-run pending** | ABI-only driver; G-SAFE `num_reqs <= 1`. The paged forward now honours `device_token_ids`; seam [#1217](https://github.com/mudler/vllm.cpp/issues/1217) |
 | Gemma-3 dense (GeGLU, dual rope, sandwich norms) | Correctness-complete, speed-pending | STRICT token-exact 48/48 greedy (gemma-3-1b-it); first Gemma-family model; GeGLU (gelu_pytorch_tanh) + dual per-layer RoPE theta + Gemma-RMSNorm sandwich norms + sqrt(hidden) embed-scale + query_pre_attn_scalar scaling |
 | Gemma-2 dense (attn + final logit soft-cap) | Correctness-complete, speed-pending | Near-tie-band 48/48 (gemma-2-2b-it): 44/48 strict on vLLM's greedy + 4/48 at 0.0-nat ties in vLLM's own logits; proves the attention + final logit soft-cap primitives (attn_logit_softcapping 50 + final 30); the inverse of Gemma-3 (both soft-caps, no QK-norm) |
 | Gemma-1 dense (the original Gemma) | Correctness-complete, speed-pending | STRICT token-exact 48/48 greedy (gemma-2b); two fused norms/layer, head_dim scale, GeGLU + sqrt(hidden) embed-scale, tied lm_head; no soft-cap/QK-norm/sliding. **D1 (2026-07-31): the whole Gemma family (1/2/3/4) folded to the default-ON bf16 merged-QKV descriptor (`MergedQkvEnabled`); re-gated Gemma-2 SACRED 48/48 (global+sliding) + Gemma-4 STRICT 32/32 — its existing gate held** |
@@ -143,7 +143,7 @@ token-for-token correctness against the pinned oracle.
 | Laguna-S-2.1 MoE (`LagunaForCausalLM`, 118B/8B) | **BINDING 2026-08-04: was 87% of vLLM (37.55 vs 43.10, same-tool nsys)**; root cause was bf16 projections on UNIFIED/ATS host memory, and device-resident staging (byte-exact) gives 44.6, parity+ vs 43.1, default-ON | 48 layers (12 global + 36 SWA-512), 256 routed top-10 + 1 shared expert, per-head softplus attn out-gate, sigmoid `noaux_tc` router, dual per-layer RoPE, GQA 8 KV / 128 head-dim, 1M ctx. History: benchmark-record |
 | InternLM2 dense (fused-`wqkv` interleaved split) | Correctness-complete, speed-pending | Token-exact 16/16 (internlm2-chat-1_8b): 12/16 strict + 4/16 bf16 near-tie (max gap 0.0 nats), 0 divergent; first InternLM model; ZERO new compute kernel (reuses the Llama dense forward; the only delta is a loader-side de-interleave of the fused `wqkv`, which packs q/k/v interleaved by KV-group) |
 | MiniMax-H3 (`MiniMaxH3DiTModel`, video+audio DIFFUSION) | **ABI v12 ONE SURFACE; device selector uses generic `DeviceType`; DSR 32.** t2va+fl2va COHERENT; bf16 shards STREAM | ref2va ckpt fidelity §8.12; encoder A/B §8.15; GB10 re-verify residual; CPU fold 6/137 (one queue + device provenance mutation-gated) |
-| LTX-2.5 (`LTX2VideoTransformer3DModel`, video+audio DIFFUSION) | **L1-L9c landed (#435).** 21.00B / 48 blocks. `VideoEngine` seam + ABI **v18**, DiT forward (CPU f32 parity, bf16 device-resident), Gemma-4 TE, both VAEs, connector, pipeline, NVFP4/FP8, keyframe bias (#658) | BOTH shipped DiTs now load inside the contract, no `allow_unported`. One runs device-resident on GB10; those 320x192/25f frames ARE a scene. A prompted render is OWED; speed and oracle parity `PENDING` |
+| LTX-2.5 (`LTX2VideoTransformer3DModel`, video+audio DIFFUSION) | **L1-L9c landed (#435).** 21.00B / 48 blocks. `VideoEngine` seam + ABI **v18**, DiT forward (CPU f32 parity, bf16 device-resident), Gemma-4 TE, both VAEs, connector, pipeline, NVFP4/FP8, keyframe bias (#658) | BOTH shipped DiTs load inside the contract, no `allow_unported`; one runs device-resident on GB10. Caption projection now on the `vt::MatmulBT` seam (#1208): 671.8->78.4 s x86. Prompted render, speed, parity OWED |
 | MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`, text-to-MUSIC) | **`ACTIVE`: W0-W7 landed; every stage including the 8.6B LM forward is implemented and gated (#672).** Oracle is the OPEN diffusers PR #14456 `c6da9936` | GGUF arms for 4 components owed. LM forward gated in a control; HTTP OBSERVED (#852). PARTIAL device arm, Thor sm_110 (#672): 8.6B LM + 2.4B fp32 DiT (§14). CPU kernels 10.7x on the vocoder chain. No reference number |
 | Command-R / Cohere dense (`CohereForCausalLM`) | Implemented, gate-blocked | ZERO-new-kernel port grounded in vLLM `commandr.py`: weight-only Cohere LayerNorm + GPT-J full-width RoPE + PARALLEL residual + `logit_scale` + tied embeddings, all reuse; compiles, links, self-registers. No SACRED gate yet (real checkpoints HF-gated, ungated ones tiny-random, GPU box disk-full); oracle run-verified at W0. See docs/BENCHMARKS.md |
 | Phi-1 / Phi-2 dense (`PhiForCausalLM`, parallel residual) | Correctness-complete, speed-pending | Token-exact 16/16 (microsoft/phi-2): 9/16 strict + 7/16 bf16 near-ties (max gap 0.25 nats), 0 forward-divergent; the OLDER Microsoft Phi arch, DISTINCT from Phi-3/Phi-4; ZERO new compute kernel (GPT-J parallel residual, LayerNorm-with-bias, biased qkv/dense, partial NeoX rope 32/80, non-gated NewGELU MLP reusing `vt::GeluTanh`, untied biased lm_head); F16 dtype-aware loader |
@@ -180,6 +180,61 @@ token-for-token correctness against the pinned oracle.
 | Multimodal: audio to text | Decode beats vLLM; encoder TTFT measured and improved but not yet at parity; OpenAI-server content-part parse + audio processor routing + engine mm-request plumbing landed (CPU), end-to-end serving pending | End-to-end on Voxtral-Mini-3B (near-tie-robust, decoder token-exact 48/48) plus a Whisper-class encoder tower. Decode is graph-captured and runs vLLM's FA2 varlen split-KV kernel (the KV block-size is rounded up to a multiple of 16 to meet its precondition): audio TPOT 39.5 ms/token BEATS vLLM 0.25.0's 40.8 ms (0.97x, non-overlapping bands). The Whisper encoder attention now uses a flash-tiled non-causal head-dim-64 kernel (`vt::AttentionDenseFlash`): a block of query-warps shares each streamed K/V tile out of shared memory (FlashAttention K/V tiling), with the per-warp online-softmax math copied verbatim from the warp kernel so the output is bit-identical (token-identical). Same-binary A/B: the encoder self-attention drops from 35.11 to 19.29 ms/layer (1.82x, non-overlapping) and the encoder forward from ~1.83 s to ~1.37 s (1.33x), token-identical output (16/16, STRICT golden unchanged, sanitizer 0). The encoder weights are now device-resident: each of the 487 encoder weight tensors is converted to bf16 and uploaded to the GPU once (mirroring the decoder's residency), reused across forwards instead of being re-marshalled every call; same-binary A/B (`VT_WHISPER_ENC_REMARSHAL`) drops the encoder forward a further ~1.37 s to ~0.73 s (1.89x, non-overlapping), removing ~648 ms of per-call host weight marshalling (nsys: 974 fewer Host-to-Device copies, ~2.5 GB less traffic), byte-identical (16/16, STRICT golden unchanged, sanitizer 0). But encoder TTFT (~0.73 s) is still far above vLLM's 43 ms (~17x, was ~32x): the residual is now GPU-compute-bound (the scalar warp-per-query attention plus the conv GEMMs), so closing it needs a tensor-core MMA head-dim-64 non-causal flash attention. Correctness held under the ratified distributional near-tie gate (teacher-force PASS, 0 divergent, strict prefix exact vs vLLM; STRICT golden unchanged; 16/16). Remaining: a tensor-core MMA encoder-attention kernel and dropping the conv host round-trip (a device im2col kernel), and there is no batched c2+ or `audio_url` serving ingestion. See docs/BENCHMARKS.md Encoder attention now has an opt-in FA-2 tensor-core path (`VT_WHISPER_ENC_FA2=1`) that is 5.50x faster and takes the ENCODER FORWARD from 15.90x to 2.89x of vLLM's whole TTFT (pinned oracle `555967922`, TTFT median 46.02 ms, production/graphed). Those are encoder-forward-vs-TTFT ratios and NOT TTFT ratios: our projector, merge and prefill are unmeasured and so are absent from the numerator. Held OPT-IN because it costs 3 near-tie divergences against the default's 0; adoption is a developer decision. Which of the five FA-2-vs-scalar differences flips those tokens is NOT established: the originally stated cause (bf16 P before the PV MMA) was refuted by forcing exactly that rounding into the scalar kernel, which left the tokens unchanged (multimodal-speed.md S17.5, #432). |
 
 | SGLang parity (competitor floor + oracle) | Oracle STOOD UP + first floor MEASURED (cache-neutral, 27B, c8/c16): throughput/TTFT WIN, TPOT/ITL open GAP | SGLang v0.5.15 (`f63458b`) whole runtime surface inventoried (44 rows: 23 FUSED into our vLLM-derived engine, 8 SGLANG-DISTINCT opt-ins, 5 inventoried, 8 out-of-scope). The `v0.5.15-cu130` arm64 image (`@sha256:d0a667e`) PULLED and RAN the 27B-NVFP4 gate model on GB10 sm_121a with no from-source build. First reproduced SGLang-vs-ours cache-neutral comparison (27B, 3 reps, idle box, one flock, engines sequential): **ours beats the SGLang floor on total/output throughput + req/s (2.21×@c16, 1.44×@c8) and TTFT (6–12× lower), but SGLang wins per-token latency (TPOT/ITL 1.18–1.49× below ours) — a reproduced OPEN GAP.** SGLang is a competitor, not the mirror source (vLLM stays behavior truth). Residuals: 35B, c1/c2/c4 low-conc sweep, shared-prefix cache-ON arm, token-exact cross-check. Numbers + repro: `docs/BENCHMARKS.md`, `.agents/sglang-matrix.md`, `.agents/specs/sglang-parity-oracle.md`. **UPDATE 2026-07-28 (`CLAIM-DECODE-LATENCY-EXPLORE`, measurement only, no source changed): the TPOT/ITL gap is CONFIRMED batch-composition, NOT a decode-kernel deficiency** — on our engine ITL(decode-batch=1)=101.75 ms is already ≤ SGLang's op-point 104–105 ms and rises monotonically with batch (→158.5 ms @ B16); nsys shows every hot decode kernel sub-linear in batch (per-token cost ↓~10×); SGLang's effective decode concurrency is ~4 (not 16) due to its 33 s admission queue, so its low ITL is simply the ITL of a small batch. Our throughput win IS the ITL cost — same lever; knob `max_num_seqs`/`max_num_batched_tokens` already exists, latency-oriented point `max_num_seqs≈8` = ITL −21% at 1.38× SGLang throughput; default stays throughput-oriented. Full data: `.agents/specs/decode-latency-lever.md` **UPDATE 2026-08-16 ([#979](https://github.com/mudler/vllm.cpp/issues/979), records only, nothing measured): two entries were stale and are corrected.** `BACKEND-GATE-CUDA-SGLANG` moves `BLOCKED` to `PARTIAL`: its recorded blocker `SERVE-ASYNC-LLM` is discharged, so the reason "HTTP TTFT/ITL cannot be measured honestly yet" is retracted. The production server streams incrementally over `AsyncLLM` (`serving_completion.h:9`, `api_server.cpp:971-981`), the benchmark harness ENFORCES it rather than assuming it (`tools/bench/run_serve_low.py:296-310` refuses `first_chunk_s >= total_s`), and the run above demonstrates it: c16 mean TTFT 2980 ms against mean ITL 154.4 ms over 128 tokens means first byte preceded completion by about twenty seconds, which a buffered server cannot do. That run is NOT voided by [#931](https://github.com/mudler/vllm.cpp/issues/931), because the keepalive frame needs 15 s of silence and the worst observed p99 TTFT was 7220 ms. The SGLang oracle also moves to `gateable = yes`: `.agents/oracles/sglang.md` still said "no SGLang run has been recorded on this project's hardware" two and a half weeks after this measurement, and `docs/BENCHMARKS.md` still said "Never ran". This discharges the SGLang third of [#647](https://github.com/mudler/vllm.cpp/issues/647). A new `BACKEND-GATE-CUDA-LLAMACPP` row is filed `INVENTORIED` for the llama.cpp-on-current-CUDA arm, which had no owner. Campaign spec: `.agents/specs/bench-qwen38-27b-four-way.md` |
+
+**CUDA graph capture takes BREAK POINTS** as of `ENG-CUDAGRAPH-BREAK` W1
+(`ACTIVE`, 2026-08-18, [spec](../.agents/specs/eng-cudagraph-break.md), #1192,
+parent #1163). A forward can be captured as a SEQUENCE of segments split at
+break points, so a forward containing a host-dependent operation is still
+graphed except at that operation instead of falling out to eager for the whole
+step.
+
+`vt::BreakableGraph`, `vt::GraphCaptureScope` and `vt::GraphBreak`
+(`include/vt/breakable_graph.h`) replace the nine hand-rolled per-model drivers
+as those migrate. **Coverage and correctness, not speed**: no throughput gate is
+declared, because our prefill has no launch bubbles to collapse (3.8% host idle,
+GPU-busy above 96%) and decode already banked its launch-overhead win.
+
+The boundary is vLLM's — its v1 default splits at `splitting_ops`, defaulted to
+the attention family — and only the registration form is SGLang's, because vLLM
+gets its split from Dynamo and FX and we have no compiler. W1 registers ONE
+break point, at the dense attention entry of `Qwen3ForCausalLM`.
+
+The stage's exit criterion was measured rather than assumed: ending a capture
+and BEGINNING A NEW ONE on the same stream mid-forward, with eager work between,
+is legal under the thread-local capture mode our CUDA backend uses (`orin:gpu0`
+via an `rc` lease, driver 12060, three replays with fresh inputs, zero
+mismatches).
+
+Gates: `tests/vt/test_breakable_graph.cpp` ports SGLang's unit suite case for
+case, with its arithmetic chains and its post-replay assertions intact (24
+cases, 163 assertions); `tests/vllm/models/test_qwen3_break_point.cpp` drives
+the production forward with a scope open, counts one segment per layer plus one,
+and compares the logits BIT FOR BIT against the unscoped forward (500 values, 0
+differing).
+
+The seam ENFORCES what it used to document. A destination-carrying break point
+takes a `vt::BreakSlot` whose storage the seam owns, because the following
+segment bakes that address and a caller's local dies first; a destination with no
+`CopyOutput` overload is a compile error naming the type rather than a silent
+drop into the no-writeback path; a second capture scope on one thread and a
+re-entered container are refused; and a forward that throws OUT OF the scope
+mid-capture leaves no partial graph reporting itself as captured. Interleaved
+replay, the `VLLM_CPP_CUDAGRAPH=0` kill switch and each refusal above are gated,
+every one proven by a mutation that reds them.
+
+Two break points in one capture writing through ONE destination are refused as
+well, at registration. `BreakSlot` closed the lifetime half of that rule and
+left the aliasing half writable: both replay closures bound to the same address,
+so the earlier writeback was overwritten. One shape still escapes, and the spec
+names it and assigns it to W2 — an exception CAUGHT INSIDE the scope leaves the
+rest of the forward uncaptured while `captured()` stays true, because nothing is
+unwinding at scope exit for the drain to see.
+
+**Not yet entered from a production step.** No driver opens a capture scope
+until W2 migrates `Qwen3DenseDecodeGraph`; the break point itself runs on every
+forward and takes the pass-through arm. The spec's `## Owed` names that with its
+owner, along with the auxiliary-stream auto-join, the ROCm and Tenstorrent arms,
+and GPU bit-exactness over more than one replay.
 
 ## Speculative decoding
 
@@ -220,6 +275,10 @@ vLLM 0.26.0.dev0 stack (which resolves vllm#40898), and it remains gated behind
 a spike while its user-facing serving surface is finalized.
 
 **Method surface (enumerated from vLLM source 2026-08-06, `.agents/specs/spec-decode-inventory.md`).** Of the 13 vLLM `SpeculativeMethod` strings we ship MTP (any k), DFlash, DSpark and n-gram; draft_model is a CPU brick and Medusa a spike; EAGLE1/EAGLE3, ngram-gpu, suffix, custom_class, extract_hidden_states, dynamic-k and the synthetic/block acceptance variants are INVENTORIED; mlp_speculator is upstream-deprecated (no V1 proposer). Draft DEPTH: MTP k>1 is BUILT and CPU-gated (`SPEC-MTP-K-GT-1`, no speed number yet). Dynamic (batch-size-keyed) and adaptive (acceptance-driven) depth stay unbuilt (`ROAD-V1-D3-SPEC-K`, #81).
+
+**DSpark block floor** (`SPEC-DSPARK-BLOCK-SIZE-GUARD`, ACTIVE, [#1225](https://github.com/mudler/vllm.cpp/issues/1225)). A speculative length below the draft's block was accepted silently: both `ResolveDspark` call sites passed `std::nullopt`, so the `k >= block` floor reached no user path, and our draft block is sized by `k` alone. It is refused now, with `block_size` supplying the floor when upstream's `dspark_block_size` is absent — one recorded divergence, because neither published Qwen3 draft sets that key. The GPU run gate that exhibits the garbling is owed.
+
+**DSpark draft routing** (`SPEC-DSPARK-QWEN3-ROUTING`, ACTIVE) makes the loader classify a DSpark draft from the draft's own `config.json` before it resolves anything else. `Qwen3DSparkModel`, `Gemma4DSparkModel` and — ahead of the pin, mirroring vllm#52197 — `DSparkDraftModel` with `model_type` `qwen3` take the landed Qwen3 lane; a draft that resolves to the DeepSeek-V4 DSpark lane is refused BY NAME instead of being rewritten into a stub. CPU-gated only: the token-exact run gate against the pinned oracle waits on a draft download and GPU time that are not authorized, so it stays owed (#1193).
 
 **DeepSeek-V4 native MTP** (`DeepSeekV4MTPModel`, ACTIVE — W1 self-spec wiring,
 2026-07-30) has its nextn draft head wired to the same lossless spec-decode path.
@@ -501,23 +560,35 @@ recurrences + fused attn preamble; 27B prefill 21.5x, decode
 [campaign](../.agents/specs/vulkan-full-support.md)), ROCm (W0 community-green
 on 5 gfx archs; the APU unified-memory fix remains unverified; gfx1200 runs
 Gemma-3 and Qwen3 all-native, with Gemma-3 strict 48/48 against two vLLM-ROCm
-oracles and Qwen3 in a measured near-tie regime; Qwen3.5-0.8B GDN runs all-native
-but its CPU/ROCm divergence remains open; gfx1201 Gemma-4 FP8 MoE is
-contributor-measured on 2x R9700 and CPU-link-verified our side; a `head_dim=128`
-decode arm lands opt-in behind `VT_ATTN_DECODE_D128`, default OFF, which moves
-gfx1200 per-token decode from 6.35x to 1.75x slower than the pinned vLLM oracle
-on one shape, a directional figure that leaves the ROCm throughput axis PENDING; #1047 item 3 on gfx1201 Gemma-4 FP8 prefill-peer is attribution only (T=2029: deleting two Finish success-path barriers is +2.55% / 46.05 ms/req vs the retained RetirePinThenUnpin wait, not a license to land the deletion and not a ROCm throughput pin; [BENCHMARKS](BENCHMARKS.md));
+oracles and Qwen3 in a measured near-tie regime; on gfx1100 the M4 gate now
+runs against the **pinned vLLM-ROCm oracle built on the same box**
+(`555967922` / `0.23.1rc1.dev1511+g555967922`): Qwen3-0.6B **16/16 PASS**
+(11/16 strict token-exact, 5/16 near-tie band, max teacher-forced gap 0.125
+nats, 0 forward-divergent; oracle K=10 deterministic in every cell) with the
+ROCm device-golden lane in `test_qwen3_paged_engine`; Qwen3.5-0.8B GDN runs
+all-native and is gated **16/16 against the same-box pinned oracle** (15/16
+strict token-exact, max gap 0.125 nats) since the `AttnQkNormRopeGate`
+output-dtype dispatch fix; gfx1201 Gemma-4 FP8 MoE is contributor-measured on
+2x R9700 and CPU-link-verified our side; a `head_dim=128` decode arm lands
+opt-in behind `VT_ATTN_DECODE_D128`, default OFF, which moves gfx1200 per-token
+decode from 6.35x to 1.75x slower than the pinned vLLM oracle on one shape, a
+directional figure that leaves the ROCm throughput axis PENDING; #1047 item 3 on gfx1201 Gemma-4 FP8 prefill-peer is attribution only (T=2029: deleting two Finish success-path barriers is +2.55% / 46.05 ms/req vs the retained RetirePinThenUnpin wait, not a license to land the deletion and not a ROCm throughput pin; [BENCHMARKS](BENCHMARKS.md));
 [guide](ROCM.md)), inference-time CPU weight offload (`ENG-WEIGHT-OFFLOAD`
 ACTIVE; the config surface landed W0a (the backend enum, both sub-configs, the
 validator's two errors and three warnings, and the dot-anchored segment match),
 all UNREACHABLE for now because nothing constructs an `OffloadConfig` yet, so
-no engine behaviour changes. Still owed: vLLM's `cpu_offload_gb` UVA arm with dotted-segment
-`cpu_offload_params` targeting, plus the layer-group `PrefetchOffloader` — a
+no engine behaviour changes. Still owed: vLLM's `cpu_offload_gb` UVA arm with
+dotted-segment `cpu_offload_params` targeting, plus the layer-group `PrefetchOffloader` — a
 pure mirror floor, and #149's dense half. Its memory and speed gates need a
 discrete-GPU rig, because on unified-memory GB10 offloading to "CPU" frees
 nothing, so those gates are blocked rather than pending
-[spec](../.agents/specs/weight-offload-uva.md)), and the full tool-calling
-template surface. **Muse Glimmer's
+[spec](../.agents/specs/weight-offload-uva.md)), the disk-residency tier as a
+config surface (`ENG-RESIDENCY-CONFIG` ACTIVE, #1110: mmap residency, prefault
+and the expert-stream lane are reachable from `--offload-config`'s `vllm_cpp`
+key, not only from `VT_*`, which keep working as overrides; env var beats config
+beats default; the 370 GiB reproduction through the JSON form is owed and needs
+GB10 [spec](../.agents/specs/weight-residency-config.md)), and the full
+tool-calling template surface. **Muse Glimmer's
 GGUF arm generates coherently** (#347, #359), is NOT token-exact, and has
 only a llama.cpp bar (#333). Its CPU decode was **synchronisation-bound, not
 kernel-bound**: the threadpool's never-yielding spin-wait cost a full scheduler
@@ -1568,6 +1639,25 @@ regression.
 
 ## Performance detail
 
+**GDN recurrence output and z gate at the model dtype on every arm
+(`GDN-MOE-BF16-OUT`, `GATING`,
+[#1168](https://github.com/mudler/vllm.cpp/issues/1168)):** `GdnOutDType`
+resolved bf16 from a dense checkpoint and f32 from a MoE one, so every MoE
+checkpoint held the recurrence output `dcore`, the `z` gate and the gated-RMSNorm
+weight at double width. vLLM branches on no model shape here. The shape term is
+gone from the resolver and from packed-decode eligibility, and
+`VT_GDN_OUT_BF16=0` is the f32 rollback for both arms now, not the dense one
+alone ([spec](../.agents/specs/gdn-moe-bf16-out.md)).
+
+**Nothing is measured and no GPU gate has run**, so no axis is claimed in either
+direction. The CPU tier enters through `ModelRegistry::Forward` on a MoE config
+and reads the dtypes off the tensors, in the default and the `=0` arm alike. The
+35B correctness gate, the `315/315` and `235/235` engine counts, the same-binary
+A/B and the `nsys` memory-format confirmation are owed to a GPU host. Dropping
+the shape term reaches packed GDN decode on no MoE checkpoint either:
+`in_proj_ba` has one writer, the dense loader
+([#1169](https://github.com/mudler/vllm.cpp/issues/1169), owed).
+
 **Local Qwen3.5-4B plain BF16 direct loader; throughput ahead, acceptance
 `PENDING`, latency and VRAM open:** production `AsyncLLM` uses default-ON exact
 `(sequence, 8-token chunk)` causal-conv dispatch. Graph-node `nsys` measures
@@ -1625,6 +1715,8 @@ Gemma4/ROCm env split: public `VT_GEMMA4_EXPERT_VRAM_MB` caps expert LRU in posi
 `BACKEND-TENSTORRENT-TRACE-RUNNER`: `SPIKE`: NO-GO for T=1 decode capture. Measured `to_vector` abort. Decode capture moved to `BACKEND-TENSTORRENT-HOST-FREE-FORWARD`. Prefill capture still unaudited.
 
 `BACKEND-TENSTORRENT-HOST-FREE-FORWARD`: `ACTIVE`: env-gated `VT_TT_HOST_FREE_DECODE` decode-graph capture. Implementer P150 run of Qwen3-0.6B, 80 tokens: 79 replays, no hang, 5.8x vs eager, 22/22 vs the per-step-copy baseline. Default path inert. Operator gate and full-engine golden still owed. A new batch after the first capture is refused.
+
+`ENG-CUDAGRAPH-DEDUP`: `ACTIVE`: env-gated `VT_CUDA_GRAPH_DEDUP` graph-executable dedup — one `cudaGraphExec` per captured TOPOLOGY instead of one per padded decode bucket per model. The GB10 same-binary A/B ran on 2026-08-18 and split: replays are byte-identical 10/10 and [#1184](https://github.com/mudler/vllm.cpp/issues/1184) is gone, but the fold NEVER engages — the signature carries the padded batch dimension, so two decode buckets never group and ON allocates as many executables as OFF. Default stays OFF; the flip is unjustified on this evidence, and a coarser key is the open hypothesis ([#1226](https://github.com/mudler/vllm.cpp/issues/1226)).
 
 **Platform SELECTION is the one non-additive site, and is now gated.** A
 platform missing from `CurrentPlatform()`'s hardcoded walk registers and answers

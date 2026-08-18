@@ -100,6 +100,7 @@ CHECKERS=(
   check-oracle-pins
   check-now-current
   check-gate-commands
+  check-symbol-anchors
 )
 
 SUITES=(
@@ -124,6 +125,7 @@ SUITES=(
   test_agent_role
   test_agent_onboard
   test_agent_start
+  test_gate_bringup
   test_claim_view
   test_upstream_inventory
   test_doc_checkpoint
@@ -147,6 +149,7 @@ SUITES=(
   test_gpu_lock_one_truth
   test_main_baseline
   test_agent_preflight_skip_report
+  test_check_symbol_anchors
 )
 
 failed=()

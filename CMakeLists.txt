@@ -703,6 +703,7 @@ add_library(vllm STATIC
   src/vllm/config/device.cpp
   src/vllm/config/kv_transfer.cpp
   src/vllm/config/offload.cpp
+  src/vllm/config/weight_residency.cpp
   src/vllm/model_executor/weight_offloader.cpp
   src/vllm/model_executor/weight_offload_policy.cpp
   src/vllm/model_executor/expert_slot_cache.cpp
@@ -1214,6 +1215,7 @@ add_library(vllm STATIC
   src/vllm/parser/parser_manager.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp
+  src/vt/breakable_graph.cpp
   src/vt/tensor.cpp
   src/vt/arena.cpp
   src/vt/op_provider.cpp
@@ -2380,4 +2382,18 @@ endif()
 
 if(VLLM_CPP_BUILD_EXAMPLES)
   add_subdirectory(examples)
+endif()
+
+# `vllm-cli`'s own reachability gate (#1135) runs the BINARY, so it needs the
+# binary built first. The dependency is declared HERE rather than in
+# tests/CMakeLists.txt because `add_subdirectory(tests)` runs before
+# `add_subdirectory(examples)`, so the `vllm-cli` target does not exist yet at
+# that point. The `$<TARGET_FILE:vllm-cli>` compile definition in tests/ is fine
+# there, because a generator expression is evaluated after every directory has
+# been processed. With examples off there is no `vllm-cli` target, no
+# `VLLM_CLI_BINARY` define, and the test EXITS 77 so CTest reports it Skipped
+# (see tests/vllm/entrypoints/test_cli_offload_config.cpp); this guard is the only
+# thing that has to know about the ordering.
+if(TARGET test_cli_offload_config AND TARGET vllm-cli)
+  add_dependencies(test_cli_offload_config vllm-cli)
 endif()

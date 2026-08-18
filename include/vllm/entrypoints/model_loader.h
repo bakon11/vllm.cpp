@@ -39,6 +39,7 @@
 #include "vllm/v1/executor/executor.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vllm/config/offload.h"
+#include "vllm/config/weight_residency.h"
 #include "vllm/v1/kv_offload/kv_connector.h"
 #include "vllm/v1/structured_output/manager.h"
 #include "vllm/v1/worker/gpu/runner.h"
@@ -168,6 +169,21 @@ struct EngineParams {
   // offloading == the byte-identical engine. Validated at construction; the
   // offloader that consumes it is W2/W5, so today this is recorded and inert.
   std::optional<vllm::OffloadConfig> offload_config = std::nullopt;
+
+  // ENG-RESIDENCY-CONFIG (#1110): the host-RAM -> DISK residency tier, parsed out
+  // of the `vllm_cpp` key of the SAME `--offload-config` document `offload_config`
+  // above comes from. Absent (default) == every knob resolves from the environment
+  // and its built-in default, i.e. the byte-identical engine.
+  //
+  // It is a SEPARATE field rather than an arm of `OffloadConfig` because that
+  // struct is a 1:1 transcription of `vllm/config/offload.py` and upstream has no
+  // disk tier — see include/vllm/config/weight_residency.h for the whole argument,
+  // the schema, and the env-beats-config precedence.
+  //
+  // FromModelDir installs it in its FIRST statement block, ahead of every path,
+  // config and weight operation, because each knob it feeds is read through a
+  // static that latches on first use.
+  std::optional<vllm::WeightResidencyConfig> weight_residency = std::nullopt;
 
   // SPEC-MTP I5d-pre: opt-in speculative-decoding configuration. Empty/absent
   // (default) == NO speculation == byte-identical production engine (mirrors
@@ -409,6 +425,24 @@ class LoadedEngine {
   static bool ResolveAsyncEnabled(const vllm::SchedulerConfig& scheduler_config,
                                   bool runner_supports_async,
                                   bool is_pooling_model = false);
+  // SPEC-MTP I5d: finalize the entrypoint's SpeculativeConfig against the loaded
+  // checkpoint. params.speculative_config carries the CLI method + optional user
+  // k; this re-runs SpeculativeConfig::ResolveMtp with the checkpoint's
+  // mtp_num_hidden_layers (from config.raw text_config, default 1) so n_predict
+  // and the resolved k are correct. Returns nullopt when no speculation is
+  // configured (the byte-identical production path). Non-Qwen3.5 or non-mtp
+  // methods that reached here throw.
+  static std::optional<vllm::SpeculativeConfig> ResolveSpecConfig(
+      const EngineParams& params, const HfConfig& config);
+  // SPEC-DSPARK-BLOCK-SIZE-GUARD (#1225): public beside the other Resolve*
+  // statics of this class, which are the pure config-resolution helpers the
+  // constructor calls and which tests already drive directly
+  // (tests/vllm/entrypoints/test_loaded_engine_dense.cpp:347 for
+  // ResolveMaxNumBatchedTokens). ResolveSpecConfig is the same kind of function
+  // and was private only by accident of where it was added. The DSpark block
+  // floor has to be reachable from a test that enters the loader's resolution
+  // path rather than calling SpeculativeConfig::ResolveDspark by hand, which is
+  // exactly the distinction .agents/reachability.md draws.
 
  private:
   // Type-erased constructor used by FromModelDir and the concrete-weight
@@ -431,15 +465,6 @@ class LoadedEngine {
       bool enable_caching,
       vllm::v1::StructuredOutputManager* structured_output_manager,
       std::optional<vllm::SpeculativeConfig> speculative_config = std::nullopt);
-  // SPEC-MTP I5d: finalize the entrypoint's SpeculativeConfig against the loaded
-  // checkpoint. params.speculative_config carries the CLI method + optional user
-  // k; this re-runs SpeculativeConfig::ResolveMtp with the checkpoint's
-  // mtp_num_hidden_layers (from config.raw text_config, default 1) so n_predict
-  // and the resolved k are correct. Returns nullopt when no speculation is
-  // configured (the byte-identical production path). Non-Qwen3.5 or non-mtp
-  // methods that reached here throw.
-  static std::optional<vllm::SpeculativeConfig> ResolveSpecConfig(
-      const EngineParams& params, const HfConfig& config);
   // SPEC-MTP I5d: build the KV-cache spec, widened for speculation when a spec
   // config is set (the extra GDN k+1 state slots + widened conv row + the
   // `fa_draft` full-attn group, MakeQwen3_5KVCacheSpec num_spec>0). With no spec

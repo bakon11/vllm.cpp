@@ -1,5 +1,6 @@
 #if defined(__unix__)
 #include <sys/mman.h>
+#include <unistd.h>  // ::sysconf(_SC_PAGESIZE) in the readahead hint below
 #endif
 // vllm.cpp original; see qwen3_5.h. Forward math mirrored 1:1 from the pinned
 // upstream (qwen3_next.py::Qwen3NextDecoderLayer / Qwen3NextModel.forward,
@@ -8,12 +9,14 @@
 // .agents/specs/qwen36-forward-notes.md (assembly, §2 mRoPE->NeoX, §5 attention),
 // .agents/specs/gdn-semantics.md (§1 layout, §6 g/beta prep, §7 recurrence),
 // .agents/specs/moe-semantics.md (§1-§6 MoE block + activated-expert gather).
+#include "vllm/config/weight_residency.h"
 #include "vllm/model_executor/host_expert_slot_store.h"
 #include "vllm/model_executor/expert_streamer.h"
 #include "vllm/model_executor/expert_slot_cache.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 
 #include "vllm/model_executor/models/decode_graph_sizes.h"
+#include "vllm/model_executor/models/dense_fp8_block_gemm.h"  // MODEL-FP8-BLOCK-LINEAR (#1189 M4)
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/AuxPool/ActivePool (shared)
 
 #include "vllm/model_executor/models/qwen3_5_dense.h"
@@ -73,9 +76,30 @@ void ResetQwen3_5MixedSpecInvocations() {
   g_mixed_spec_invocations.store(0, std::memory_order_relaxed);
 }
 
+// GDN-MOE-BF16-OUT (#1168) Edit 2 dropped the `e.dense_model` term. It entered at
+// f344decf4 ("dispatch exact packed decode") as one of that change's "real-model
+// safety gates", was never revisited, and neither reference has an equivalent:
+// VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE defaults True with no shape term
+// (vllm/envs.py:124 @ 5559679) and SGLang keys supports_packed_decode on the
+// platform alone (gdn_triton.py:43 @ f63458b5be). It became REDUNDANT once
+// GdnOutDType stopped branching on model shape: `core_out` is `outdt`, and
+// GdnPackedDecodeDTypesCompatible below already pins it to BF16, so an f32
+// recurrence output is what deselects packed decode on either arm. Removing it
+// BEFORE the dtype change would have removed a term that the dtype rule did not
+// yet subsume, which is why the two edits are one change and in this order.
+//
+// Do not read that as "and now the removal is observable in production", because
+// it is not, in either order (fresh-review finding). `has_packed_ba` needs
+// `in_proj_ba`, written at exactly one site in the tree — the dense loader,
+// qwen3_5_dense_weights.cpp:431 — so on a MoE checkpoint the eligibility is
+// false before the shape term is ever read. Removing it therefore reaches packed
+// decode on NO checkpoint; it removes a contradiction with both references and a
+// second answer to a question the dtype rule already answers. Reaching packed
+// decode on a MoE arm needs the merged `in_proj_ba` owner in the MoE loader,
+// which is #1169, and it is owed.
 bool detail::ShouldUsePackedGdnDecode(
     const GdnPackedDecodeEligibility& e) {
-  return e.runtime_enabled && e.cuda && e.dense_model && e.has_packed_ba &&
+  return e.runtime_enabled && e.cuda && e.has_packed_ba &&
          e.merged_ba_enabled && e.dtype_compatible && e.has_state_indices &&
          e.num_prefills == 0 && e.num_prefill_tokens == 0 &&
          e.num_spec_decodes == 0 && e.num_spec_decode_tokens == 0 &&
@@ -100,7 +124,12 @@ vt::DType detail::GdnProjectedMixedQkvDType(const GdnMixedQkvDTypeInputs& in) {
 // in the ONE place both the producer and the predictor read. See the header for
 // why each term is required; the short version is that the toggle is the opt-in,
 // `indt` keeps VT_GDN_IN_BF16's rollback honest on this arm too, and `outdt`
-// confines the narrowing to the dense 27B.
+// keeps the chain dtype-uniform. `outdt` used to be described as what "confines
+// the narrowing to the dense 27B"; GDN-MOE-BF16-OUT (#1168) removed the
+// model-shape argument from `GdnOutDType`, so `outdt` is BF16 on BOTH arms at
+// the default and confines nothing. The DEFAULT-OFF `VT_GDN_FP8_IN_BF16` toggle
+// (`GdnFp8InBf16Enabled`, which requires a leading '1') is now the only term
+// keeping this inert on the 35B.
 vt::DType detail::GdnFp8MergedMixedQkvDType(bool fp8_in_bf16_enabled,
                                            vt::DType in_dtype,
                                            vt::DType out_dtype) {
@@ -124,6 +153,28 @@ bool detail::GdnPackedDecodeDTypesCompatible(const GdnPackedDecodeDTypes& d) {
 // Default OFF: ON only for a '1'-leading value (vt::cuda::GdnPackedRegTileFlagIsOn).
 bool detail::PackedGdnDecodeFp8TowerFlagIsOn(const char* env_value) {
   return env_value != nullptr && env_value[0] == '1';
+}
+
+// GDN-MOE-BF16-OUT (#1168) — VT_GDN_OUT_BF16, default ON, parsed here so the CPU
+// tier can pin the truth table that GdnOutDType() caches. There is no model-shape
+// term: the environment is the whole decision, on the dense and the MoE arms
+// alike, exactly as upstream resolves one model dtype for every layer.
+bool detail::GdnOutBf16FlagIsOn(const char* env_value) {
+  return env_value == nullptr || env_value[0] != '0';
+}
+
+// ...and the RESOLVER that consumes it, here rather than in the anonymous
+// namespace below so the CPU tier can call the thing the model calls. Pinning
+// the parser alone does not pin that anything reads it: a `GdnOutDType()`
+// hardwired to BF16 keeps every default-environment gate green, and the
+// documented `VT_GDN_OUT_BF16=0` rollback then silently stops rolling back. See
+// the header for why that matters more here than coverage — the variable is the
+// denominator of this row's same-binary A/B. The full derivation of WHAT this
+// dtype is stays at the `using` declaration below, next to the call sites.
+vt::DType detail::GdnOutDType() {
+  static const bool bf16 =
+      detail::GdnOutBf16FlagIsOn(std::getenv("VT_GDN_OUT_BF16"));
+  return bf16 ? vt::DType::kBF16 : vt::DType::kF32;
 }
 
 bool detail::ShouldUseMergedGdnQkvz(const GdnMergedQkvzEligibility& e) {
@@ -181,6 +232,40 @@ void detail::DisableGdnFp8InProjDebugStats() {
   g_gdn_fp8_inproj_debug_enabled.store(false, std::memory_order_release);
 }
 
+namespace {
+// GDN-MOE-BF16-OUT (#1168). What the last NON-MIXED-SPEC paged GDN layer actually
+// allocated and projected, recorded off the tensors themselves rather than off
+// the predicate. `GdnBlockPagedMixedSpec` is a paged GDN layer too and records
+// nothing, the stores are unconditional (the fp8 sibling above is default-off),
+// and they happen at graph CAPTURE and not at replay. The header states all
+// three; none of them is what the shape of this code suggests.
+std::atomic<bool> g_gdn_out_dtypes_observed{false};
+std::atomic<int> g_gdn_out_core_dtype{static_cast<int>(vt::DType::kF32)};
+std::atomic<int> g_gdn_out_z_dtype{static_cast<int>(vt::DType::kF32)};
+
+void RecordGdnOutActivationDTypes(vt::DType core_out, vt::DType z_gate) {
+  g_gdn_out_core_dtype.store(static_cast<int>(core_out), std::memory_order_relaxed);
+  g_gdn_out_z_dtype.store(static_cast<int>(z_gate), std::memory_order_relaxed);
+  g_gdn_out_dtypes_observed.store(true, std::memory_order_release);
+}
+}  // namespace
+
+void detail::ResetGdnOutActivationDTypes() {
+  g_gdn_out_dtypes_observed.store(false, std::memory_order_release);
+  g_gdn_out_core_dtype.store(static_cast<int>(vt::DType::kF32), std::memory_order_relaxed);
+  g_gdn_out_z_dtype.store(static_cast<int>(vt::DType::kF32), std::memory_order_relaxed);
+}
+
+detail::GdnOutActivationDTypes detail::LastGdnOutActivationDTypes() {
+  GdnOutActivationDTypes out;
+  out.observed = g_gdn_out_dtypes_observed.load(std::memory_order_acquire);
+  out.core_out =
+      static_cast<vt::DType>(g_gdn_out_core_dtype.load(std::memory_order_relaxed));
+  out.z_gate =
+      static_cast<vt::DType>(g_gdn_out_z_dtype.load(std::memory_order_relaxed));
+  return out;
+}
+
 bool detail::PackedGdnDecodeEnvSelected(const GdnPackedDecodeEnvConfig& env) {
   // Mirror PackedGdnDecodeRuntimeEnabled: enabled unless first char is '0'.
   const bool runtime_enabled =
@@ -190,8 +275,8 @@ bool detail::PackedGdnDecodeEnvSelected(const GdnPackedDecodeEnvConfig& env) {
       !(env.merged_proj != nullptr && env.merged_proj[0] == '0') &&
       (env.merged_ba == nullptr || env.merged_ba[0] != '0');
   // Mirror the dtype_compatible expression on the real 27B dense gate:
-  // GdnInDType (default BF16), GdnOutDType dense default (BF16; override
-  // '0' -> F32), MergedGdnBaOutputDType(packed) (default BF16 under packed;
+  // GdnInDType (default BF16), GdnOutDType (default BF16 on every arm since
+  // #1168; override '0' -> F32), MergedGdnBaOutputDType(packed) (default BF16 under packed;
   // override '0' -> F32). The SSM cache dtype term is always a float dtype.
   const bool in_bf16 = env.in_bf16 == nullptr || env.in_bf16[0] != '0';
   const bool out_bf16 = env.out_bf16 == nullptr || env.out_bf16[0] != '0';
@@ -2273,6 +2358,13 @@ DBuf SigmoidGateOProjD(Dev d, const Tensor& attn2d, const Tensor& gate2d,
 #endif
   DBuf gated(d, DType::kBF16, {T, K});
   vt::SigmoidGateBf16(d.q, gated.t(), attn2d, gate2d);
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first, out_dtype bf16 --
+  // the same dtype every other arm of this o_proj returns.
+  if (!w.o_proj_fp8_block.Empty()) {
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated.t(),
+                                                        w.o_proj_fp8_block,
+                                                        DType::kBF16);
+  }
   return !w.o_proj_fp8.Empty() ? MatmulFp8CutlassD(d, gated.t(), w.o_proj_fp8, DType::kBF16)
          : fp4 ? MatmulNvfp4Bf16D(d, gated.t(), w.o_proj_fp4)
                : MatmulBf16D(d, gated.t(), w.o_proj);  // [T,H]
@@ -2380,7 +2472,18 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
       (Bf16GemmOutEnabled() && out.fp4) ? DType::kBF16 : DType::kF32;
   const auto project = [&](const Nvfp4Weight& fp4_weight,
                            const Fp8Weight& fp8_weight,
+                           const Fp8BlockWeight& block_weight,
                            const OwnedTensor& plain_weight) -> DBuf {
+    // MODEL-FP8-BLOCK-LINEAR (#1189 M4). FIRST, and exclusive: M3's loader
+    // fills the block field and leaves the bf16, per-tensor fp8 and fp4 ones
+    // EMPTY (qwen3_5_dense_weights.cpp), so a non-empty block weight IS the
+    // scheme. `out_dtype` is bf16 because that is upstream's `out_dtype` here
+    // -- the MODEL dtype (fp8.py:284) -- not the f32 the per-tensor arm below
+    // happens to use; a token gate cannot see a dtype that is too wide.
+    if (!block_weight.Empty()) {
+      return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, h, block_weight,
+                                                          DType::kBF16);
+    }
     if (fuse_qkv) {
       return MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(),
                                     fp4_weight, q_out_dt, qkv_sf_sw_p);
@@ -2403,11 +2506,11 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
                            : MatmulF32D(d, h, plain_weight);
   };
   out.q_owner.emplace(
-      project(w.q_proj_fp4, w.q_proj_fp8, w.q_proj));
+      project(w.q_proj_fp4, w.q_proj_fp8, w.q_proj_fp8_block, w.q_proj));
   out.k_owner.emplace(
-      project(w.k_proj_fp4, w.k_proj_fp8, w.k_proj));
+      project(w.k_proj_fp4, w.k_proj_fp8, w.k_proj_fp8_block, w.k_proj));
   out.v_owner.emplace(
-      project(w.v_proj_fp4, w.v_proj_fp8, w.v_proj));
+      project(w.v_proj_fp4, w.v_proj_fp8, w.v_proj_fp8_block, w.v_proj));
   out.qgate = out.q_owner->t();
   out.key = out.k_owner->t();
   out.value = out.v_owner->t();
@@ -3168,8 +3271,8 @@ bool GdnFp8InBf16Enabled() {
   return on;
 }
 
-// GDN recurrence-OUTPUT + z-gate in bf16 (27B default ON; 35B keeps its former
-// f32 default; VT_GDN_OUT_BF16=0/1 overrides both for diagnostics).
+// GDN recurrence-OUTPUT + z-gate in bf16, on EVERY arm (default ON;
+// VT_GDN_OUT_BF16=0 is the same-binary f32 rollback).
 // vLLM keeps core_attn_out and the z gate bf16 (the gated-RMSNorm consumes them):
 // FLA chunk_o.py stores o bf16, and Qwen3NextGatedRMSNorm reads bf16 core/gate,
 // upcasting to f32 only for the variance reduction (layernorm_guard.py). Our
@@ -3184,18 +3287,26 @@ bool GdnFp8InBf16Enabled() {
 // this lever is the f32 `dcore` recurrence output that attempt left untouched.
 // This is correctness-significant for the 27B: with the repaired full NVFP4
 // tactic stack, f32 core/z takes the alternate whitespace near-tie branch while
-// bf16 reproduces native vLLM 16/16. Keep every unmeasured 35B arm, including
-// GGUF, on its prior f32 default; the explicit env override remains available
-// for its later independently gated campaign.
-DType GdnOutDType(bool dense_model) {
-  static const int override = [] {
-    const char* e = std::getenv("VT_GDN_OUT_BF16");
-    if (e == nullptr) return -1;
-    return e[0] == '0' ? 0 : 1;
-  }();
-  const bool bf16 = override >= 0 ? override != 0 : dense_model;
-  return bf16 ? DType::kBF16 : DType::kF32;
-}
+// bf16 reproduces native vLLM 16/16.
+//
+// GDN-MOE-BF16-OUT (#1168) removed the `bool dense_model` parameter this used to
+// default to. It resolved bf16 for a dense checkpoint and f32 for a MoE one, and
+// all three call sites passed `cfg.num_experts == 0`, so every MoE checkpoint
+// carried `dcore`, `z` and the gated-norm weight at double width. Upstream does
+// not branch on model shape anywhere on this path — `Qwen3_5ForCausalLMBase`
+// (vllm/model_executor/models/qwen3_5.py:280-297 @ 5559679) is the shared base of
+// the dense and MoE causal-LM arms — and the deferral quoted above ("keep every
+// unmeasured 35B arm on its prior f32 default") named its own successor campaign,
+// which this is. The parameter is gone rather than defaulted because a signature
+// that accepts a model shape makes the default unreadable at the definition and
+// lets a new call site reintroduce the split silently. VT_GDN_OUT_BF16=0 is now
+// the f32 rollback for BOTH arms rather than for the dense one alone.
+//
+// Fresh-review repair: the definition moved up beside `GdnOutBf16FlagIsOn` and
+// into `detail::`, so that a gate can observe the RESOLVER and not only its
+// parser. Nothing about the resolution changed. The call sites below are
+// unqualified and keep reading it through this declaration.
+using detail::GdnOutDType;
 
 // bf16 residual stream (default ON). vLLM runs the 35B in bf16
 // (model_config.dtype=bfloat16): qwen3_next.py keeps `residual` as the bf16 hidden
@@ -3529,8 +3640,11 @@ DBuf MergedFp8QkvzD(Dev d, const Tensor& x, const Tensor* h_fp8,
 // resident owner is shared by both arms: the fallback slices its output ROWS
 // (dim-0 raw-NK slices stay contiguous) and issues the two legacy GEMMs at
 // their independent dtypes, never retaining duplicate split weights. The
-// merged arm requires one uniform output dtype (GdnInDType == GdnOutDType; the
-// 27B default is BF16/BF16, matching vLLM's model-dtype projection).
+// merged arm requires one uniform output dtype (GdnInDType == GdnOutDType, and
+// since GDN-MOE-BF16-OUT (#1168) that is BF16/BF16 on every arm, matching vLLM's
+// model-dtype projection). The uniformity term therefore no longer excludes a
+// MoE checkpoint; `has_packed_qkvz` still does, because no MoE or GGUF loader
+// builds the merged `in_proj_qkvz` owner either — the same gap as #1169's.
 // VT_GDN_MERGED_QKVZ=0 (or master VT_GDN_MERGED_PROJ=0) restores the split
 // GEMMs from the same binary and the same resident owner.
 bool MergedGdnQkvzEnabled(Dev d) {
@@ -3595,11 +3709,17 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
   //      narrowing is not value-neutral),
   //   2. indt == BF16, i.e. VT_GDN_IN_BF16 is on (its default) — this IS the
   //      lever being unblocked, so honouring its rollback is mandatory,
-  //   3. outdt == BF16. This is what confines the change to the 27B: the 35B is
-  //      MoE, so GdnOutDType(dense_model=false) is f32 by default and this stays
-  //      inert there. It also keeps the whole chain dtype-uniform, which the
-  //      downstream contracts need — vt::RmsNormGatedQuantFp8 requires
+  //   3. outdt == BF16, which keeps the whole chain dtype-uniform — the
+  //      downstream contracts need that: vt::RmsNormGatedQuantFp8 requires
   //      gate.dtype == x.dtype (ops.cpp), and `z` below is exactly that gate.
+  //      This term USED to read "confines the change to the 27B, because the
+  //      35B is MoE and GdnOutDType(dense_model=false) is f32 there". #521
+  //      asked for that correction and GDN-MOE-BF16-OUT (#1168) is what makes
+  //      it wrong: outdt is BF16 on every arm now. What still keeps this leaf
+  //      inert on the 35B is condition 1, the DEFAULT-OFF VT_GDN_FP8_IN_BF16
+  //      toggle — a toggle term, not a model-shape one. Nothing moves by
+  //      default in either merge order, but whoever turns that toggle on owns
+  //      measuring the 35B too (#417).
   // PERF-GDN-PACKED-BRIDGE (#365): PERF-FP8-ALPHA-FOLD's three-term decision,
   // moved into the shared `GdnFp8MergedInProjDType` so the PRODUCER (this line,
   // which reaches MergedFp8QkvzD and allocates the buffer) and the PREDICTOR
@@ -3676,6 +3796,19 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
                                      GdnFp8MergedInProjDType(indt, outdt)}),
              "qwen3_5 split FP8 GDN qkv: the allocated mixed_qkv dtype and the "
              "packed-decode prediction disagree (GdnProjectedMixedQkvDType)");
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first on both projections.
+  // `indt`/`outdt` rather than a literal bf16 here, because the packed-decode
+  // predictor above derives the SAME dtype for this arm and a disagreement
+  // makes vt::GdnPackedDecode throw.
+  if (!w.in_proj_qkv_fp8_block.Empty()) {
+    out.mixed_owner.emplace(dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, h, w.in_proj_qkv_fp8_block, indt));
+    out.z_owner.emplace(dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, h, w.in_proj_z_fp8_block, outdt));
+    out.mixed = out.mixed_owner->t();
+    out.z = out.z_owner->t();
+    return out;
+  }
   out.mixed_owner.emplace(
       !w.in_proj_qkv_fp8.Empty()
           ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_qkv_fp8,
@@ -3746,7 +3879,7 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // and on the merged fp8 branch too under VT_GDN_FP8_IN_BF16 (default OFF, see
   // GdnFp8InBf16Enabled). See GdnInDType().
   const DType indt = GdnInDType();
-  const DType outdt = GdnOutDType(cfg.num_experts == 0);
+  const DType outdt = GdnOutDType();
   GdnQkvzOutput qkvz =
       ProjectGdnQkvz(d, w, h, conv_dim, value_dim, indt, outdt, h_fp8);
   Tensor mixed = qkvz.mixed;  // [T,conv_dim], contiguous or row-strided view
@@ -3870,6 +4003,13 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
   // §3.6), else bf16 (default / GGUF).
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
+  // other arm of this out_proj returns.
+  if (!w.out_proj_fp8_block.Empty()) {
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_bf16.t(),
+                                                        w.out_proj_fp8_block,
+                                                        DType::kBF16);
+  }
   return !w.out_proj_fp8.Empty()
              ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
          : !w.out_proj_fp4.Empty()
@@ -4152,7 +4292,7 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
   const int64_t conv_dim = 2 * key_dim + value_dim;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
   const DType convdt = mixed.dtype;
-  const DType outdt = GdnOutDType(cfg.num_experts == 0);
+  const DType outdt = GdnOutDType();
   const DType actdt = GdnActDType();
   const float scale = 1.0F / std::sqrt(SizeF(Dk));
   g_mixed_spec_invocations.fetch_add(1, std::memory_order_relaxed);
@@ -4338,6 +4478,13 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
                      vt::RmsNormGatedArgs{eps, sigmoid_gate});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
   }
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
+  // other arm of this out_proj returns.
+  if (!w.out_proj_fp8_block.Empty()) {
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_bf16.t(),
+                                                        w.out_proj_fp8_block,
+                                                        DType::kBF16);
+  }
   return !w.out_proj_fp8.Empty()
              ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
          : !w.out_proj_fp4.Empty()
@@ -4383,7 +4530,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   const bool mixed_spec = spec && np > 0;
 
   const DType indt = GdnInDType();
-  const DType outdt = GdnOutDType(cfg.num_experts == 0);
+  const DType outdt = GdnOutDType();
   // PERF-27B-GDN-PACKED-REACHABLE (#365). `dtype_compatible` is decided by the
   // ACTIVATION dtypes vt::GdnPackedDecode requires, not by how the GDN weights
   // are stored. `mixed_qkv` has to be PREDICTED because this decision runs
@@ -4406,7 +4553,6 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
       detail::GdnPackedDecodeEligibility{
           PackedGdnDecodeRuntimeEnabled(),
           vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging(),
-          cfg.num_experts == 0,
           !w.in_proj_ba.Empty(),
           MergedGdnBaEnabled(d),
           detail::GdnPackedDecodeDTypesCompatible(
@@ -4585,6 +4731,12 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // intermediates are allocated. This mirrors vLLM v0.25.0
   // _forward_core_decode_non_spec:1644-1695.
   DBuf dcore(d, outdt, {T, Hv, Dv});
+  // GDN-MOE-BF16-OUT (#1168): read off the tensors, not off GdnOutDType, so a
+  // gate entering through ModelRegistry::Forward observes what this layer RAN.
+  // This is the ONLY recording site. The mixed spec+non-spec batch returns into
+  // GdnBlockPagedMixedSpec above and never reaches it, so a mixed step leaves
+  // the record untouched rather than stale-free — see the header's limits.
+  RecordGdnOutActivationDTypes(dcore.t().dtype, z.dtype);
   const float scale = 1.0F / std::sqrt(SizeF(Dk));
   if (packed_decode) {
     Tensor gidx = SubView(sdi.gdn_state_idx.t(), 0, nd);
@@ -4786,6 +4938,13 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
   // §3.6), else bf16 (default / GGUF).
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
+  // other arm of this out_proj returns.
+  if (!w.out_proj_fp8_block.Empty()) {
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_bf16.t(),
+                                                        w.out_proj_fp8_block,
+                                                        DType::kBF16);
+  }
   return !w.out_proj_fp8.Empty()
              ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
          : !w.out_proj_fp4.Empty()
@@ -5081,6 +5240,34 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   pa_args.max_seq_len = meta.max_seq_len;
   vt::PagedAttention(d.q, dattn.t(), qn3, k_cache, v_cache, dblk, dsl, dqsl, pa_args);
 
+  // VT_DUMP_ATTN (issue #41, 0.8B ROCm divergence spike W1/W2): dump the
+  // full-attn block's internals per full-attn-layer call index (0-based), as
+  // raw little-endian dumps under $VT_DUMP_ATTN/fa<k>_{qkv,q,attn,gate}.bin.
+  // Inert when unset; the Downloads sync, so never set on a graph path.
+  static thread_local int64_t dump_fa_idx = -1;
+  dump_fa_idx++;
+  if (std::getenv("VT_DUMP_ATTN") != nullptr) {
+    auto DumpT = [&](const char* stage, const Tensor& t) {
+      int64_t n = 1;
+      for (int i = 0; i < t.rank; ++i) n *= t.shape[i];
+      const size_t es = vt::SizeOf(t.dtype);
+      // contiguous check: innermost stride 1 and packed
+      std::vector<uint8_t> raw(static_cast<size_t>(n) * es);
+      DBuf tmp(d, t.dtype, {n});
+      d.b.Copy(d.q, tmp.ptr(), t.data, raw.size());
+      tmp.Download(d, raw.data());
+      const std::string path = std::string(std::getenv("VT_DUMP_ATTN")) +
+                               "/fa" + std::to_string(dump_fa_idx) + "_" +
+                               stage + ".bin";
+      std::FILE* f = std::fopen(path.c_str(), "wb");
+      if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+    };
+    DumpT("qkv", qgate);
+    DumpT("q", qn3);
+    DumpT("attn", dattn.t());
+    DumpT("gate", gatef.t());
+  }
+
   // Sigmoid output gate, folded into the o_proj activation quant on the true-W4A4
   // path (§5) — see SigmoidGateOProjD.
   return SigmoidGateOProjD(d, Reshape(dattn.t(), {T, Hq * Dh}),
@@ -5146,11 +5333,28 @@ Tensor KqResidentSlice(Dev d, const OwnedTensor& w, int64_t N, int64_t K,
 // Whether the operator ASKED for streaming, independent of whether a store has
 // been built yet. The grouped-MoE gate needs this before any expert is touched.
 inline bool Qwen35ExpertStreamRequested() {
-  static const bool on = [] {
-    const char* v = std::getenv("VT_MOE_EXPERT_STREAM");
-    return v != nullptr && v[0] != '0' && v[0] != '\0';
-  }();
-  return on;
+  // ENG-RESIDENCY-CONFIG (#1110): the answer now comes from
+  // `ResolveExpertStreamRequested()`, which holds `VT_MOE_EXPERT_STREAM` >
+  // `--offload-config`'s `vllm_cpp.expert_stream.enabled` > OFF, and which keeps
+  // this knob's ODD environment rule verbatim: only the FIRST CHARACTER is
+  // examined, so `VT_MOE_EXPERT_STREAM=false` is ON. That is what
+  // docs/ENVIRONMENT.md documents, so it is transcribed rather than normalised
+  // onto the tree's whole-value polarity.
+  //
+  // The answer is still cached on first call, and that is deliberate — it decides
+  // whether an ~18 GiB slot store is built and whether the default-on grouped-MoE
+  // path is disabled, and those two must not be able to disagree later in the same
+  // process. The function-local static lives in `ResolveExpertStreamRequested`, not
+  // here; this is a pure delegation.
+  //
+  // That cached answer is why `SetWeightResidencyConfig` refuses a config that would
+  // CHANGE it — not one that arrives late. A document that omits `expert_stream`, or
+  // asks for exactly what was decided, or that the environment overrides anyway, is
+  // accepted; only one that would make this function's answer differ from the value
+  // already returned is refused, because recording that would publish a
+  // configuration the engine is not running. The loader installs in `FromModelDir`'s
+  // first block, ahead of all weight I/O, so the ordering holds by construction.
+  return ResolveExpertStreamRequested();
 }
 
 class Qwen35ExpertStream {
@@ -5437,22 +5641,35 @@ class Qwen35ExpertStream {
   }
 
   explicit Qwen35ExpertStream(size_t slot_bytes) {
-    const char* sb = std::getenv("VT_MOE_EXPERT_STREAM_SLOT_BYTES");
-    if (sb != nullptr && *sb != '\0') {
-      const long long v = std::atoll(sb);
-      if (v > 0) slot_bytes = static_cast<size_t>(v);
-    }
-    int32_t slots = 64;
-    const char* sv = std::getenv("VT_MOE_EXPERT_STREAM_SLOTS");
-    if (sv != nullptr && *sv != '\0') {
-      const long v = std::atol(sv);
-      if (v > 0) slots = static_cast<int32_t>(v);
-    }
+    // ENG-RESIDENCY-CONFIG (#1110): both sizes resolve through the shared
+    // resolvers, which hold env var > `--offload-config`'s
+    // `vllm_cpp.expert_stream.{slots,slot_bytes}` > the default, and which keep
+    // the tolerant integer parsing this constructor already had (atoll, then
+    // ignore anything non-positive) so an environment-only run is unchanged. The
+    // CONFIG side is stricter: a zero or negative value is refused at startup,
+    // where the operator can still read the message, rather than silently becoming
+    // the default.
+    //
+    // `slot_bytes`' default is the caller's computed maximum, not a constant, so it
+    // is passed in rather than duplicated here.
+    slot_bytes = static_cast<size_t>(
+        ResolveExpertStreamSlotBytes(static_cast<int64_t>(slot_bytes)));
+    const int32_t slots = static_cast<int32_t>(ResolveExpertStreamSlots());
+    // STATS_EVERY stays environment-only, and that is a decision rather than an
+    // oversight: it changes only how often the line below is printed, so it is the
+    // instrument and not the configuration. `--offload-config` refuses it as an
+    // unknown key rather than accepting and dropping it.
     const char* se = std::getenv("VT_MOE_EXPERT_STREAM_STATS_EVERY");
     if (se != nullptr && *se != '\0') {
       const long v = std::atol(se);
       if (v >= 0) stats_every_ = static_cast<int64_t>(v);
     }
+    // Record the geometry this store was actually built with. It is the only way
+    // a test can tell that the two resolvers above were consulted: the values are
+    // otherwise visible only on a stderr line, and a site that hardcoded the
+    // default would leave every existing suite green.
+    NoteExpertStreamGeometry(static_cast<int64_t>(slots),
+                             static_cast<int64_t>(slot_bytes));
     store_ = std::make_unique<HostExpertSlotStore>(slots, slot_bytes);
     cache_ = std::make_unique<ExpertSlotCache>(slots);
     streamer_ = std::make_unique<ExpertStreamer>(*cache_, *store_);
@@ -6870,6 +7087,21 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
   // halves the GEMM write + MoeSiluMul read; else f32 (current). MoeSiluMul is
   // templated on the input dtype so both work.
   const DType gu_out = Bf16GemmOutEnabled() ? DType::kBF16 : DType::kF32;
+  // MODEL-FP8-BLOCK-LINEAR (#1189 M4). The dense SwiGLU MLP's three
+  // projections, exclusive and first. bf16 out on all three -- upstream's
+  // `out_dtype` is the model dtype (fp8.py:284) and `vt::MoeSiluMul` is
+  // templated on its input dtype, so gate/up feed it unchanged; down_proj's
+  // bf16 is what every other arm of this return already produces.
+  if (!w.gate_proj_fp8_block.Empty()) {
+    DBuf bg = dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, dh, w.gate_proj_fp8_block, DType::kBF16);
+    DBuf bu = dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, dh, w.up_proj_fp8_block, DType::kBF16);
+    DBuf bact(d, DType::kBF16, {T, I});
+    vt::MoeSiluMul(d.q, bact.t(), bg.t(), bu.t());
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(
+        d, bact.t(), w.down_proj_fp8_block, DType::kBF16);
+  }
   DBuf gate = fuse_gu ? MatmulNvfp4Fp4DirectD(d, gu_ap->t(), gu_as->t(), w.gate_proj_fp4, gu_out,
                                               gu_sf_sw_p)
               : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, dh, w.gate_proj_fp4)
@@ -7002,9 +7234,27 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
+  // VT_DUMP_ACT layer index: the paged loop's per-layer counter (0-based), used
+  // by the sub-stage dump below. Declared per-process; only the dump reads it.
+  static thread_local int64_t dump_layer_idx = -1;
+  dump_layer_idx++;
+  const bool dump_sub = std::getenv("VT_DUMP_ACT_SUB") != nullptr;
+  auto DumpStage = [&](const char* stage, DBuf& buf) {
+    if (!dump_sub) return;
+    std::vector<uint8_t> raw(static_cast<size_t>(T) * static_cast<size_t>(H) *
+                             vt::SizeOf(buf.t().dtype));
+    buf.Download(d, raw.data());
+    const std::string path = std::string(std::getenv("VT_DUMP_ACT_SUB")) +
+                             "/layer_" + std::to_string(dump_layer_idx) + "_" +
+                             stage + ".bin";
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+  };
+
   Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
   DBuf dhn(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dhn.t(), hidden.t(), dw_in, vt::RmsNormArgs{eps, true}, &res.t());
+  DumpStage("post_input_norm", dhn);
 
   DBuf attn = [&] {
     if (layer.is_linear_attention) {
@@ -7017,12 +7267,15 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
     return FullAttnBlockPaged(d, layer.attn, cfg, dhn.t(), sdi, attn_meta,
                               *attn_kv, T);
   }();
+  DumpStage("block_out", attn);
 
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
+  DumpStage("post_attn_norm", dh2);
 
   hidden = DenseMlpBlock(d, layer.mlp, cfg, dh2.t(), T);
+  DumpStage("mlp_out", hidden);
 }
 
 // ── Qwen3.5/3.6 MTP head shared preamble (SPEC-MTP I5c). ────────────────────
@@ -8494,6 +8747,24 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
     // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
     // (no-op) when aux_out is null — every non-DFlash caller.
     MaybeCaptureAuxTap(d, l, aux_layer_ids, aux_out, hidden.t(), res.t(), T, H);
+    // VT_DUMP_ACT (issue #41, ROCm 0.8B forward-divergence fix spike W1): dump
+    // the residual stream after each layer as raw little-endian bf16 to
+    // $VT_DUMP_ACT/layer_<l>.bin (inert when unset; a debug hook, never the
+    // hot path — the Download forces a sync, so capture-graph paths must not
+    // set the env).
+    if (std::getenv("VT_DUMP_ACT") != nullptr) {
+      std::vector<uint8_t> raw(static_cast<size_t>(T) * static_cast<size_t>(H) *
+                               vt::SizeOf(hidden.t().dtype));
+      hidden.Download(d, raw.data());  // Copy + Synchronize
+      const char* dir = std::getenv("VT_DUMP_ACT");
+      const std::string path =
+          std::string(dir) + "/layer_" + std::to_string(l) + ".bin";
+      std::FILE* f = std::fopen(path.c_str(), "wb");
+      if (f != nullptr) {
+        std::fwrite(raw.data(), 1, raw.size(), f);
+        std::fclose(f);
+      }
+    }
   }
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
@@ -10322,8 +10593,11 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     // Drain the capture if the forward throws — see the 35B driver above for why
     // a skipped EndCaptureGraph poisons the stream permanently (#339, F-B). This
     // is the 27B DENSE driver, and it is the one that matters most here: the
-    // bf16-D fp8 lever this row guards (VT_GDN_FP8_IN_BF16) is confined to the
-    // 27B by construction, since the 35B is MoE and its GdnOutDType is f32.
+    // bf16-D fp8 lever this row guards (VT_GDN_FP8_IN_BF16) is off by DEFAULT
+    // (GdnFp8InBf16Enabled), which is the only thing keeping it inert on the
+    // 35B. It used to read "confined to the 27B by construction, since the 35B
+    // is MoE and its GdnOutDType is f32"; GDN-MOE-BF16-OUT (#1168) made outdt
+    // BF16 on both arms, so the bound is a toggle now, not a model shape.
     DBuf lg = [&] {
       try {
         return DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
