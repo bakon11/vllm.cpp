@@ -55,8 +55,10 @@ Witness the product `vt::PagedAttention` seam, not a direct WMMA kernel call.
   oracle miss, or non-zero status. No silent retry. No timing. No d=512.
 - Runner: `tests/scripts/run-785-p1.sh` (exit 78 without `VT_785_P1_GPU_GO=1`).
   Trace: `rocprofv3 --kernel-trace` parsed by `tests/scripts/parse_785_p1_trace.py`.
-  Classifier is exclusive: A = WMMA present and scalar absent; B = scalar
-  present and WMMA absent; both/none = UNKNOWN. GPU binary is an
+  Classifier separates family from exact specialization: A = exact
+  WMMA `<2,8,16,32,false>` and no SharedK family and no other WMMA;
+  B = exact scalar `<2,8,32,32>` and no WMMA family and no other scalar;
+  wrong BM/BN, wrong qg/d, mixed, or none = UNKNOWN. GPU binary is an
   `add_executable` only (not ordinary CTest). Shared fixture header
   `tests/vt/sharedk_wmma_p1_fixture.h` is used by host and GPU; GPU prints
   frozen Q/K/V SHA-256 and the runner fails on mismatch. Arms pin

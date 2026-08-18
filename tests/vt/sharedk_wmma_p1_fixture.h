@@ -287,24 +287,18 @@ inline OracleStats Score(const std::vector<float>& got, const std::vector<float>
   return s;
 }
 
-inline constexpr const char* kWmma[] = {
+inline constexpr const char* kExactWmma[] = {
     "PagedAttnPrefillSharedKWmma<2, 8, 16, 32, false>",
     "PagedAttnPrefillSharedKWmma<2,8,16,32,false>",
     "PagedAttnPrefillSharedKWmmaILi2ELi8ELi16ELi32ELb0E",
 };
-inline constexpr const char* kScalar[] = {
-    "PagedAttnPrefillSharedK<2, 8,",
-    "PagedAttnPrefillSharedK<2,8,",
-    "PagedAttnPrefillSharedKILi2ELi8E",
+inline constexpr const char* kExactScalar[] = {
+    "PagedAttnPrefillSharedK<2, 8, 32, 32>",
+    "PagedAttnPrefillSharedK<2,8,32,32>",
+    "PagedAttnPrefillSharedKILi2ELi8ELi32ELi32EE",
 };
 
-// Exclusive: A = WMMA present AND scalar absent; B = scalar present AND WMMA
-// absent; both/none/wrong specialization => '?'.
-inline char ClassifyArm(const std::string& text) {
-  bool wmma = false;
-  for (const char* m : kWmma) {
-    if (text.find(m) != std::string::npos) wmma = true;
-  }
+inline std::string ScalarLines(const std::string& text) {
   std::string filtered;
   filtered.reserve(text.size());
   size_t i = 0;
@@ -318,12 +312,50 @@ inline char ClassifyArm(const std::string& text) {
     }
     i = end == text.size() ? end : end + 1;
   }
-  bool scalar = false;
-  for (const char* m : kScalar) {
-    if (filtered.find(m) != std::string::npos) scalar = true;
+  return filtered;
+}
+
+inline bool HasAny(const std::string& text, const char* const* ms, size_t n) {
+  for (size_t i = 0; i < n; ++i) {
+    if (text.find(ms[i]) != std::string::npos) return true;
   }
-  if (wmma && !scalar) return 'A';
-  if (scalar && !wmma) return 'B';
+  return false;
+}
+
+inline std::string StripExact(const std::string& text, const char* const* ms, size_t n) {
+  std::string out = text;
+  for (size_t i = 0; i < n; ++i) {
+    for (;;) {
+      const auto pos = out.find(ms[i]);
+      if (pos == std::string::npos) break;
+      out.erase(pos, std::strlen(ms[i]));
+    }
+  }
+  return out;
+}
+
+// Family vs exact specialization:
+// A = exact WMMA <2,8,16,32,false> AND no SharedK family AND no other WMMA.
+// B = exact scalar <2,8,32,32> AND no WMMA family AND no other scalar.
+// Wrong BM/BN, wrong qg/d, mixed, or none => '?'.
+inline char ClassifyArm(const std::string& text) {
+  const auto scalar_blob = ScalarLines(text);
+  const bool exact_wmma =
+      HasAny(text, kExactWmma, sizeof(kExactWmma) / sizeof(kExactWmma[0]));
+  const bool exact_scalar = HasAny(
+      scalar_blob, kExactScalar, sizeof(kExactScalar) / sizeof(kExactScalar[0]));
+  const bool wmma_family = text.find("PagedAttnPrefillSharedKWmma") != std::string::npos;
+  const bool scalar_family =
+      scalar_blob.find("PagedAttnPrefillSharedK") != std::string::npos;
+  const bool other_wmma =
+      StripExact(text, kExactWmma, sizeof(kExactWmma) / sizeof(kExactWmma[0]))
+          .find("PagedAttnPrefillSharedKWmma") != std::string::npos;
+  const bool other_scalar =
+      StripExact(scalar_blob, kExactScalar,
+                 sizeof(kExactScalar) / sizeof(kExactScalar[0]))
+          .find("PagedAttnPrefillSharedK") != std::string::npos;
+  if (exact_wmma && !scalar_family && !other_wmma) return 'A';
+  if (exact_scalar && !wmma_family && !other_scalar) return 'B';
   return '?';
 }
 

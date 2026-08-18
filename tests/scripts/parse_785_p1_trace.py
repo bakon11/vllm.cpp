@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """#785 P1 kernel-trace classifier.
 
-Contract (Researcher bee0):
-  A (default/on): trace must contain PagedAttnPrefillSharedKWmma<2,8,16,32,false>
-  B (WMMA=0): that kernel absent; scalar PagedAttnPrefillSharedK<2,8,...> present
+Family vs exact specialization (Researcher 2609):
+  A: exact WMMA <2,8,16,32,false>; no SharedK family; no other WMMA.
+  B: exact scalar <2,8,32,32>; no WMMA family; no other scalar.
+  Wrong BM/BN, wrong qg/d, mixed, or none => UNKNOWN.
 
-WMMA's mangled/demangled name contains the SharedK prefix, so scalar
-detection ignores any line that also contains SharedKWmma.
+WMMA names contain the SharedK prefix; scalar family is scored only on
+lines that do not contain SharedKWmma.
 
 Exit 0 prints `arm=A|B|UNKNOWN` plus marker hits.
 Exit 2 = unreadable/empty input (fail closed).
@@ -17,15 +18,15 @@ import argparse
 import sys
 from pathlib import Path
 
-WMMA_MARKERS = (
+EXACT_WMMA = (
     "PagedAttnPrefillSharedKWmma<2, 8, 16, 32, false>",
     "PagedAttnPrefillSharedKWmma<2,8,16,32,false>",
     "PagedAttnPrefillSharedKWmmaILi2ELi8ELi16ELi32ELb0E",
 )
-SCALAR_MARKERS = (
-    "PagedAttnPrefillSharedK<2, 8,",
-    "PagedAttnPrefillSharedK<2,8,",
-    "PagedAttnPrefillSharedKILi2ELi8E",
+EXACT_SCALAR = (
+    "PagedAttnPrefillSharedK<2, 8, 32, 32>",
+    "PagedAttnPrefillSharedK<2,8,32,32>",
+    "PagedAttnPrefillSharedKILi2ELi8ELi32ELi32EE",
 )
 
 
@@ -46,18 +47,28 @@ def collect_text(path: Path) -> str:
     return "\n".join(chunks)
 
 
+def _scalar_blob(text: str) -> str:
+    return "\n".join(line for line in text.splitlines() if "SharedKWmma" not in line)
+
+
+def _strip_exact(text: str, markers: tuple[str, ...]) -> str:
+    out = text
+    for m in markers:
+        out = out.replace(m, "")
+    return out
+
+
 def classify(text: str) -> tuple[str, list[str], list[str]]:
-    wmma_hits = [m for m in WMMA_MARKERS if m in text]
-    scalar_blob_lines = []
-    for line in text.splitlines():
-        if "SharedKWmma" in line:
-            continue
-        scalar_blob_lines.append(line)
-    scalar_blob = "\n".join(scalar_blob_lines)
-    scalar_hits = [m for m in SCALAR_MARKERS if m in scalar_blob]
-    if wmma_hits and not scalar_hits:
+    scalar_blob = _scalar_blob(text)
+    wmma_hits = [m for m in EXACT_WMMA if m in text]
+    scalar_hits = [m for m in EXACT_SCALAR if m in scalar_blob]
+    wmma_family = "PagedAttnPrefillSharedKWmma" in text
+    scalar_family = "PagedAttnPrefillSharedK" in scalar_blob
+    other_wmma = "PagedAttnPrefillSharedKWmma" in _strip_exact(text, EXACT_WMMA)
+    other_scalar = "PagedAttnPrefillSharedK" in _strip_exact(scalar_blob, EXACT_SCALAR)
+    if wmma_hits and not scalar_family and not other_wmma:
         arm = "A"
-    elif scalar_hits and not wmma_hits:
+    elif scalar_hits and not wmma_family and not other_scalar:
         arm = "B"
     else:
         arm = "UNKNOWN"
@@ -85,10 +96,10 @@ def main(argv: list[str]) -> int:
         print(f"ERROR: expected arm={args.expect} got {arm}", file=sys.stderr)
         return 1
     if args.expect == "A" and not wmma_hits:
-        print("ERROR: A missing WMMA kernel identity", file=sys.stderr)
+        print("ERROR: A missing exact WMMA specialization", file=sys.stderr)
         return 1
     if args.expect == "B" and (wmma_hits or not scalar_hits):
-        print("ERROR: B must be scalar-only", file=sys.stderr)
+        print("ERROR: B must be exact scalar-only", file=sys.stderr)
         return 1
     return 0
 

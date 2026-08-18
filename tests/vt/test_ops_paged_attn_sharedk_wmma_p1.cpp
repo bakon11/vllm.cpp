@@ -63,7 +63,7 @@ TEST_CASE("P1 zero-variance / empty fail closed") {
   CHECK_FALSE(s.ok);
 }
 
-TEST_CASE("P1 exclusive classifier: A XOR B; both/none UNKNOWN") {
+TEST_CASE("P1 exclusive classifier: exact spec XOR; wrong family UNKNOWN") {
   const std::string a =
       "Dispatch,Kernel_Name\n"
       "0,\"void vt::rocm::(anonymous namespace)::"
@@ -74,12 +74,25 @@ TEST_CASE("P1 exclusive classifier: A XOR B; both/none UNKNOWN") {
       "PagedAttnPrefillSharedK<2, 8, 32, 32>(__hip_bfloat16*)\"\n";
   const std::string mangled_a =
       "_ZN2vt4rocm12_GLOBAL__N_127PagedAttnPrefillSharedKWmmaILi2ELi8ELi16ELi32ELb0EEEv";
+  const std::string mangled_b =
+      "_ZN2vt4rocm12_GLOBAL__N_124PagedAttnPrefillSharedKILi2ELi8ELi32ELi32EEEv";
   const std::string empty = "Dispatch,Kernel_Name\n";
+  const std::string wrong_scalar =
+      "PagedAttnPrefillSharedK<2, 8, 16, 32>";
+  const std::string d512_scalar =
+      "PagedAttnPrefillSharedK<2, 16, 16, 16>";
+  const std::string wrong_wmma =
+      "PagedAttnPrefillSharedKWmma<2, 8, 16, 16, false>";
   CHECK(ClassifyArm(a) == 'A');
   CHECK(ClassifyArm(b) == 'B');
   CHECK(ClassifyArm(mangled_a) == 'A');
+  CHECK(ClassifyArm(mangled_b) == 'B');
   CHECK(ClassifyArm(empty) == '?');
   CHECK(ClassifyArm(a + b) == '?');
+  CHECK(ClassifyArm(wrong_scalar) == '?');
+  CHECK(ClassifyArm(d512_scalar) == '?');
+  CHECK(ClassifyArm(wrong_wmma) == '?');
+  CHECK(ClassifyArm(std::string("PagedAttnPrefillSharedKILi2ELi8ELi16ELi32EE")) == '?');
 }
 
 TEST_CASE("P1 eligibility pins SharedK d=256 qg=2 T>=64 one request") {
