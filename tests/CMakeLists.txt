@@ -1530,6 +1530,9 @@ set_tests_properties(test_backend_cross_device_vt_attn_decode_d128 PROPERTIES
 # of that skeleton carrying a DECISION is gated on a CPU-only CI runner with no
 # AMD GPU. The rest of the ROCm skeleton is under VLLM_CPP_HIP below.
 vllm_cpp_add_test(test_rocm_arch vt/test_rocm_arch.cpp)
+# #785 P1 host package (fixture/oracle/trace classifier). CPU-only.
+vllm_cpp_add_test(test_ops_paged_attn_sharedk_wmma_p1
+  vt/test_ops_paged_attn_sharedk_wmma_p1.cpp)
 vllm_cpp_add_test(test_triton_aot_arch_dispatch
   vt/test_triton_aot_arch_dispatch.cpp)
 target_include_directories(test_triton_aot_arch_dispatch PRIVATE
@@ -1542,6 +1545,9 @@ if(VLLM_CPP_HIP)
   # Plain C++ (no HIP header): every assertion goes through the vt:: seam. Each
   # case no-ops when the build has HIP but the box has no AMD GPU.
   vllm_cpp_add_test(test_rocm_backend vt/test_rocm_backend.cpp)
+  # #785 P1 GPU product-seam witness. Fail-closed (exit 5) unless VT_785_P1_GPU=1.
+  vllm_cpp_add_test(test_ops_paged_attn_sharedk_wmma_p1_gpu
+    vt/test_ops_paged_attn_sharedk_wmma_p1_gpu.cpp)
 endif()
 if(VLLM_CPP_METAL)
   vllm_cpp_add_test(test_metal_backend vt/test_metal_backend.cpp)

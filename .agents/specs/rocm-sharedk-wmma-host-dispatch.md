@@ -36,13 +36,28 @@ Measured KD on that object (fields after `.name`):
 |---|---|---|---|---|---|
 | `<2,8,16,32,false>` | d=256 | 151 | **0** | **0** | 4880 |
 
-P1 (not this head): gfx1201 witness that the d=256 SharedKWmma
-instantiation actually dispatches, plus same-build forced-scalar vs
-oracle. No d=512 GPU work in this lane. GPU HOLD until Researcher
-greens this repaired P0.
+P1 (this package; GPU HOLD):
+
+Witness the product `vt::PagedAttention` seam, not a direct WMMA kernel call.
+
+- Fixture: BF16 Q/K/V/out, d=256, qg=2 (hq=2,hk=1), T=64, one request,
+  causal, sliding window left=32 right=0, scale=1/sqrt(256),
+  seeds 78525601/02/03. Tensor SHA-256 frozen in
+  `tests/vt/test_ops_paged_attn_sharedk_wmma_p1.cpp`.
+- A/B same binary, separate processes (`VT_ATTN_PREFILL_SHAREDK_WMMA` is
+  process-static). A = default/on, exact kernel
+  `PagedAttnPrefillSharedKWmma<2,8,16,32,false>`. B = `=0`, that kernel
+  absent, scalar `PagedAttnPrefillSharedK<2,8,...>` present.
+- Both vs the same host f32 oracle. Preregistered BF16 bar:
+  `abs(got-ref) <= 1.5e-2 + 1.0e-2*|ref|`, `corr>=0.999`, no nonfinite.
+  Candidate-vs-scalar distance is reported; bit identity is not required.
+- Fail closed on skip, missing trace, wrong kernel identity, nonfinite,
+  oracle miss, or non-zero status. No silent retry. No timing. No d=512.
+- Runner: `tests/scripts/run-785-p1.sh` (exit 78 without `VT_785_P1_GPU_GO=1`).
+  Trace: `rocprofv3 --kernel-trace` parsed by `tests/scripts/parse_785_p1_trace.py`.
 
 ## Owed
 
-- P1 d=256 dispatch witness + scalar-vs-oracle
+- Researcher review of this P1 package, then GPU GO/HOLD
 - Separate kernel repair before any d=512 WMMA launch
 - PR body (never-ran consequence + expected d=256 uplift)
