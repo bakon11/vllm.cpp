@@ -635,12 +635,25 @@ bool RunGemma4Fp8TopKIndexedOnExpertDevice(vt::Queue& compute_q, int expert_dev,
 
   hipStream_t est = static_cast<hipStream_t>(tls.eq.handle);
   auto retire_fail = [&]() -> bool {
-    if (est) (void)hipStreamSynchronize(est);
-    if (cst) (void)hipStreamSynchronize(cst);
+    if (est) {
+      (void)hipSetDevice(expert_dev);
+      (void)hipStreamSynchronize(est);
+    }
+    if (cst) {
+      (void)hipSetDevice(compute_dev);
+      (void)hipStreamSynchronize(cst);
+    }
+    (void)hipSetDevice(compute_dev);
     return false;
   };
-  // Steady-state: no hipSetDevice between stream ops (graph-prep + less driver tax).
+  // Current-device ownership is explicit. HIP stream ops and peer copies run
+  // under the stream's owning device. RestoreComputeDev restores compute on
+  // every exit. The prior "no hipSetDevice" claim was false: init left
+  // current=expert and success set compute, so only the first peer call saw
+  // the expert current-device.
+  if (hipSetDevice(compute_dev) != hipSuccess) return retire_fail();
   if (hipEventRecord(tls.ev_c, cst) != hipSuccess) return retire_fail();
+  if (hipSetDevice(expert_dev) != hipSuccess) return retire_fail();
   if (hipStreamWaitEvent(est, tls.ev_c, 0) != hipSuccess) return retire_fail();
 
   auto peer = [&](void* dst, const void* src, size_t n) -> bool {
@@ -656,10 +669,10 @@ bool RunGemma4Fp8TopKIndexedOnExpertDevice(vt::Queue& compute_q, int expert_dev,
     return retire_fail();
 
   if (hipEventRecord(tls.ev_e, est) != hipSuccess) return retire_fail();
+  if (hipSetDevice(compute_dev) != hipSuccess) return retire_fail();
   if (hipStreamWaitEvent(cst, tls.ev_e, 0) != hipSuccess) return retire_fail();
   if (hipMemcpyPeerAsync(ysum_compute, compute_dev, tls.y, expert_dev, hb, cst) != hipSuccess)
     return retire_fail();
-  if (hipSetDevice(compute_dev) != hipSuccess) return retire_fail();
   return true;
 }
 
