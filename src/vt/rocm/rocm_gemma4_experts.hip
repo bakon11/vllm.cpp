@@ -680,10 +680,12 @@ bool RetireGemma4Fp8TopKIndexedPeer(vt::Queue& compute_q, int expert_dev) {
   const int compute_dev = compute_q.device.index;
   hipStream_t cst = static_cast<hipStream_t>(compute_q.handle);
   bool ok = true;
+  if (compute_dev >= 0 && hipSetDevice(compute_dev) != hipSuccess) ok = false;
   if (cst && hipStreamSynchronize(cst) != hipSuccess) ok = false;
   auto& tls = g_idx_peer_tls;
   if (tls.eq_live && tls.cdev == compute_dev && (expert_dev < 0 || tls.edev == expert_dev)) {
     hipStream_t est = static_cast<hipStream_t>(tls.eq.handle);
+    if (tls.edev >= 0 && hipSetDevice(tls.edev) != hipSuccess) ok = false;
     if (est && hipStreamSynchronize(est) != hipSuccess) ok = false;
   }
   if (compute_dev >= 0 && hipSetDevice(compute_dev) != hipSuccess) ok = false;
