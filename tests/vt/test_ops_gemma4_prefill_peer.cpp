@@ -183,7 +183,7 @@ struct PeerSlot {
   } eq;
 };
 struct PeerTls {
-  PeerSlot s[2];
+  PeerSlot s[1];
 };
 PeerTls& PeerPipeTls() {
   static PeerTls t;
@@ -315,6 +315,11 @@ TEST_CASE("prefill peer wrapper uses slot 0 only") {
   const std::string hip = ReadHip();
   CHECK(hip.find("LaunchGemma4Fp8ExpertGeGLUPrefillPeer(compute_q, /*slot=*/0") != std::string::npos);
   CHECK(hip.find("FinishGemma4Fp8ExpertGeGLUPrefillPeer(compute_q, /*slot=*/0") != std::string::npos);
+  CHECK(hip.find("PeerSlot s[1]") != std::string::npos);
+  CHECK(hip.find("PeerSlot s[2]") == std::string::npos);
+  CHECK(hip.find("if (slot != 0 || !x_compute") != std::string::npos);
+  CHECK(hip.find("if (slot != 0 || !y_compute") != std::string::npos);
+  CHECK(hip.find("slot < 0 || slot > 1") == std::string::npos);
 }
 
 TEST_CASE("prefill peer failed retirement quarantines pin") {

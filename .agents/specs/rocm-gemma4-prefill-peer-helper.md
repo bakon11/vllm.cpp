@@ -215,7 +215,6 @@ is discharged. Named here rather than left to be discovered, per AGENTS.md
      HEAD/binary/recipe in `docs/BENCHMARKS.md` + `.agents/benchmark-record.md`.
      Expensive → next-row; the correctness wait stays.
 
-- **`PeerSlot s[2]` — narrow to `[1]` (Researcher ca41).** Do not invent slot-1
-  overlap wiring in this merge-gating pass. Proposed CPU repair after ACK:
-  `s[2]` → `s[1]`, Launch/Finish fail-closed on `slot != 0`, keep the existing
-  slot-0 source invariant. No GPU.
+- **`PeerSlot s[1]` SOURCE FIXED (Researcher ca41).** No slot-1 overlap wiring.
+  Launch/Finish fail-closed on `slot != 0`. Wrapper still hardcodes `/*slot=*/0`.
+  GPU not required for this item.

@@ -744,7 +744,7 @@ struct PeerSlot {
 };
 
 struct PeerPipe {
-  PeerSlot s[2];
+  PeerSlot s[1];  // slot 0 only; overlap slot-1 is a later row
 };
 
 inline PeerPipe& PeerPipeTls() {
@@ -933,7 +933,7 @@ bool LaunchGemma4Fp8ExpertGeGLUPrefillPeer(vt::Queue& compute_q, int slot, int e
                                            const void* s_gu, const void* fp8_dn, const void* s_dn,
                                            int M, int I, int H) {
   try {
-  if (slot < 0 || slot > 1 || !x_compute || !fp8_gu || !s_gu || !fp8_dn || !s_dn || M <= 0 ||
+  if (slot != 0 || !x_compute || !fp8_gu || !s_gu || !fp8_dn || !s_dn || M <= 0 ||
       I <= 0 || H <= 0 || expert_dev < 0)
     return false;
   const int compute_dev = compute_q.device.index;
@@ -1133,7 +1133,7 @@ bool LaunchGemma4Fp8ExpertGeGLUPrefillPeer(vt::Queue& compute_q, int slot, int e
 bool FinishGemma4Fp8ExpertGeGLUPrefillPeer(vt::Queue& compute_q, int slot, void* y_compute, int M,
                                            int H) {
   try {
-  if (slot < 0 || slot > 1 || !y_compute || M <= 0 || H <= 0) return false;
+  if (slot != 0 || !y_compute || M <= 0 || H <= 0) return false;
   PeerSlot& tls = PeerPipeTls().s[slot];
   if (tls.pending_M <= 0 || !tls.y || !tls.ev_e) return false;
   if (M > tls.pending_M) return false;
