@@ -1542,12 +1542,23 @@ target_include_directories(test_cpu_isa_x86 PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_cpu_isa_arm vt/test_cpu_isa_arm.cpp)
 target_include_directories(test_cpu_isa_arm PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(VLLM_CPP_HIP)
-  # Plain C++ (no HIP header): every assertion goes through the vt:: seam. Each
-  # case no-ops when the build has HIP but the box has no AMD GPU.
-  vllm_cpp_add_test(test_rocm_backend vt/test_rocm_backend.cpp)
-  # #785 P1 GPU product-seam witness. Fail-closed (exit 5) unless VT_785_P1_GPU=1.
-  vllm_cpp_add_test(test_ops_paged_attn_sharedk_wmma_p1_gpu
-    vt/test_ops_paged_attn_sharedk_wmma_p1_gpu.cpp)
+# Plain C++ (no HIP header): every assertion goes through the vt:: seam. Each
+# case no-ops when the build has HIP but the box has no AMD GPU.
+vllm_cpp_add_test(test_rocm_backend vt/test_rocm_backend.cpp)
+# #785 P1 GPU product-seam witness. Executable only — NOT add_test.
+# Ordinary CTest must not see this target. Runner fail-closes on 77/nonzero.
+add_executable(test_ops_paged_attn_sharedk_wmma_p1_gpu
+  vt/test_ops_paged_attn_sharedk_wmma_p1_gpu.cpp)
+target_include_directories(test_ops_paged_attn_sharedk_wmma_p1_gpu PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR})
+if(TARGET vllm::sanitize_test_shared)
+  target_link_libraries(test_ops_paged_attn_sharedk_wmma_p1_gpu PRIVATE
+    vllm::sanitize_test_shared vllm_test_main)
+else()
+  target_link_libraries(test_ops_paged_attn_sharedk_wmma_p1_gpu PRIVATE
+    vllm::vllm vllm_test_main)
+endif()
+vllm_cpp_set_warnings(test_ops_paged_attn_sharedk_wmma_p1_gpu)
 endif()
 if(VLLM_CPP_METAL)
   vllm_cpp_add_test(test_metal_backend vt/test_metal_backend.cpp)

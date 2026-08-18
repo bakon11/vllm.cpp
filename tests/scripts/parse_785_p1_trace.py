@@ -55,9 +55,9 @@ def classify(text: str) -> tuple[str, list[str], list[str]]:
         scalar_blob_lines.append(line)
     scalar_blob = "\n".join(scalar_blob_lines)
     scalar_hits = [m for m in SCALAR_MARKERS if m in scalar_blob]
-    if wmma_hits:
+    if wmma_hits and not scalar_hits:
         arm = "A"
-    elif scalar_hits:
+    elif scalar_hits and not wmma_hits:
         arm = "B"
     else:
         arm = "UNKNOWN"

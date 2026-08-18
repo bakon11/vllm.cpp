@@ -1,20 +1,22 @@
 // #785 P1 GPU product-seam witness. Calls vt::PagedAttention on kROCM.
 // Does NOT launch PagedAttnPrefillSharedKWmma directly.
-// Run only via tests/scripts/run-785-p1.sh after Researcher GPU GO.
-// Missing device or missing VT_785_P1_GPU => exit 5 (fail closed, not SKIP 77).
+// Not registered with CTest. Run only via tests/scripts/run-785-p1.sh
+// after Researcher GPU GO.
+//
+// Missing VT_785_P1_GPU, missing device, env conflict, or hash mismatch
+// => exit 5 (fail closed). Runner treats 77/nonzero as P1 failure.
 #include <doctest/doctest.h>
 
 #include <algorithm>
 #include <cmath>
-#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <limits>
 #include <string>
 #include <vector>
 
+#include "vt/sharedk_wmma_p1_fixture.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
@@ -27,50 +29,27 @@ using vt::DType;
 using vt::PagedAttentionArgs;
 using vt::Queue;
 using vt::Tensor;
+using namespace vt_785_p1;
 
 namespace {
-
-constexpr int64_t kT = 64;
-constexpr int64_t kHq = 2;
-constexpr int64_t kHk = 1;
-constexpr int64_t kD = 256;
-constexpr int64_t kBlock = 16;
-constexpr float kScale = 0.0625f;
-constexpr int64_t kWindowLeft = 32;
-constexpr int64_t kWindowRight = 0;
-constexpr uint32_t kQSeed = 78525601u;
-constexpr uint32_t kKSeed = 78525602u;
-constexpr uint32_t kVSeed = 78525603u;
-constexpr double kAbsFloor = 1.5e-2;
-constexpr double kRel = 1.0e-2;
-constexpr double kMinCorr = 0.999;
 
 [[noreturn]] void FailClosed(const char* why) {
   std::fprintf(stderr, "\n*** P1 GPU FAIL CLOSED (exit 5) ***\n%s\n", why);
   std::exit(5);
 }
 
-inline uint16_t F32ToBf16Bits(float f) {
-  uint32_t x;
-  std::memcpy(&x, &f, sizeof(x));
-  const uint32_t rounding = 0x7fffu + ((x >> 16) & 1u);
-  return static_cast<uint16_t>((x + rounding) >> 16);
-}
-inline float Bf16BitsToF32(uint16_t b) {
-  uint32_t x = static_cast<uint32_t>(b) << 16;
-  float f;
-  std::memcpy(&f, &x, sizeof(f));
-  return f;
+const char* EnvOr(const char* key) {
+  const char* e = std::getenv(key);
+  return e ? e : "";
 }
 
-std::vector<float> RandF32(size_t n, uint32_t seed) {
-  std::vector<float> v(n);
-  uint32_t s = seed;
-  for (auto& x : v) {
-    s = s * 1664525u + 1013904223u;
-    x = (static_cast<float>(s >> 8) / static_cast<float>(1u << 24)) * 4.0f - 2.0f;
-  }
-  return v;
+bool EnvIs1(const char* key) {
+  const char* e = std::getenv(key);
+  return e != nullptr && e[0] == '1' && e[1] == '\0';
+}
+bool EnvIs0(const char* key) {
+  const char* e = std::getenv(key);
+  return e != nullptr && e[0] == '0' && e[1] == '\0';
 }
 
 Tensor Contig(void* data, DType dt, Device dev, const std::vector<int64_t>& shape) {
@@ -111,59 +90,11 @@ struct DeviceBuf {
   }
 };
 
-std::vector<float> Oracle(const std::vector<float>& q, const std::vector<float>& kc,
-                          const std::vector<float>& vc, const std::vector<int32_t>& block_table) {
-  const int64_t qpk = kHq / kHk;
-  std::vector<float> out(static_cast<size_t>(kT * kHq * kD), 0.0f);
-  for (int64_t local = 0; local < kT; ++local) {
-    const int64_t p = local;
-    const int64_t jmin = std::max<int64_t>(0, p - kWindowLeft);
-    int64_t jmax = std::min(p, p + kWindowRight);
-    jmax = std::min(jmax, kT - 1);
-    for (int64_t h = 0; h < kHq; ++h) {
-      const int64_t g = h / qpk;
-      const int64_t qoff = (local * kHq + h) * kD;
-      std::vector<float> sc(static_cast<size_t>(jmax - jmin + 1));
-      float m = -std::numeric_limits<float>::infinity();
-      for (int64_t j = jmin; j <= jmax; ++j) {
-        const int64_t blk = block_table[static_cast<size_t>(j / kBlock)];
-        const int64_t off = j % kBlock;
-        const int64_t kbase = ((blk * kBlock + off) * kHk + g) * kD;
-        float dot = 0.0f;
-        for (int64_t e = 0; e < kD; ++e)
-          dot += q[static_cast<size_t>(qoff + e)] * kc[static_cast<size_t>(kbase + e)];
-        dot *= kScale;
-        sc[static_cast<size_t>(j - jmin)] = dot;
-        if (dot > m) m = dot;
-      }
-      float denom = 0.0f;
-      for (float& s : sc) {
-        s = std::exp(s - m);
-        denom += s;
-      }
-      const float inv = 1.0f / denom;
-      for (int64_t e = 0; e < kD; ++e) {
-        float a = 0.0f;
-        for (int64_t j = jmin; j <= jmax; ++j) {
-          const int64_t blk = block_table[static_cast<size_t>(j / kBlock)];
-          const int64_t off = j % kBlock;
-          const int64_t vbase = ((blk * kBlock + off) * kHk + g) * kD;
-          a += sc[static_cast<size_t>(j - jmin)] * inv * vc[static_cast<size_t>(vbase + e)];
-        }
-        out[static_cast<size_t>(qoff + e)] = a;
-      }
-    }
-  }
-  return out;
-}
-
 }  // namespace
 
 TEST_CASE("P1 product seam vt::PagedAttention d=256 SharedK") {
   if (std::getenv("VT_785_P1_GPU") == nullptr) {
-    std::fprintf(stderr,
-                 "\n*** P1 GPU not requested (exit 77 SKIP) — not a pass ***\n");
-    std::exit(77);
+    FailClosed("VT_785_P1_GPU unset");
   }
   if (!vt::rocm::DeviceAvailable()) {
     FailClosed("no ROCm device");
@@ -173,86 +104,83 @@ TEST_CASE("P1 product seam vt::PagedAttention d=256 SharedK") {
     FailClosed("VT_785_P1_OUT unset");
   }
 
-  const int64_t num_blocks = (kT + kBlock - 1) / kBlock;
-  auto qf = RandF32(static_cast<size_t>(kT * kHq * kD), kQSeed);
-  auto kf = RandF32(static_cast<size_t>(num_blocks * kBlock * kHk * kD), kKSeed);
-  auto vf = RandF32(static_cast<size_t>(num_blocks * kBlock * kHk * kD), kVSeed);
-  std::vector<uint16_t> qb(qf.size()), kb(kf.size()), vb(vf.size());
-  std::vector<float> qr(qf.size()), kr(kf.size()), vr(vf.size());
-  for (size_t i = 0; i < qf.size(); ++i) {
-    qb[i] = F32ToBf16Bits(qf[i]);
-    qr[i] = Bf16BitsToF32(qb[i]);
+  if (EnvIs1("VT_ROCM_ATTN_CPU_REF") || EnvIs1("VT_CPU_REF")) {
+    FailClosed("CPU-ref must be off");
   }
-  for (size_t i = 0; i < kf.size(); ++i) {
-    kb[i] = F32ToBf16Bits(kf[i]);
-    kr[i] = Bf16BitsToF32(kb[i]);
-    vb[i] = F32ToBf16Bits(vf[i]);
-    vr[i] = Bf16BitsToF32(vb[i]);
+  if (EnvIs0("VT_ATTN_DECODE_OPT") || EnvIs0("VT_ATTN_DECODE_GQA") ||
+      EnvIs0("VT_ATTN_PREFILL_FLASH_SHAREDK")) {
+    FailClosed("decode-opt / decode-GQA / SharedK must be on");
   }
-  std::vector<int32_t> block_table(static_cast<size_t>(num_blocks));
-  for (int64_t i = 0; i < num_blocks; ++i) block_table[static_cast<size_t>(i)] = static_cast<int32_t>(i);
-  std::vector<int32_t> seq_lens = {static_cast<int32_t>(kT)};
-  std::vector<int32_t> qsl = {0, static_cast<int32_t>(kT)};
-  const auto ref = Oracle(qr, kr, vr, block_table);
+  if (!EnvIs1("VT_ATTN_DECODE_OPT") || !EnvIs1("VT_ATTN_DECODE_GQA") ||
+      !EnvIs1("VT_ATTN_PREFILL_FLASH_SHAREDK")) {
+    FailClosed("decode-opt / decode-GQA / SharedK must be explicitly 1");
+  }
+  const bool wmma1 = EnvIs1("VT_ATTN_PREFILL_SHAREDK_WMMA");
+  const bool wmma0 = EnvIs0("VT_ATTN_PREFILL_SHAREDK_WMMA");
+  if (wmma1 == wmma0) {
+    FailClosed("VT_ATTN_PREFILL_SHAREDK_WMMA must be explicit 1 or 0");
+  }
 
+  const auto f = MakeFixture();
+  const std::string qh = Sha256U16Le(f.q_bf16);
+  const std::string kh = Sha256U16Le(f.k_bf16);
+  const std::string vh = Sha256U16Le(f.v_bf16);
+  if (qh != kQHash || kh != kKHash || vh != kVHash) {
+    FailClosed("fixture Q/K/V SHA-256 mismatch vs preregistered");
+  }
+  {
+    std::ofstream h(std::string(outdir) + "/fixture-hashes.txt");
+    if (!h) FailClosed("cannot write fixture-hashes.txt");
+    h << "q_bf16=" << qh << "\nk_bf16=" << kh << "\nv_bf16=" << vh << "\n";
+  }
+  {
+    std::ofstream e(std::string(outdir) + "/env.txt");
+    if (!e) FailClosed("cannot write env.txt");
+    e << "VT_785_P1_GPU=" << EnvOr("VT_785_P1_GPU") << "\n"
+      << "VT_ATTN_PREFILL_SHAREDK_WMMA=" << EnvOr("VT_ATTN_PREFILL_SHAREDK_WMMA") << "\n"
+      << "VT_ATTN_PREFILL_FLASH_SHAREDK=" << EnvOr("VT_ATTN_PREFILL_FLASH_SHAREDK") << "\n"
+      << "VT_ATTN_DECODE_OPT=" << EnvOr("VT_ATTN_DECODE_OPT") << "\n"
+      << "VT_ATTN_DECODE_GQA=" << EnvOr("VT_ATTN_DECODE_GQA") << "\n"
+      << "VT_ROCM_ATTN_CPU_REF=" << EnvOr("VT_ROCM_ATTN_CPU_REF") << "\n"
+      << "VT_CPU_REF=" << EnvOr("VT_CPU_REF") << "\n";
+  }
+
+  const auto ref = Oracle(f);
   Backend& rocm = vt::GetBackend(DeviceType::kROCM);
   Queue q = rocm.CreateQueue();
-  DeviceBuf dq(rocm, q, DType::kBF16, {kT, kHq, kD}, qb.data());
-  DeviceBuf dk(rocm, q, DType::kBF16, {num_blocks, kBlock, kHk, kD}, kb.data());
-  DeviceBuf dv(rocm, q, DType::kBF16, {num_blocks, kBlock, kHk, kD}, vb.data());
-  DeviceBuf dbt(rocm, q, DType::kI32, {1, num_blocks}, block_table.data());
-  DeviceBuf dsl(rocm, q, DType::kI32, {1}, seq_lens.data());
-  DeviceBuf dqsl(rocm, q, DType::kI32, {2}, qsl.data());
+  DeviceBuf dq(rocm, q, DType::kBF16, {kT, kHq, kD}, f.q_bf16.data());
+  DeviceBuf dk(rocm, q, DType::kBF16, {f.num_blocks, kBlock, kHk, kD}, f.k_bf16.data());
+  DeviceBuf dv(rocm, q, DType::kBF16, {f.num_blocks, kBlock, kHk, kD}, f.v_bf16.data());
+  DeviceBuf dbt(rocm, q, DType::kI32, {1, f.num_blocks}, f.block_table.data());
+  DeviceBuf dsl(rocm, q, DType::kI32, {1}, f.seq_lens.data());
+  DeviceBuf dqsl(rocm, q, DType::kI32, {2}, f.qsl.data());
   DeviceBuf dout(rocm, q, DType::kBF16, {kT, kHq, kD}, nullptr);
 
   PagedAttentionArgs args{kScale, /*causal=*/true};
-  args.window_size = vt::AttentionWindow{kWindowLeft, kWindowRight};
-  args.query_start_loc_host = qsl.data();
+  args.window_size = vt::AttentionWindow{static_cast<int32_t>(kWindowLeft),
+                                         static_cast<int32_t>(kWindowRight)};
+  args.query_start_loc_host = f.qsl.data();
   args.max_seq_len = static_cast<int32_t>(kT);
   vt::PagedAttention(q, dout.t, dq.t, dk.t, dv.t, dbt.t, dsl.t, dqsl.t, args);
 
-  std::vector<uint16_t> got(qb.size(), 0);
+  std::vector<uint16_t> got(f.q_bf16.size(), 0);
   dout.Download(q, got.data());
-
   std::vector<float> got_f(got.size());
-  size_t nonfinite = 0, violations = 0;
-  double max_abs = 0, mean_g = 0, mean_r = 0;
-  for (size_t i = 0; i < got.size(); ++i) {
-    got_f[i] = Bf16BitsToF32(got[i]);
-    if (!std::isfinite(got_f[i]) || !std::isfinite(ref[i])) ++nonfinite;
-    mean_g += got_f[i];
-    mean_r += ref[i];
-  }
-  mean_g /= static_cast<double>(got.size());
-  mean_r /= static_cast<double>(got.size());
-  double num = 0, dg = 0, dr = 0;
-  for (size_t i = 0; i < got.size(); ++i) {
-    const double err = std::abs(got_f[i] - ref[i]);
-    if (err > max_abs) max_abs = err;
-    if (err > kAbsFloor + kRel * std::abs(static_cast<double>(ref[i]))) ++violations;
-    const double ag = got_f[i] - mean_g;
-    const double ar = ref[i] - mean_r;
-    num += ag * ar;
-    dg += ag * ag;
-    dr += ar * ar;
-  }
-  const double corr = (dg > 0.0 && dr > 0.0) ? (num / std::sqrt(dg * dr)) : 0.0;
-  const int oracle_ok = (nonfinite == 0 && violations == 0 && corr >= kMinCorr) ? 1 : 0;
+  for (size_t i = 0; i < got.size(); ++i) got_f[i] = Bf16BitsToF32(got[i]);
+  const auto st = Score(got_f, ref);
 
-  const std::string out_path = std::string(outdir) + "/out.bf16";
-  const std::string met_path = std::string(outdir) + "/metrics.txt";
   {
-    std::ofstream o(out_path, std::ios::binary);
+    std::ofstream o(std::string(outdir) + "/out.bf16", std::ios::binary);
     if (!o) FailClosed("cannot write out.bf16");
     o.write(reinterpret_cast<const char*>(got.data()),
             static_cast<std::streamsize>(got.size() * sizeof(uint16_t)));
   }
   {
-    std::ofstream m(met_path);
+    std::ofstream m(std::string(outdir) + "/metrics.txt");
     if (!m) FailClosed("cannot write metrics.txt");
-    m << "max_abs=" << max_abs << "\ncorr=" << corr << "\nnonfinite=" << nonfinite
-      << "\nviolations=" << violations << "\noracle_ok=" << oracle_ok
+    m << "max_abs=" << st.max_abs << "\ncorr=" << st.corr << "\nnonfinite=" << st.nonfinite
+      << "\nviolations=" << st.violations << "\noracle_ok=" << (st.ok ? 1 : 0)
       << "\nn=" << got.size() << "\n";
   }
-  if (!oracle_ok) FailClosed("oracle bar miss");
+  if (!st.ok) FailClosed("oracle bar miss");
 }

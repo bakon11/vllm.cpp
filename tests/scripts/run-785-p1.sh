@@ -2,10 +2,9 @@
 # #785 P1 d=256 SharedK WMMA product-seam witness.
 # GPU HOLD until Researcher names GO. Default exit 78.
 #
-# Claim: A (default) dispatches PagedAttnPrefillSharedKWmma<2,8,16,32,false>
-# via vt::PagedAttention; B (VT_ATTN_PREFILL_SHAREDK_WMMA=0) dispatches
-# scalar PagedAttnPrefillSharedK<2,8,...>. Same binary, separate processes.
-# No timing. No d=512. Never :8010/:8012.
+# A: SHAREDK_WMMA=1, exclusive WMMA kernel.
+# B: SHAREDK_WMMA=0, exclusive scalar SharedK.
+# Same binary, separate processes. No timing. No d=512. Never :8010/:8012.
 set -euo pipefail
 
 if [[ "${VT_785_P1_GPU_GO:-}" != "1" ]]; then
@@ -19,6 +18,9 @@ OUT="${VT_785_P1_OUT:-/home/don/.cache/hermes-builds/vllm-785-p0/p1-out}"
 BIN="${BUILD}/tests/test_ops_paged_attn_sharedk_wmma_p1_gpu"
 PARSER="${ROOT}/tests/scripts/parse_785_p1_trace.py"
 ROCPROF="${ROCPROFV3:-/opt/rocm/bin/rocprofv3}"
+QHASH=27f164e220edf8d37ddfd1783f0c390968b9d2314ff5d89b7aea3ef50f0eba72
+KHASH=d803e64df022e1cb2049b06d65fc36da02a79ac09f77831e967237e47d49f7ca
+VHASH=910548159fd5a5a478573dac6de96f374014cb0b76dac7389071f265dfe1cae7
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
@@ -31,15 +33,18 @@ mkdir -p "$OUT/A" "$OUT/B"
 
 run_arm() {
   local arm="$1"
+  local wmma="$2"
   local dest="$OUT/$arm"
-  local env_wmma="${2:-}"
   mkdir -p "$dest/trace" "$dest/art"
-  # Separate process: SHAREDK_WMMA is process-static.
   env \
     VT_785_P1_GPU=1 \
     VT_785_P1_OUT="$dest/art" \
+    VT_ATTN_PREFILL_SHAREDK_WMMA="$wmma" \
     VT_ATTN_PREFILL_FLASH_SHAREDK=1 \
-    ${env_wmma} \
+    VT_ATTN_DECODE_OPT=1 \
+    VT_ATTN_DECODE_GQA=1 \
+    VT_ROCM_ATTN_CPU_REF=0 \
+    VT_CPU_REF=0 \
     "$ROCPROF" --kernel-trace --output-format csv \
       -d "$dest/trace" -o "ktrace" \
       -- "$BIN" --test-case="*product seam*"
@@ -49,10 +54,15 @@ run_arm() {
   fi
   python3 "$PARSER" "$dest/trace" --expect "$arm" \
     | tee "$dest/trace-class.txt"
+  local hashes="$dest/art/fixture-hashes.txt"
+  [[ -f "$hashes" ]] || die "arm $arm missing fixture-hashes.txt"
+  grep -qx "q_bf16=$QHASH" "$hashes" || die "arm $arm Q hash mismatch"
+  grep -qx "k_bf16=$KHASH" "$hashes" || die "arm $arm K hash mismatch"
+  grep -qx "v_bf16=$VHASH" "$hashes" || die "arm $arm V hash mismatch"
 }
 
-run_arm A ""
-run_arm B "VT_ATTN_PREFILL_SHAREDK_WMMA=0"
+run_arm A 1
+run_arm B 0
 
 python3 - <<PY
 import math, struct, sys
@@ -64,7 +74,7 @@ def load(p):
         print("ERROR: odd bf16 byte length", p, file=sys.stderr)
         sys.exit(1)
     n = len(b)//2
-    return [struct.unpack_from("<e" if False else "<H", b, 2*i)[0] for i in range(n)]
+    return [struct.unpack_from("<H", b, 2*i)[0] for i in range(n)]
 
 def bits_to_f32(h):
     return struct.unpack("<f", struct.pack("<I", (h & 0xffff) << 16))[0]
@@ -83,13 +93,12 @@ corr = 0.0 if da == 0.0 or db == 0.0 else num/(da*db)
 print(f"ab_max_abs={max_abs:.8f}")
 print(f"ab_corr={corr:.8f}")
 print(f"n={len(a)}")
-# Report only; do not require bit identity.
 Path(out/"ab-distance.txt").write_text(
     f"ab_max_abs={max_abs:.8f}\nab_corr={corr:.8f}\nn={len(a)}\n")
 for arm in ("A","B"):
     met = (out/arm/"art"/"metrics.txt").read_text()
     print(f"--- {arm} metrics ---")
-    print(met, end="" if met.endswith("\\n") else "\\n")
+    print(met, end="" if met.endswith("\n") else "\n")
     if "nonfinite=0" not in met:
         print("ERROR: nonfinite in", arm, file=sys.stderr)
         sys.exit(1)
