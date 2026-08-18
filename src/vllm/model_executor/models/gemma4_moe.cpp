@@ -762,6 +762,16 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
   // T=1: hipGraph-stable TLS acc. T>1: owned [T,H] + per-token existing helpers.
   // VT_GEMMA4_DECODE_INDEXED_MAX_T: default 63; =1 → T=1 only; clamp [1,63].
   const int64_t indexed_max_t = Gemma4DecodeIndexedMaxT();
+  const bool indexed_eligible = Gemma4IndexedOkT(T, indexed_max_t, top_k, fp8_res);
+  auto emit_moe_dispatch = [&](const char* path, bool fallthrough) {
+    if (!profile) return;
+    std::fprintf(stderr,
+                 "gemma4 moe dispatch: T=%lld indexed_max_t=%lld path=%s eligible=%d top_k=%d "
+                 "compute_dev=%d expert_dev=%d fallthrough=%d\n",
+                 static_cast<long long>(T), static_cast<long long>(indexed_max_t), path,
+                 indexed_eligible ? 1 : 0, top_k, compute_dev, ex.dev_id, fallthrough ? 1 : 0);
+    std::fflush(stderr);
+  };
   if (Gemma4IndexedOkT(T, indexed_max_t, top_k, fp8_res)) {
     // per-expert scale on device (once per layer/E; apply each token — helper is G-wide).
     struct EscTls {
@@ -873,6 +883,8 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
           },
           restore_compute);
       if (disp.ok) {
+        emit_moe_dispatch(indexed_arm == Gemma4IndexedArm::Peer ? "indexed_peer" : "indexed_same",
+                          /*fallthrough=*/false);
         const auto t_router1 = profile ? clock::now() : clock::time_point{};
         Gemma4MoeScratch r;
         r.tensor = acc_fast.t();
@@ -923,6 +935,8 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
             },
             restore_compute);
         if (disp.ok) {
+          emit_moe_dispatch(indexed_arm == Gemma4IndexedArm::Peer ? "indexed_peer" : "indexed_same",
+                            /*fallthrough=*/false);
           Gemma4MoeScratch r;
           r.tensor = acc_idx->t();
           r.storage = acc_idx->ReleaseShared();
@@ -936,6 +950,8 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     if (!indexed_retired && rw_idx_owned) (void)rw_idx_owned->Release();
     // fall through to legacy host-gather path
   }
+
+  emit_moe_dispatch("legacy", /*fallthrough=*/indexed_eligible);
 
   std::vector<float> hw(static_cast<size_t>(T * top_k));
   std::vector<int32_t> hi(static_cast<size_t>(T * top_k));
