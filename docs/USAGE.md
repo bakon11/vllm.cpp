@@ -48,6 +48,56 @@ The server also supports OpenAI clients that use
 `http://localhost:8000/v1` as their base URL. The model-specific guides record
 extra files and launch flags when a model needs them.
 
+`--model` also takes a Hugging Face repository name, which the server fetches
+into the cache before it binds:
+
+```sh
+build/examples/vllm-server --model Qwen/Qwen3-0.6B --port 8000
+```
+
+That form needs a build that carries transport layer security. The default
+`-DVLLM_CPP_OPENSSL=ON` is the tested path, and every release lane and every
+container image uses it; `-DVLLM_CPP_BUILD_BORINGSSL=ON` is offered and has
+never been compiled here. A build that mixes the two states across its own
+source files refuses to start with exit 2 and a message naming what disagrees,
+rather than serving corrupted responses. See [Access Hugging Face
+checkpoints](guides/hugging-face-access.md) for the build options,
+`--revision`, `--download-dir`, the `HF_*` environment variables, and the
+release lanes that carry no fetch. `vllm-cli` and the C ABI still take a local
+path only.
+
+That command is measured, not illustrative. On 2026-08-20, on x86_64 with the
+default OpenSSL build and an empty `HF_HOME`, it fetched
+`Qwen/Qwen3-0.6B` at revision `c1899de289a04d12100db370d81485cdf75e47ca` from
+`huggingface.co`: `model.safetensors` (1503300328 bytes), `tokenizer.json`
+(11422654), `vocab.json` (2776833), `merges.txt` (1671853),
+`tokenizer_config.json` (9732), `config.json` (726) and
+`generation_config.json` (239), 1.5 GB of cache in total. The server then bound
+its port and answered `/v1/completions`. A second start with the same `HF_HOME`
+reports every file as `already in the cache` and transfers no bytes. Before
+[#1511](https://github.com/mudler/vllm.cpp/issues/1511) this command downloaded
+nothing at all, because the hub answers with a relative `Location` header that
+the client read as a URL.
+
+## Draft with a second checkpoint
+
+Speculative decoding runs a small draft model beside the target and verifies its
+proposals losslessly, so the emitted tokens do not change. Pass the draft with
+`--speculative-config`:
+
+```sh
+build/examples/vllm-server   --model /path/to/target   --speculative-config '{"method":"dflash","model":"/path/to/draft","num_speculative_tokens":7}'
+```
+
+The draft may be a checkpoint directory or a single `.gguf` file, for DFlash,
+DFlash2 and DSpark alike. A GGUF draft is dequantized to bf16 as it loads, so
+picking a smaller quantization saves download and disk and does not save memory.
+
+[Speculative decoding](SPECULATIVE-DECODING.md) lists the supported methods, the
+draft checkpoints each was gated against, and what each one refuses by name.
+Drafting is greedy: `draft_sample_method` accepts only `"greedy"`, and any other
+value is refused at startup rather than silently ignored.
+
 ## Use the C ABI
 
 For an installed library, use the stable public interface in
@@ -98,6 +148,18 @@ for `LoadedEngine`. The source-tree examples declare their link targets in
 [`examples/CMakeLists.txt`](../examples/CMakeLists.txt). External consumers
 must use the C ABI in `include/vllm.h`.
 
+Configuring with `-DVLLM_CPP_SANITIZE=address,undefined` or
+`-DVLLM_CPP_SANITIZE=thread` changes what a test target links. Instrumented
+test executables link one internal shared image of the instrumented archive
+instead of force-linking `vllm::vllm` into each of them, because the
+force-linked form runs a hosted runner out of disk. That image forwards the
+same include directories, compile definitions and link libraries, so a target's
+own CMake is the same in both configurations. It does not LINK identically: the
+archive is force-linked into each executable only in the default build, and not
+propagating that is the reason the instrumented image exists. Link `vllm::vllm`
+as above and let the build choose; naming the internal image yourself is not
+supported.
+
 ## First-line troubleshooting
 
 - Run the executable with `--help` and confirm that you are using the expected
@@ -108,6 +170,14 @@ must use the C ABI in `include/vllm.h`.
 - Read the matching model or task guide before you add model-specific flags.
 - If startup fails, use the exact error text to find the refused file, option,
   operation, or checkpoint arm in the focused guides.
+- `tokenizer: merge token "..." at merge rank N ... is not in the vocabulary`
+  means the tokenizer file names a merge whose left token, right token, or
+  joined result is missing from its own vocabulary. Both `tokenizer.json` and a
+  GGUF's `tokenizer.ggml.merges` are checked, and the message names the missing
+  token. HF `tokenizers` refuses the same file for the same reason, so the file
+  is malformed rather than unsupported; a GGUF that fails this and whose
+  original `tokenizer.json` loads was damaged by its converter. Before this
+  check the same file loaded and then failed on some prompts instead.
 
 ## Find a focused guide
 

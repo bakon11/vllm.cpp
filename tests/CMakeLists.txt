@@ -212,8 +212,12 @@ target_include_directories(test_minimax_music3_llm_real PRIVATE
 # (minimax_music3_acoustic_goldens.inc, no weight bytes). The full-scale fp32
 # companion is tests/parity/test_minimax_music3_acoustic_real.cpp.
 vllm_cpp_add_test(test_minimax_music3_acoustic vllm/models/test_minimax_music3_acoustic.cpp)
+# Reaches src/ for `music3_profile.h` — an INTERNAL instrument, deliberately not
+# on the public surface — because the intra-DiT spans (#1542) live inside
+# `DitForwardDevice` and this is the only suite that drives that forward.
 target_include_directories(test_minimax_music3_acoustic PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models
+  ${CMAKE_SOURCE_DIR}/src)
 # The FULL-SCALE companion: the REAL fp32 2.4B DiT and 0.054B vocoder driven on
 # the REAL inputs, against the committed oracle capture (denoise_{first,last}_*,
 # vocoder_input_chunk0, waveform). Checkpoint-gated exactly as the AR one is;
@@ -577,6 +581,13 @@ target_include_directories(test_qwen3_dflash_forward PRIVATE ${CMAKE_SOURCE_DIR}
 # runs the grouped convolution.
 vllm_cpp_add_test(test_qwen3_dflash2_draft vllm/models/test_qwen3_dflash2_draft.cpp)
 target_include_directories(test_qwen3_dflash2_draft PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DFLASH2 W5 (#1314): the GGUF DFlash2 drafter arm. The container the other
+# suite cannot reach -- a GGUF declares no `architectures` and writes the same
+# `general.architecture = dflash` a DFlash1 drafter writes -- plus the LOWER
+# BOUND its k-quant arms need, because this lane dequantizes to bf16 by design
+# and a token gate therefore cannot see a quantized tensor that never decoded.
+vllm_cpp_add_test(test_qwen3_dflash2_gguf vllm/models/test_qwen3_dflash2_gguf.cpp)
+target_include_directories(test_qwen3_dflash2_gguf PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-DSPARK W2: the DSpark Markov transition head + draft->target vocab map.
 vllm_cpp_add_test(test_qwen3_dspark_markov vllm/models/test_qwen3_dspark_markov.cpp)
 target_include_directories(test_qwen3_dspark_markov PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -966,6 +977,17 @@ vllm_cpp_add_test(test_tokenizer_metaspace_split
 target_compile_definitions(test_tokenizer_metaspace_split PRIVATE
   PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e")
 vllm_cpp_add_test(test_bpe vllm/test_bpe.cpp)
+# The load-time MergeTokenOutOfVocabulary refusal asserts that every
+# committed HF golden still loads, so test_bpe reaches the goldens dir.
+target_compile_definitions(test_bpe PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+# SPEC-BPE-QUADRATIC-MERGE (#1365) — the long-pretoken equivalence corpus and
+# the absolute cost bound. The corpus ids are HF `tokenizers` 0.22.2 output over
+# the two committed goldens (an oracle, not a snapshot of ours); the cost case
+# is the row's ONLY timing assertion and it is RED against the O(n^2) merge.
+vllm_cpp_add_test(test_bpe_equivalence vllm/test_bpe_equivalence.cpp)
+target_compile_definitions(test_bpe_equivalence PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 vllm_cpp_add_test(test_detokenizer vllm/test_detokenizer.cpp)
 vllm_cpp_add_test(test_request vllm/test_request.cpp)
 vllm_cpp_add_test(test_kv_cache_utils vllm/v1/test_kv_cache_utils.cpp)
@@ -1348,10 +1370,16 @@ target_include_directories(test_dflash_kvprep PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # assertion that a DFlash1 checkpoint's resolution is unchanged.
 vllm_cpp_add_test(test_dflash_causality vllm/v1/spec_decode/test_dflash_causality.cpp)
 vllm_cpp_add_test(test_dflash_propose vllm/v1/spec_decode/test_dflash_propose.cpp)
-# SPEC-DFLASH2 W2 (#1314): the candidate-selector refusal -- the boundary the
-# DFlash2 architecture is left at once its grouped convolution runs.
-vllm_cpp_add_test(test_dflash2_walk_refusal
-  vllm/v1/spec_decode/test_dflash2_walk_refusal.cpp)
+# SPEC-DFLASH2 W4 (#1314): the INVERSE guard, once the walk lands and there is
+# no missing mechanism left to refuse -- a DFlash2 block that reaches the DFlash1
+# per-slot argmax throws by name, and the walk's own refusals are gated beside
+# it. W1/W2/W3 read "the candidate-selector refusal" here, which was the boundary
+# the architecture was left at while its selector was unported.
+vllm_cpp_add_test(test_dflash2_argmax_guard
+  vllm/v1/spec_decode/test_dflash2_argmax_guard.cpp)
+# SPEC-DFLASH2 W4 (#1314): reachability (spec G5) -- a real LoadedEngine through
+# GPUModelRunner::propose_drafts_block, with the drafts read off the production
+# trace.
 vllm_cpp_add_test(test_dflash2_runner_reach
   vllm/v1/spec_decode/test_dflash2_runner_reach.cpp)
 target_include_directories(test_dflash_propose PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -1530,6 +1558,28 @@ if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_downloader vllm/transformers_utils/test_downloader.cpp)
   vllm_cpp_add_test(test_model_resolver
     vllm/transformers_utils/test_model_resolver.cpp)
+  # ENG-HF-MODEL-DOWNLOAD W5 (#1280): the transport-layer-security suite. It is
+  # the ONE place in this row that speaks https, and the one place that measures
+  # whether the server half and the fetcher half were compiled against the same
+  # cpp-httplib layout. Its TLS arm starts a real `httplib::SSLServer` on
+  # loopback, so it shares the RUN_SERIAL treatment below.
+  vllm_cpp_add_test(test_tls_transport
+    vllm/transformers_utils/test_tls_transport.cpp)
+  # THE EXPECTATION, computed on a path that does NOT read the macro under test.
+  # `VLLM_CPP_TEST_EXPECT_TLS` says "the user asked for the download feature and
+  # this host has the OpenSSL development files", which is a fact about the
+  # CONFIGURATION. The suite then asserts that the BUILD delivered transport
+  # layer security. Deriving the expectation from `CPPHTTPLIB_OPENSSL_SUPPORT`
+  # instead would make the case a tautology that a silently disabled feature
+  # passes, which is the exact failure `scripts/validate-container-image.py`
+  # exists to catch in the container.
+  if(VLLM_CPP_HF_DOWNLOAD_REQUESTED AND VLLM_CPP_OPENSSL)
+    find_package(OpenSSL QUIET)
+    if(OpenSSL_FOUND)
+      target_compile_definitions(test_tls_transport PRIVATE
+        VLLM_CPP_TEST_EXPECT_TLS=1)
+    endif()
+  endif()
   vllm_cpp_add_test(test_openai_api_server vllm/entrypoints/openai/test_api_server.cpp)
   # /v1/audio/transcriptions dispatch + socket smoke run against the REAL
   # library transcription seam on the committed parakeet_e2e fixture
@@ -1554,7 +1604,7 @@ if(VLLM_CPP_SERVER)
   # these two against each other, not against the CPU-hog tests that actually
   # cause the starvation.)
   set_tests_properties(test_openai_api_server test_openai_conformance test_hf_hub
-    test_downloader test_model_resolver
+    test_downloader test_model_resolver test_tls_transport
     PROPERTIES RUN_SERIAL ON)
   # SERVE-RECIPE-ARGS (#606): the accepted-and-inert serve-argument seam. It
   # drives the REAL VllmServerMain (owned by the library behind the same
@@ -2121,6 +2171,10 @@ vllm_cpp_add_test(test_ops_dflash_paged_block_attn vt/test_ops_dflash_paged_bloc
 vllm_cpp_add_test(test_ops_dflash2_grouped_conv vt/test_ops_dflash2_grouped_conv.cpp)
 vllm_cpp_add_test(test_ops_topk_values_indices vt/test_ops_topk_values_indices.cpp)
 vllm_cpp_add_test(test_ops_dflash2_selector_edges vt/test_ops_dflash2_selector_edges.cpp)
+# SPEC-DFLASH2 W4 (#1314): the candidate selector's PATH WALK -- one program per
+# request with the slot-to-slot dependency as a loop inside it, gated against
+# upstream's own `_selector_walk_kernel` control flow plus CUDA==CPU bit-exactness.
+vllm_cpp_add_test(test_ops_dflash2_path_walk vt/test_ops_dflash2_path_walk.cpp)
 vllm_cpp_add_test(test_ops_reshape_cache vt/test_ops_reshape_cache.cpp)
 # KV-FP8 W1: fp8 KV-cache store (ReshapeAndCacheFp8) + paged-attention read
 # dequant + the ParseCacheDType config wiring.

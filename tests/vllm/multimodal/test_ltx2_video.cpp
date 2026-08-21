@@ -3686,8 +3686,340 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
                       << "]");
   }
 
+  // (1c) THE LEAF DOES NOT EXTEND BEYOND ITS ANCHORS, and this assertion is the
+  // one that catches what (2) below was written for -- down to its own
+  // resolution, which is stated here rather than left to be discovered.
+  //
+  // WHAT IT DOES NOT CATCH, MEASURED. At fixture scale this bounds a swallow at
+  // 30 ms per leaf record and sees nothing smaller. A mutation that opens
+  // `denoise` at the top of `phase.prepare`, so the whole prepare becomes
+  // un-named time inside the leaf, moves the span slack from 26.6 us to 124.6 us
+  // and the case stays GREEN, because `phase.prepare` is only about 125 us on
+  // this fixture. The coverage floor (2) misses it too -- it moved 0.4 points --
+  // so this is not a regression against the shape that shipped, but it IS the
+  // limit of the instrument at this geometry, and `### Owed out of W0` is where
+  // the leaf-by-leaf version lives.
+  //
+  // AND THE RESOLUTION IS NOW 30 ms RATHER THAN 0.25 ms, which is a real
+  // loss and is the price of a bound that survives a two-core contended runner.
+  // The 0.25 ms constant was inside its own honest distribution: at head
+  // 6b48edb2c, unmutated, it reddened 3 of 33 runs on a shared
+  // 20-core box and 2 of 10 under an added eight-way spin load.
+  // Nothing about the tree moved between a green run and a red one; the
+  // scheduler did. See `### The span-slack bound, fourth shape` in the row's
+  // spec for the whole distribution.
+  //
+  // MEASURED, because the previous shape of this gate was argued rather than
+  // measured and it decided by box load for two days (#1439, #1494). The
+  // un-covered seconds inside a leaf are TWO structurally different things and
+  // the old single share floor charged them to one number:
+  //
+  //   * the HEAD and TAIL -- the leaf's own seconds lying outside the span its
+  //     sub-scopes occupy. This is exactly where a leaf that opened early over a
+  //     phase nobody named, or stayed open over one, puts the whole swallow. It
+  //     is TWO instrument boundaries, so it does not grow with the render and it
+  //     does not grow with the step count.
+  //   * the INTERIOR gaps -- the time BETWEEN consecutive sub-scopes. For
+  //     `denoise` that is the sampler's per-step update, which is real work, runs
+  //     once per evaluation, and scales with the latent.
+  //
+  // The probe that separated them, run on the fixture's two renders: `denoise`
+  // is one leaf record with 8 sub-scopes, head 3.2-15.9 us and tail 19.6-102.5
+  // us, against SEVEN interior gaps of 62-67 us at nine frames and 463-549 us at
+  // 81. So 95% of the residue is interior and 5% is boundary, and the interior
+  // half is what moves with the box: `denoise` coverage measures 99.55% down to
+  // 88.85% across three boxes on an UNCHANGED tree, while head-plus-tail stays
+  // between 0.10% and 0.30% of the leaf in every one of those runs.
+  //
+  // THAT is why the 0.95 floor sat inside its own measurement and this one does
+  // not. A share floor on the SUM cannot separate "the sampler updated its state
+  // between evaluations" from "a phase nobody named is wearing this label"; the
+  // span slack can, because only the second one lands here.
+  //
+  // ONE CONSTANT PER LEAF RECORD, AND DELIBERATELY NOT A SHARE OF THE LEAF. This bound was
+  // first written `max(1 ms, 2% of the leaf)`, on the reasoning that a share is
+  // what keeps an assertion meaningful at production scale. A fresh review showed
+  // that reasoning inverts here, and the measurement agrees with the review:
+  //
+  //   * A share inside a `max` never tightens, so it is pure slack and it is
+  //     LARGEST exactly where the leaf is largest. Under load `denoise` reached
+  //     3.82 s with 38 us of slack against a 76 ms bound, and `decode.audio`
+  //     3.07 s with 39 us against 61 ms -- 500x to 2200x. At production scale a
+  //     swallowed phase of several seconds would have passed.
+  //   * The quantity does not grow with the render. It is two instrument
+  //     boundaries, and every measurement taken of it -- eight renders and four
+  //     leaves here, plus a fresh review's own runs under an eight-way spin load
+  //     where the denoise leaf ballooned to 3.82 s -- is at or under 135 us
+  //     whatever the leaf did. A constant therefore holds on all of them and is
+  //     strictly tighter than the share at every leaf size.
+  //
+  // AND IT IS CONFIGURATION-AWARE, which is the second thing a fresh review broke
+  // and the more interesting one. The flat 0.25 ms below was set from plain and
+  // spin-loaded builds only. NO measurement behind it came from a sanitizer
+  // build, and the premise "this quantity does not scale" turned out to be right
+  // about RENDER SIZE and silently wrong about BUILD CONFIGURATION. It reds on
+  // both sanitizer lanes.
+  //
+  // The reason is not a fudge and it is worth stating plainly: the slack is the
+  // cost of opening and closing a phase scope, and a sanitizer instruments
+  // exactly that path. ASan checks a shadow byte on every access in it; TSan
+  // additionally keeps per-access happens-before state and does it under a lock.
+  // A scope boundary therefore genuinely costs more in those builds -- it is a
+  // different machine, not a noisier one. Measured on this one test:
+  //
+  //   | lane | that test's wall | worst span slack observed |
+  //   |---|---|---|
+  //   | plain | 259 s | 121 us |
+  //   | `address,undefined` | 1165 s | 730 us |
+  //   | `thread` | 2116 s | 1658 us |
+  //
+  // (CI figures, which are the worst because those runners are two-core and
+  // contended. The same probe on a 20-core box read 94 us / 569 us / 895 us in
+  // the same order, so the ordering is the build and not the box.)
+  //
+  // A NORMALISED BOUND WOULD BE BETTER AND THERE IS NO NORMALISER. The old 0.95
+  // coverage floor tolerated instrumentation ACCIDENTALLY, by being a ratio of two
+  // quantities that inflate together: when TSan makes everything 8x slower both
+  // `covered` and `leaf_seconds` grow and the ratio survives. The span slack is an
+  // ABSOLUTE quantity, so the overhead lands on it undiluted -- which is the real
+  // reason "does not grow with the render" did not generalise. It does not grow
+  // with the RENDER; it grows with the INSTRUMENT.
+  //
+  // So the right question is whether some in-run reference scales the same way.
+  // Five candidates were tested over 24 observations -- four leaves x two renders
+  // x three build configurations -- and the spread of each, worst over best:
+  //
+  //   | candidate | spread | undefined |
+  //   |---|---|---|
+  //   | `slack / submin` | 78630x | 0 |
+  //   | `slack / leaf_seconds` | 4598x | 0 |
+  //   | `slack / mean sub-scope` | 2377x | 0 |
+  //   | `slack / mean interior gap` | 418x | 3 of 24 |
+  //   | **`slack` itself** | **44.6x** | 0 |
+  //
+  // EVERY RATIO IS WORSE THAN THE RAW QUANTITY, and the two most obvious ones are
+  // worse by two orders of magnitude. The gap normaliser is also undefined for a
+  // leaf with one sub-scope, which `artifacts.frames` is. Conditioned on the build
+  // instead, the raw quantity is tight: 20.1-93.6 us plain, 128-569 us under ASan,
+  // 52.1-895 us under TSan -- about 4.7x, 4.4x and 17.2x. So configuration is the
+  // variable that actually explains this quantity, and a per-configuration
+  // constant is the most stable bound available rather than a fallback.
+  //
+  // WHY NOT A SINGLE FLAT 4 ms COVERING ALL THREE: it would be ~30x slack on the
+  // plain lane, where the honest value is ~121 us and the assertion currently
+  // works, and that lane is the only one giving this file a clean signal today.
+  // Two numbers keep each lane held to its own instrument.
+  //
+  // 0.25 ms plain is ~2.1x the worst plain measurement; 3 ms under a sanitizer is
+  // ~1.8x the worst sanitizer measurement. Both are multiples of a measurement
+  // rather than numbers fitted to make a run pass. The sanitizer margin is the
+  // thinner of the two and that is disclosed rather than papered over: under TSan
+  // the instrument's own noise is within about 4x of the smallest leaf it
+  // measures, which is the honest state of this fixture at this scale.
+  //
+  // ONE BOUND PER LEAF RECORD, COMPARED AGAINST THAT RECORD ALONE. This line
+  // first shipped summing the slack of every record of the leaf and comparing the
+  // SUM against `kSpanSlackPerRecord * leaves.size()`. Both halves of that were
+  // defects, and the comment that stood here asserted the opposite of one of
+  // them (#1559):
+  //
+  //   * THE MULTIPLIER WAS READ FROM THE ARTIFACT UNDER TEST. `leaves.size()` is
+  //     whatever `RecordsNamed(table, c.leaf, c.render)` returned, guarded only
+  //     by `REQUIRE(!leaves.empty())` and tied to no independent number. A defect
+  //     that emitted one EXTRA leaf record therefore enlarged its own budget by a
+  //     whole constant. Assertion (0) counts the SUB-SCOPE records against
+  //     `Ltx2ConditioningTrace`; nothing counts the leaf's own.
+  //   * "STRICTER ON MULTI-RECORD LEAVES RATHER THAN LOOSER" WAS FALSE. A sum
+  //     against N constants lets ONE record spend the whole budget, so a swallow
+  //     concentrated in a single record of a three-record leaf got 3x the bound
+  //     it would have got alone. That looseness was load-bearing rather than
+  //     academic: under ASan `artifacts.frames` r2 measured 3.354 ms of slack
+  //     against a 6 ms bound and passed only because that leaf has two records.
+  //
+  // Checking each record against one constant removes both. It is what the
+  // failure message already claimed -- that ONE record's head and tail are
+  // bounded -- and it is strictly tighter than the sum on every leaf that has
+  // more than one record.
+  //
+  // AND THERE IS ONE CONSTANT NOW, NOT ONE PER BUILD CONFIGURATION. The third
+  // shape carried 0.25 ms plain and 3 ms under either sanitizer, on the measured
+  // ground that a sanitizer instruments the scope boundary this quantity IS. That
+  // ground is still true and it is no longer the biggest term. Within the PLAIN
+  // lane alone, on one host, one leaf record's own head-plus-tail spans 25.0 us
+  // to 10.032 ms -- 402x -- so the scheduler moves this quantity further than the
+  // sanitizer does, a second constant would have to clear the same tail anyway,
+  // and 30 ms against 33 ms is a distinction without a difference. The sanitizer
+  // lanes therefore get LOOSER here than the 3 ms they carried, which can only
+  // turn a red green; the worst sanitizer slack anybody has recorded is 3.354 ms.
+  //
+  // THE NESTED-`#if` FORM GOES WITH THE SECOND CONSTANT, and what it recorded is
+  // worth keeping, so it is kept in the row's spec and here: GCC does not define
+  // `__has_feature`, and `defined(__has_feature) && __has_feature(...)` still has
+  // to PARSE the call, which is a hard preprocessor error there. The one-line
+  // `||` form compiled on the TSan leg only because `||` short-circuits before
+  // reaching it, which is the kind of green that means nothing. Anyone
+  // reintroducing a per-configuration constant needs the nested form again.
+  const double kSpanSlackPerRecord = 0.03;  // 30 ms, every build configuration
+  // THE COVERAGE FLOOR (2) IS WHAT HOLDS A SINGLE-RECORD LEAF THE CAP BELOW
+  // SWALLOWS -- and ONLY a single-record leaf, which is the scope this line
+  // used to leave out. Where the cap binds, this bound degrades to "head plus
+  // tail is at most half the record". For a leaf of ONE record `covered >= 0.5 *
+  // leaf_seconds` says exactly that, so (2) is a genuine precondition of this
+  // assertion and the REQUIRE below keeps it available.
+  //
+  // ON A MULTI-RECORD LEAF THE HAND-OFF IS MUCH WEAKER AND THAT IS NOT HIDDEN
+  // HERE. (2) is a statement about the leaf SUM, so a short record of a long
+  // leaf draws on a budget it could never fill. Measured: `decode.video`'s
+  // reopen records are 0.019-5.66 ms inside a 0.17-1.39 s leaf whose 0.90 floor
+  // permits 17-139 ms, so a swallow that grows one of those records to just
+  // under the resolution floor -- up to 94x its honest size -- is seen by
+  // neither assertion. `### Owed out of W0` carries that escape as a ceiling
+  // rather than as the name of an assertion, and the fix for it is an anchor
+  // inside the reopen, not a wider bound.
+  REQUIRE_MESSAGE(c.min_coverage >= 0.5,
+                  "'" << c.leaf << "' carries a " << (100.0 * c.min_coverage)
+                      << "% coverage floor, under the 50% that (1c) hands its "
+                         "below-resolution records of a SINGLE-record leaf to");
+  // AND EACH RECORD'S BOUND IS CAPPED AT HALF OF THAT RECORD, WITH `min` --
+  // never `max`.
+  //
+  // The polarity is the whole point, and it is the inversion of the
+  // `max(constant, share)` an earlier review removed:
+  //
+  //   * under `max`, the share was a FLOOR, so it only ever made the bound
+  //     LOOSER, and it was loosest where the leaf was biggest -- 2200x slack on a
+  //     multi-second leaf, where a swallowed phase would have passed;
+  //   * under `min`, the share is a CEILING, so it only ever makes the bound
+  //     TIGHTER, and it makes `span_bound < record_seconds` true BY
+  //     CONSTRUCTION, which is what the REQUIRE below records rather than risks.
+  //
+  // WHERE THE CAP BINDS, THE RECORD IS BELOW THIS INSTRUMENT'S RESOLUTION, AND IT
+  // IS REPORTED RATHER THAN CHECKED. That is the one line in this block a reader
+  // should be suspicious of, so here is the whole argument.
+  //
+  // A capped bound is no longer the absolute quantity this assertion is about. It
+  // is "head plus tail is at most half of this record", which on a SINGLE-record
+  // leaf is exactly what `covered >= 0.5 * leaf_seconds` already says, and the
+  // REQUIRE above holds every leaf here to a floor of at least 0.5. So on that
+  // shape the capped arm adds nothing (2) does not already carry. On a
+  // multi-record leaf it would add something, and what is given up there is
+  // priced in the note beside the REQUIRE above rather than assumed away.
+  //
+  // AND IT IS WORSE THAN NOTHING, MEASURED. On the records where the cap binds,
+  // the honest head-plus-tail is 4.6% to 72.3% of the record's own duration
+  // (53 runs at head 6b48edb2c): `decode.video`'s reopen-after-the-last-chunk
+  // record is 19-89 us of which 8-32 us is its own two boundaries. A 50% share is
+  // inside that distribution, so the capped arm would decide by scheduler and not
+  // by tree -- the exact defect the 0.95 coverage floor had and that this whole
+  // assertion was added to replace.
+  //
+  // THE SKIP CANNOT HIDE A SWALLOW, and the direction is why. A swallowed phase
+  // makes a leaf record LONGER, never shorter, so it moves a record TOWARD the
+  // gated set and never out of it. What escapes is bounded and stated: a swallow
+  // that leaves the record under 60 ms in total. On this fixture that is
+  // `artifacts.frames` (0.90-61.0 ms over both renders) and `decode.video`'s two
+  // short reopen records (0.019-5.66 ms), and both are named in
+  // `### Owed out of W0` rather than left to be found.
+  size_t span_checked = 0;
+  size_t span_unresolvable = 0;
+  double worst_span_slack = 0.0;
+  for (size_t li = 0; li < leaves.size(); ++li) {
+    INFO("leaf record " << (li + 1) << " of " << leaves.size());
+    const double lo = leaves[li]["start_seconds"].get<double>();
+    const double hi = leaves[li]["end_seconds"].get<double>();
+    const double record_seconds = hi - lo;
+    double first_in = hi;
+    double last_in = lo;
+    bool any = false;
+    for (const std::pair<double, double>& iv : subs) {
+      if (iv.first < lo - 1e-9 || iv.second > hi + 1e-9) continue;
+      if (!any || iv.first < first_in) first_in = iv.first;
+      if (!any || iv.second > last_in) last_in = iv.second;
+      any = true;
+    }
+    // A leaf record containing NO sub-scope is entirely un-anchored, and every
+    // one of its seconds is slack. That is the honest reading and it is also the
+    // strictest one.
+    const double span_slack = any ? (first_in - lo) + (hi - last_in) : record_seconds;
+    worst_span_slack = std::max(worst_span_slack, span_slack);
+    const double span_bound = std::min(kSpanSlackPerRecord, 0.5 * record_seconds);
+    // THE BOUND MUST BE ABLE TO FAIL, and this is a REQUIRE because a check that
+    // cannot fail is worse than no check. `span_slack <= record_seconds` holds by
+    // construction above, so any bound at or above the record makes the CHECK
+    // below vacuous -- it passes at 100% slack. The 1 ms version this line first
+    // carried did exactly that on `artifacts.frames`, which measured 0.826-0.983
+    // ms at the time: ten of twelve checks reddened under a forced-strict probe
+    // and that leaf's two passed AT 100% SLACK.
+    //
+    // It is now true BY CONSTRUCTION, because the bound is capped at half the
+    // record. It is kept as a cheap invariant on the FORMULA: an edit that
+    // removes the cap, or reinstates a floor, reds here instead of silently
+    // restoring a vacuous check. A zero-length leaf record reds here too, which
+    // is the only way this line can fire today and is a defect either way.
+    REQUIRE_MESSAGE(span_bound < record_seconds,
+                    "record " << (li + 1) << " of the '" << c.leaf << "' leaf is "
+                        << record_seconds << "s, at or under the " << span_bound
+                        << "s span-slack bound, so a check against it could not fail: "
+                           "`span_slack <= record_seconds` already holds by construction");
+    if (span_bound < kSpanSlackPerRecord) {
+      ++span_unresolvable;
+      MESSAGE("  " << c.leaf << " record " << (li + 1) << " is " << record_seconds
+                   << "s, under the " << (2.0 * kSpanSlackPerRecord)
+                   << "s this bound can resolve: span slack " << span_slack << "s ("
+                   << (100.0 * span_slack / record_seconds)
+                   << "%) is NOT checked here. On a single-record leaf (2) below "
+                      "is exactly as strict; on a multi-record leaf it is a share "
+                      "of the SUM and much weaker -- see `### Owed out of W0` for "
+                      "what escapes on this leaf");
+      continue;
+    }
+    ++span_checked;
+    MESSAGE("  " << c.leaf << " record " << (li + 1) << " span slack = " << span_slack << "s of "
+                 << record_seconds << "s (" << (100.0 * span_slack / record_seconds)
+                 << "%), bound " << span_bound << "s");
+    CHECK_MESSAGE(span_slack <= span_bound,
+                  "record " << (li + 1) << " of '" << c.leaf << "' spends " << span_slack
+                      << "s inside its own leaf record but OUTSIDE the span its sub-scopes "
+                         "occupy, over a bound of " << span_bound
+                      << "s. A leaf that opened before its work began, or stayed open after it "
+                         "ended, is carrying a phase nobody named under this one's name. This "
+                         "quantity is TWO INSTRUMENT BOUNDARIES and it does not grow with the "
+                         "render -- but it does move with the box and with the build: measured "
+                         "over one build configuration on one host it spans 402x, so read "
+                         "a red here against the run's own load before reading it as a swallowed "
+                         "phase");
+  }
+  MESSAGE("  " << c.leaf << " span slack: " << span_checked << " of " << leaves.size()
+               << " leaf record(s) checked at " << kSpanSlackPerRecord << "s, "
+               << span_unresolvable << " below this instrument's resolution; worst "
+               << worst_span_slack << "s");
+
   // (2) COVERAGE. A leaf that encloses its own sub-scopes AND a phase nobody
   // named would satisfy containment while still hiding time.
+  //
+  // WHAT THIS NUMBER IS NOW, AND WHY IT IS NOT THE 0.95 IT WAS. It bounds the
+  // INTERIOR gaps -- the residue (1c) above cannot see -- and the interior is
+  // real work whose share of the leaf is a property of the BOX, not of the tree.
+  // The population, all on an unchanged `denoise`: 99.28%, 99.38%, 99.55% and
+  // 99.228% on the row's own box; 98.52%, 98.84%, 98.23%, 98.77% and 94.14% on a
+  // second x86 box as its load moved; 94.60%, 96.85% and 94.60% on the box #1494
+  // measured; and 92.39% and 88.85% on the GitHub runner that has to stay green.
+  // The 81-frame arm runs 85.85% to 97.09% over the same set. A 0.95 floor is
+  // therefore BELOW half of its own honest distribution, which is why `main`
+  // carried this red, and no floor near the measured share can be set without
+  // reopening it.
+  //
+  // So this floor is deliberately loose, on exactly the argument the
+  // `decode.video.vae` and `decode.audio.vocoder` floors beside it are set by:
+  // it is worth having where honest and defective separate by a wide margin, and
+  // it is not the assertion that carries this leaf. What carries it is (0), the
+  // record count taken from `Ltx2ConditioningTrace`, and (1c) above, which bounds
+  // the head and the tail of each leaf record at 30 ms where the record is
+  // long enough to resolve it. (1c) does NOT hold this leaf's short records --
+  // see the resolution note there -- so for `artifacts.frames` on the nine-frame
+  // render this floor is the only thing under the head and the tail.
+  // NOTHING WAS DELETED to get here: this number moved and an assertion was added
+  // beside it.
   double covered = 0.0;
   for (const std::pair<double, double>& iv : subs) covered += iv.second - iv.first;
   MESSAGE("  " << c.leaf << " = " << leaf_seconds << "s over " << leaves.size()
@@ -3933,29 +4265,64 @@ void CheckRenderPhases(const nlohmann::json& table,
   //    and the Euler or res_2s step, which no anchor wraps — PLUS two instrument
   //    boundaries per evaluation. 0.95.
   //
-  //    THE MARGIN IS A FALSE-RED RISK AND THIS COMMENT USED TO ARGUE THE
-  //    OPPOSITE. It said the uncovered part "costs a percent of a 40 ms leaf",
-  //    which reads as though the overhead scales with the leaf. It does not: the
-  //    16 boundary samples cost the same wall whether the denoise is 20 ms or 20
-  //    minutes, so the RATIO gets worse exactly as the hardware gets faster. A
-  //    third fresh review measured 99.228% on a quiet box at a 20 ms leaf — an
-  //    uncovered 0.154 ms — which puts the crossing point at a denoise leaf of
-  //    about 3.1 ms. Below that this threshold reds a healthy tree. It is a
-  //    FALSE RED and never a false pass, and it is left at 0.95 rather than
-  //    loosened on an argument nobody has measured: the (0) record count is what
-  //    now ties this name to its work, and a red here has a diagnosis printed
-  //    beside it in the MESSAGE above.
+  //    THE FALSE RED THE PREVIOUS COMMENT PREDICTED HAPPENED, AND ITS CAUSE IS
+  //    NOT THE ONE IT NAMED (#1494, and #1439 for the sibling assertion). It
+  //    reasoned that the uncovered part is 16 boundary samples whose cost is
+  //    fixed, so the ratio worsens as the hardware gets faster, put the crossing
+  //    point at a denoise leaf of about 3.1 ms, and left the number at 0.95.
+  //    `main` then carried this case RED for two days at leaves of 13.7 ms and
+  //    27.5 ms, which are four to nine times above that crossing point.
   //
-  //    AND IT IS A PARAMETER, because the uncovered part is WORK and its share
-  //    depends on the geometry. `denoise.step` wraps the denoiser evaluation;
-  //    the post-process and the Euler or res_2s step sit outside it and scale
-  //    with the latent, while the evaluation the anchor covers scales with it
-  //    too. Measured here: 99.28%, 99.38% and 99.55% at nine frames
-  //    (`latent_t = 2`) against 96.55%, 96.90% and 97.09% at 81
-  //    (`latent_t = 11`), same binary, same box, three runs each. So the
-  //    nine-frame call passes 0.95 and the 81-frame call 0.90 — six points of
-  //    margin on the measured value in both cases, which is the same rule the
-  //    other thresholds are set by and not a loosening to fit.
+  //    MEASURED, THE RESIDUE IS NOT BOUNDARIES. Probing the intervals over the
+  //    fixture's two renders: head 3.2-15.9 us and tail 19.6-102.5 us, against
+  //    SEVEN interior gaps of 62-67 us at nine frames and 463-549 us at 81. The
+  //    boundaries are about 5% of the residue; the other 95% is the sampler's
+  //    per-step update, which is real work, runs once per evaluation, and scales
+  //    with the latent. Its share of the leaf is a property of the BOX and not
+  //    of the tree, because a short serial stretch between two long parallel
+  //    ones is what loses to a contended scheduler. On an UNCHANGED `denoise`
+  //    the nine-frame arm measures 99.55%, 99.38%, 99.28% and 99.228% (the row's
+  //    own box), 98.84%, 98.77%, 98.52%, 98.23% and 94.14% (a second x86 box as
+  //    its load moved), 96.85%, 94.60% and 94.60% (the box #1494 measured), and
+  //    92.39% and 88.85% (the GitHub runner this lane has to stay green on). The
+  //    81-frame arm spans 97.09% down to 85.85% over the same set.
+  //
+  //    SO THE SHARE FLOOR CANNOT BE THE ASSERTION THAT CARRIES THIS LEAF. A
+  //    0.95 floor sits below half of its own honest distribution, and any floor
+  //    set near the measured share reopens the red on the next contended runner.
+  //    It is 0.75 on both arms: 10.85 points below the worst honest observation,
+  //    and worth having only where honest and defective separate widely, which
+  //    is the same argument the 0.50 floors on `decode.video.vae` and
+  //    `decode.audio.vocoder` are set by. The geometry dependence the previous
+  //    comment parameterised is real and is SMALLER than the box dependence, so
+  //    one number below both arms replaces two numbers sitting inside each.
+  //
+  //    WHAT REPLACES IT IS ASSERTION (1c), the span slack, which bounds the head
+  //    and the tail -- the only place a swallowed phase can land -- at
+  //    30 ms PER LEAF RECORD, on the records long enough to resolve it.
+  //    NO CLAIM IS MADE THAT THIS IS TIGHTER THAN 0.95 IN NUMBERS, because it is
+  //    not: 5% of a 13.7 ms leaf is 685 us. The point is a different one. The old
+  //    bound covered the head, the tail AND the interior together, while the
+  //    interior alone measured 1046 us on the runner that reported it -- so the
+  //    budget was already spent before any swallow, no honest tree could satisfy
+  //    it, and it therefore bounded nothing at all. (1c) is spent by the
+  //    boundaries alone, which do not grow with the render.
+  //
+  //    THEY DO MOVE WITH THE BOX, and the first two shapes of this bound were
+  //    calibrated as though they did not. Measured unmutated at head 6b48edb2c,
+  //    one build configuration, one host: 25.0 us to 10.032 ms on one leaf record, 402x. That is why the
+  //    constant is 30 ms and not the 0.25 ms this note used to quote, and
+  //    it is why a red here is read against the run's own load first (#1559).
+  //
+  //    NAMING THE UN-NAMED TIME WOULD SETTLE IT PROPERLY, which is what #1439
+  //    asks for first. A `denoise.update` scope over the sampler's per-step
+  //    update would put the interior residue under a name and make a tight share
+  //    floor honest again. That is a production scope in `ltx2_video.cpp` inside
+  //    both sampler arms, it makes `denoise` a multi-part leaf and so pulls in
+  //    (1b) and `part_min_coverage`, and it owes the phase names published in
+  //    `docs/models/ltx-2-5.md`. It stays owed rather than being folded into the
+  //    repair of a standing red, which is the same judgement #1439 and #1494
+  //    each recorded for themselves.
   //  * `decode.video.chunk` runs from the leaf's own open to the moment the
   //    decoder hands a chunk back, so the only uncovered part is TWO instrument
   //    boundaries — measured 99.44% — and that is why its threshold is the
@@ -4193,7 +4560,7 @@ TEST_CASE("ltx2 video: the three carrying phases contain their work and the load
   // every `Generate`, which is half of why the counts here need a render filter.
   const vllm::multimodal::Ltx2ConditioningTrace trace_one = ltx2->last_conditioning();
   CheckRenderPhases(first, trace_one, result, latent_channels, render_one, /*min_chunks=*/1,
-                    /*denoise_min_coverage=*/0.95);
+                    /*denoise_min_coverage=*/0.75);
 
   // ── RENDER 2: 81 frames, which CHUNKS, and every count above is checked at
   // N > 1 ───────────────────────────────────────────────────────────────────
@@ -4222,12 +4589,12 @@ TEST_CASE("ltx2 video: the three carrying phases contain their work and the load
                     << render_one << "; the table's `render` field is not the per-generation "
                                      "slice the counts below are taken over");
   CheckRenderPhases(table, ltx2->last_conditioning(), multi_result, latent_channels, render_two,
-                    /*min_chunks=*/2, /*denoise_min_coverage=*/0.90);
+                    /*min_chunks=*/2, /*denoise_min_coverage=*/0.75);
 
   // ...and the FIRST render's records are still in the second render's table and
   // still hold, which is what says the filter above selects rather than hides.
   CheckRenderPhases(table, trace_one, result, latent_channels, render_one, /*min_chunks=*/1,
-                    /*denoise_min_coverage=*/0.95);
+                    /*denoise_min_coverage=*/0.75);
 
   // (3c) AND NOTHING BUT AN ANCHOR IS NESTED. The assertion that sees a leaf
   // swallow a NEIGHBOUR, which the four above cannot: see the note on

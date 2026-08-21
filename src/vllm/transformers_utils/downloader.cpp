@@ -23,6 +23,7 @@
 #include <httplib/httplib.h>
 #include <nlohmann/json.hpp>
 
+#include "vllm/http_transport_abi.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 
 namespace vllm {
@@ -359,7 +360,17 @@ HfRemoteFile HubProbeFile(const std::string& url, const HfHubOptions& opts) {
     }
     if (!info.size.has_value()) {
       std::string length = HeaderOrEmpty(*res, "X-Linked-Size");
-      if (length.empty()) length = HeaderOrEmpty(*res, "Content-Length");
+      // `Content-Length` on a REDIRECT is the length of the redirect's own
+      // body, not of the file it names. Measured against huggingface.co on
+      // 2026-08-20: the 307 answering `resolve` for a file that is not in
+      // large-file storage carries `content-length: 234` and no
+      // `x-linked-size`, so reading it here gave a 726 byte config.json a size
+      // of 234 and the transfer refused on a disagreement with the tree
+      // listing. `X-Linked-Size` keeps its meaning on a redirect, because the
+      // hub sets it to the LINKED file's size, and it is still read (#1511).
+      if (length.empty() && !IsRedirect(res->status)) {
+        length = HeaderOrEmpty(*res, "Content-Length");
+      }
       info.size = ParseLength(length);
     }
     if (HeaderOrEmpty(*res, "Accept-Ranges") == "bytes") {
@@ -372,7 +383,10 @@ HfRemoteFile HubProbeFile(const std::string& url, const HfHubOptions& opts) {
                                  std::to_string(res->status) +
                                  " with no Location header");
       }
-      current = location;
+      // A `Location` may be a RELATIVE reference (RFC 7231 section 7.1.2) and
+      // huggingface.co sends one, so it is resolved against the address that
+      // answered rather than used as a URL. See `HfResolveUrl` (#1511).
+      current = HfResolveUrl(current, location);
       // The credential stops at the host the caller named.
       send_token = false;
       continue;
@@ -522,7 +536,9 @@ HfDownloadResult HubDownloadFile(const std::string& url, const fs::path& dest,
                                    std::to_string(status) +
                                    " with no Location header");
         }
-        current = location;
+        // Resolved against the address that answered, for the same reason
+        // as in `HubProbeFile` above (#1511).
+        current = HfResolveUrl(current, location);
         send_token = false;
         continue;
       }
@@ -625,4 +641,22 @@ HfDownloadResult HubDownloadFile(const std::string& url, const fs::path& dest,
 }
 
 }  // namespace transformers_utils
+
+// The TRANSFER half of the one-definition-rule instrument declared in
+// `include/vllm/http_transport_abi.h`. It is defined HERE, in the translation
+// unit that runs the `HEAD`, the ranged `GET` and the resume, so the reading is
+// that unit's own. Without it, undefining `CPPHTTPLIB_OPENSSL_SUPPORT` for this
+// file alone compiles cleanly and no instrument in the tree says so.
+HttpTransportAbi DownloaderHttpTransportAbi() {
+  HttpTransportAbi abi;
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+  abi.tls = true;
+#else
+  abi.tls = false;
+#endif
+  abi.result_size = sizeof(httplib::Result);
+  abi.client_connection_size = sizeof(httplib::ClientConnection);
+  return abi;
+}
+
 }  // namespace vllm

@@ -1,44 +1,77 @@
-// DFlash2 speculator — candidate selection (SPEC-DFLASH2 W3, #1314). See the
-// header for the port note and the upstream anchors.
+// DFlash2 speculator — candidate selection (W3) and the PATH WALK (W4), #1314.
+// See the header for the port note and the upstream anchors.
 #include "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf
+#include "vt/backend.h"
 #include "vt/ops.h"
 
 namespace vllm::v1 {
 
-void RefuseDflash2PathWalk(const Qwen3DFlashWeights& weights,
-                           const Dflash2ProposeState& scored) {
+void RefuseDflash1ArgmaxOnDflash2Block(const Qwen3DFlashWeights& weights) {
   if (!weights.IsDflash2()) return;
-  const int64_t transitions = static_cast<int64_t>(scored.edge_scores.size());
   VT_CHECK(false,
-           "dflash2: this draft is a DFlash2 draft (its dflash_config declares "
-           "conv_kernel_size/conv_group_size/selector_rank/selector_top_k and it "
-           "carries the attention_conv/mlp_conv and candidate_selector tensors). Its "
-           "grouped dynamic depthwise convolution and its CANDIDATE SELECTOR are "
-           "implemented and just ran: the target head's top-K, the two codebooks, the "
-           "hidden projection and the edge lattice are all computed for this block -- "
-           "scored-transitions=" + std::to_string(transitions) + " over requests=" +
-               std::to_string(scored.num_reqs) + " steps=" +
-               std::to_string(scored.num_steps) + " top_k=" +
-               std::to_string(scored.top_k) +
-               ". Its PATH WALK is not. Upstream walks the best path through those "
-               "edge scores from the verified anchor, by inverse CDF at T>0, and "
-               "caches the realized q the lossless verify reads -- "
-               "_selector_walk_kernel and _cache_draft_logits_kernel "
-               "(vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py) @ "
-               "vllm-project/vllm#52816 head "
-               "66e5414c6d75a8529473d977f7458c140bbab8a0. Sampling this block with "
-               "the DFlash1 per-slot argmax instead would succeed and propose worse "
-               "tokens with NO visible symptom: the verify is lossless, so the "
-               "emitted tokens are still the target's and only acceptance falls. "
-               "Owed by row SPEC-DFLASH2 wave W4 "
-               "(.agents/specs/dflash2-spec-decode.md), issue #1314 "
-               "(https://github.com/mudler/vllm.cpp/issues/1314). Use a "
-               "DFlashDraftModel checkpoint until that wave lands.");
+           "dflash2: a DFlash2 block reached the DFlash1 per-slot argmax. That is "
+           "not a fallback, it is the one defect this architecture exists to "
+           "remove: the argmax proposes well-formed tokens, the verify is "
+           "lossless, the engine still emits the TARGET's tokens, and only "
+           "ACCEPTANCE falls -- so no token gate in this repository can see it. A "
+           "DFlash2 draft must draft through the candidate selector's PATH WALK "
+           "(vllm::v1::Dflash2WalkPath -> vt::Dflash2PathWalk), which mirrors "
+           "DFlash2Speculator._sample_path / _selector_walk_kernel "
+           "(vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py) @ "
+           "vllm-project/vllm#52816 head "
+           "66e5414c6d75a8529473d977f7458c140bbab8a0. Reaching this message means "
+           "the walk's call site is gone from the propose path, not that a "
+           "checkpoint is unsupported. Row SPEC-DFLASH2 "
+           "(.agents/specs/dflash2-spec-decode.md), issue #1314 "
+           "(https://github.com/mudler/vllm.cpp/issues/1314).");
+}
+
+Dflash2WalkResult Dflash2WalkPath(const Dflash2ProposeState& scored, vt::Queue& queue) {
+  const int64_t B = scored.num_reqs, L = scored.num_steps, K = scored.top_k;
+  VT_CHECK(B > 0 && L > 0 && K > 0,
+           "dflash2 path-walk: the scored lattice must have requests, steps and "
+           "candidates");
+  VT_CHECK(scored.candidates.rows == B * L && scored.candidates.top_k == K,
+           "dflash2 path-walk: the candidate set must be [num_reqs*num_steps, top_k]");
+  VT_CHECK(static_cast<int64_t>(scored.edge_scores.size()) == B * L * K * K,
+           "dflash2 path-walk: the lattice must score every (step, predecessor, "
+           "child) transition of every request");
+
+  dense_attn::Dev d{vt::GetBackend(queue.device.type), queue};
+  dense_attn::DBuf dev_scores(d, vt::DType::kF32, {B, L, K, K}, scored.edge_scores.data());
+  dense_attn::DBuf dev_cand(d, vt::DType::kI64, {B, L, K}, scored.candidates.ids.data());
+  dense_attn::DBuf dev_tokens(d, vt::DType::kI64, {B, L});
+  vt::Dflash2PathWalkArgs args;
+  args.top_k = K;
+  vt::Dflash2PathWalk(d.q, dev_tokens.t(), dev_scores.t(), dev_cand.t(), args);
+
+  std::vector<int64_t> tokens(static_cast<size_t>(B * L), 0);
+  dev_tokens.Download(d, tokens.data());
+
+  Dflash2WalkResult out;
+  out.draft_token_ids.assign(static_cast<size_t>(B), {});
+  for (int64_t b = 0; b < B; ++b) {
+    std::vector<int32_t>& row = out.draft_token_ids[static_cast<size_t>(b)];
+    row.reserve(static_cast<size_t>(L));
+    for (int64_t l = 0; l < L; ++l) {
+      const int64_t id = tokens[static_cast<size_t>(b * L + l)];
+      // The verify, the KV rollback and the input batch all carry token ids as
+      // i32. A candidate that does not fit is an id-space error and is named
+      // here rather than truncated into a different, valid-looking token.
+      VT_CHECK(id >= 0 && id <= static_cast<int64_t>(INT32_MAX),
+               "dflash2 path-walk: the walk produced a token id outside the i32 "
+               "range the verify carries");
+      row.push_back(static_cast<int32_t>(id));
+    }
+  }
+  return out;
 }
 
 Dflash2ProposeState Dflash2SelectCandidates(const std::vector<float>& block_logits,
@@ -55,6 +88,39 @@ Dflash2ProposeState Dflash2SelectCandidates(const std::vector<float>& block_logi
   const int64_t vocab = weights.draft_vocab_size;
   const int64_t H = config.hidden_size;
   VT_CHECK(vocab > 0 && H > 0, "dflash2 select-candidates: invalid draft vocab/hidden");
+  // SPEC-DFLASH2 W5 (#1314): the codebooks must SPAN the vocabulary the
+  // candidates are drawn from. `vocab` is the TARGET's head width
+  // (`draft_vocab_size`, which `src/vllm/entrypoints/model_loader.cpp` sets from
+  // the target's `lm_head.shape[0]`); the codebook extent comes from the DRAFT,
+  // checked at load against the DRAFT config's own `vocab_size`
+  // (`qwen3_dflash_weights.cpp`, the `[vocab, rank]` assertion).
+  //
+  // THE TWO HAVE ALWAYS BEEN ABLE TO DIFFER, on BOTH container arms. Through W5
+  // this comment said that on safetensors they "trace back to one `config.json`,
+  // so they could not differ"; that is wrong, and W5's fresh review found it
+  // (#1314 F7). Even there the two numbers are read from two different files --
+  // the DRAFT directory's `config.json` and the TARGET's `lm_head` -- so nothing
+  // ever forced them equal. What the GGUF arm changes is how LIKELY the mismatch
+  // is: a GGUF draft declares no vocabulary at all and is sized from its own
+  // `tokenizer.ggml.tokens`, so a drafter paired with the wrong target reaches
+  // here with a codebook SHORTER than the ids that index it, which is an
+  // out-of-range read of a 127 MB tensor rather than a wrong answer. Refused by
+  // name, and the numbers are quoted because the fix is to pair the draft with
+  // the target it was trained on.
+  //
+  // The comparison is STRICT, which is stricter than the out-of-range read
+  // requires. That is deliberate and it is also OWED: `## Owed` O16 hands W6 the
+  // job of reading upstream's own condition at the PR-head oracle, because a
+  // strict `==` is a NEW refusal class on the already-shipping safetensors lane
+  // for any target whose head is padded relative to the draft's codebooks.
+  const int64_t codebook_rows =
+      weights.candidate_selector.predecessor_codebook.shape[0];
+  VT_CHECK(codebook_rows == vocab,
+           "dflash2 select-candidates: the draft's candidate-selector codebooks "
+           "hold " + std::to_string(codebook_rows) +
+               " rows but the target's head is " + std::to_string(vocab) +
+               " wide; the codebooks are indexed by TARGET token id, so this "
+               "draft was not trained against this target (SPEC-DFLASH2, #1314)");
   VT_CHECK(static_cast<int64_t>(block_logits.size()) == P * nq * vocab,
            "dflash2 select-candidates: block_logits must be [num_reqs*(1+k), draft_vocab]");
   VT_CHECK(static_cast<int64_t>(block_hidden.size()) == P * nq * H,

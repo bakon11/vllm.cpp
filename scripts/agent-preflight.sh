@@ -89,9 +89,11 @@ CHECKERS=(
   check-windows-release-state
   check-container-matrix
   check-container-workflow
+  check-build-runtime-deps
   check-role-discipline
   claim-view
   check-readme-structure
+  check-quickstart-recipes
   check-public-doc-tables
   check-model-checklist
   check-supported-models
@@ -104,6 +106,7 @@ CHECKERS=(
   check-test-registration
   check-snapshot-pins
   check-oracle-pins
+  check-oracle-denominator-flags
   check-now-current
   check-gate-commands
   check-symbol-anchors
@@ -122,6 +125,8 @@ SUITES=(
   test_release_postpublish_audit
   test_check_container_matrix
   test_check_container_workflow
+  test_check_build_runtime_deps
+  test_validate_container_image
   test_release_index
   test_release_metadata
   test_release_accelerator_metadata
@@ -137,6 +142,7 @@ SUITES=(
   test_upstream_inventory
   test_doc_checkpoint
   test_check_readme_structure
+  test_check_quickstart_recipes
   test_check_public_doc_tables
   test_check_model_checklist
   test_check_supported_models
@@ -158,6 +164,7 @@ SUITES=(
   test_agent_preflight_skip_report
   test_agent_pr_body
   test_check_symbol_anchors
+  test_check_oracle_denominator_flags
   test_check_conflict_markers
 )
 
